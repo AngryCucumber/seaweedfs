@@ -17,6 +17,7 @@ import (
 	"github.com/seaweedfs/raft"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/massdblicense"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/sequence"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
@@ -57,6 +58,8 @@ type Topology struct {
 	UuidMap        map[string][]string
 
 	LastLeaderChangeTime time.Time
+
+	MassDBLicense *massdblicense.Store
 }
 
 func NewTopology(id string, seq sequence.Sequencer, volumeSizeLimit uint64, pulse int, replicationAsMin bool) *Topology {
@@ -78,8 +81,30 @@ func NewTopology(id string, seq sequence.Sequencer, volumeSizeLimit uint64, puls
 	t.chanCrowdedVolumes = make(chan storage.VolumeInfo)
 
 	t.Configuration = &Configuration{}
+	t.MassDBLicense = massdblicense.NewStore()
 
 	return t
+}
+
+// CommitMassDBLicenseState uses the same replicated snapshot command for both supported Raft
+// implementations. Callers must calculate the candidate from a current Snapshot before invoking it.
+func (t *Topology) CommitMassDBLicenseState(next massdblicense.State) error {
+	t.RaftServerAccessLock.RLock()
+	defer t.RaftServerAccessLock.RUnlock()
+
+	if t.RaftServer != nil {
+		_, err := t.RaftServer.Do(NewMassDBLicenseCommand(next))
+		return err
+	}
+	if t.HashicorpRaft != nil {
+		envelope, err := json.Marshal(NewMassDBLicenseEnvelope(next))
+		if err != nil {
+			return fmt.Errorf("marshal MassDB License command: %w", err)
+		}
+		future := t.HashicorpRaft.Apply(envelope, time.Second)
+		return future.Error()
+	}
+	return fmt.Errorf("no raft server available for MassDB License mutation")
 }
 
 func (t *Topology) IsChildLocked() (bool, error) {

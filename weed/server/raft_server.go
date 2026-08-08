@@ -2,6 +2,7 @@ package weed_server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"os"
@@ -52,25 +53,40 @@ type StateMachine struct {
 var _ hashicorpRaft.FSM = &StateMachine{}
 
 func (s StateMachine) Save() ([]byte, error) {
-	state := topology.MaxVolumeIdCommand{
-		MaxVolumeId: s.topo.GetMaxVolumeId(),
+	licenseState := s.topo.MassDBLicense.Snapshot()
+	state := topology.MasterSnapshot{
+		FormatVersion: 1,
+		MaxVolumeId:   s.topo.GetMaxVolumeId(),
+		MassDBLicense: &licenseState,
 	}
 	glog.V(1).Infof("Save raft state %+v", state)
 	return json.Marshal(state)
 }
 
 func (s StateMachine) Recovery(data []byte) error {
-	state := topology.MaxVolumeIdCommand{}
+	state := topology.MasterSnapshot{}
 	err := json.Unmarshal(data, &state)
 	if err != nil {
 		return err
 	}
 	glog.V(1).Infof("Recovery raft state %+v", state)
 	s.topo.UpAdjustMaxVolumeId(state.MaxVolumeId)
+	if state.MassDBLicense != nil {
+		if err := s.topo.MassDBLicense.Restore(*state.MassDBLicense); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func (s *StateMachine) Apply(l *hashicorpRaft.Log) interface{} {
+	var envelope topology.MassDBLicenseEnvelope
+	if err := json.Unmarshal(l.Data, &envelope); err == nil && envelope.CommandType != "" {
+		if envelope.FormatVersion != 1 || envelope.CommandType != topology.MassDBLicenseCommandType {
+			return fmt.Errorf("unknown raft command type %q format %d", envelope.CommandType, envelope.FormatVersion)
+		}
+		return s.topo.MassDBLicense.Restore(envelope.Payload)
+	}
 	before := s.topo.GetMaxVolumeId()
 	state := topology.MaxVolumeIdCommand{}
 	err := json.Unmarshal(l.Data, &state)
@@ -84,8 +100,11 @@ func (s *StateMachine) Apply(l *hashicorpRaft.Log) interface{} {
 }
 
 func (s *StateMachine) Snapshot() (hashicorpRaft.FSMSnapshot, error) {
-	return &topology.MaxVolumeIdCommand{
-		MaxVolumeId: s.topo.GetMaxVolumeId(),
+	licenseState := s.topo.MassDBLicense.Snapshot()
+	return &topology.MasterSnapshot{
+		FormatVersion: 1,
+		MaxVolumeId:   s.topo.GetMaxVolumeId(),
+		MassDBLicense: &licenseState,
 	}, nil
 }
 
@@ -113,6 +132,7 @@ func NewRaftServer(option *RaftServerOption) (*RaftServer, error) {
 	}
 
 	raft.RegisterCommand(&topology.MaxVolumeIdCommand{})
+	raft.RegisterCommand(&topology.MassDBLicenseCommand{})
 
 	var err error
 	transporter := raft.NewGrpcTransporter(option.GrpcDialOption)
