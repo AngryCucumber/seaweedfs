@@ -29,7 +29,7 @@ type DownloadOptions struct {
 
 func init() {
 	cmdDownload.Run = runDownload // break init cycle
-	d.server = cmdDownload.Flag.String("server", "localhost:9333", "SeaweedFS master location")
+	d.server = cmdDownload.Flag.String("server", "localhost:9333", "MassDB-OSS master location")
 	d.dir = cmdDownload.Flag.String("dir", ".", "Download the whole folder recursively if specified.")
 }
 

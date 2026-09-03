@@ -110,7 +110,7 @@ func main() {
 }
 
 var usageTemplate = `
-SeaweedFS: store billions of files and serve them fast!
+MassDB-OSS: store billions of files and serve them fast!
 
 Usage:
 

@@ -24,7 +24,7 @@ func init() {
 var cmdFix = &Command{
 	UsageLine: "fix [-volumeId=234] [-collection=bigData] /tmp",
 	Short:     "run weed tool fix on files or whole folders to recreate index file(s) if corrupted",
-	Long: `Fix runs the SeaweedFS fix command on dat files or whole folders to re-create the index .idx file.
+	Long: `Fix runs the MassDB-OSS fix command on dat files or whole folders to re-create the index .idx file.
   You Need to stop the volume server when running this command.
 `,
 }

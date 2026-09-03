@@ -1,4 +1,4 @@
-# A sample TOML config file for SeaweedFS filer store
+# A sample TOML config file for MassDB-OSS filer store
 # Used with "weed filer" or "weed server -filer"
 # Put this file to one of the location, with descending priority
 #    ./filer.toml

@@ -42,14 +42,14 @@ func (c *commandVolumeTierUpload) Help() string {
 
 	This command will move the dat file of a volume to a remote tier.
 
-	SeaweedFS enables scalable and fast local access to lots of files, 
+	MassDB-OSS enables scalable and fast local access to lots of files, 
 	and the cloud storage is slower by cost efficient. How to combine them together?
 
 	Usually the data follows 80/20 rule: only 20% of data is frequently accessed.
 	We can offload the old volumes to the cloud.
 
-	With this, SeaweedFS can be both fast and scalable, and infinite storage space.
-	Just add more local SeaweedFS volume servers to increase the throughput.
+	With this, MassDB-OSS can be both fast and scalable, and infinite storage space.
+	Just add more local MassDB-OSS volume servers to increase the throughput.
 
 	The index file is still local, and the same O(1) disk read is applied to the remote file.
 

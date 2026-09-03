@@ -62,7 +62,7 @@ func (s *SftpServer) GetSettings() (*ftpserver.Settings, error) {
 
 // ClientConnected is called to send the very first welcome message
 func (s *SftpServer) ClientConnected(cc ftpserver.ClientContext) (string, error) {
-	return "Welcome to SeaweedFS FTP Server", nil
+	return "Welcome to MassDB-OSS FTP Server", nil
 }
 
 // ClientDisconnected is called when the user disconnects, even if he never authenticated

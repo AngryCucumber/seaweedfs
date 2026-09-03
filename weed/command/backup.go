@@ -30,7 +30,7 @@ type BackupOptions struct {
 
 func init() {
 	cmdBackup.Run = runBackup // break init cycle
-	s.master = cmdBackup.Flag.String("server", "localhost:9333", "SeaweedFS master location")
+	s.master = cmdBackup.Flag.String("server", "localhost:9333", "MassDB-OSS master location")
 	s.collection = cmdBackup.Flag.String("collection", "", "collection name")
 	s.dir = cmdBackup.Flag.String("dir", ".", "directory to store volume data files")
 	s.volumeId = cmdBackup.Flag.Int("volumeId", -1, "a volume id. The volume .dat and .idx files should already exist in the dir.")

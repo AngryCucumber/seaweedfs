@@ -84,7 +84,7 @@ var cmdMount = &Command{
 	Long: `mount weed filer to userspace.
 
   Pre-requisites:
-  1) have SeaweedFS master and volume servers running
+  1) have MassDB-OSS master and volume servers running
   2) have a "weed filer" running
   These 2 requirements can be achieved with one command "weed server -filer=true"
 

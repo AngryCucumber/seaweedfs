@@ -1,4 +1,4 @@
-# A sample TOML config file for replicating SeaweedFS filer
+# A sample TOML config file for replicating MassDB-OSS filer
 # Used with "weed filer.backup"
 # Using with "weed filer.replicate" is deprecated.
 # Put this file to one of the location, with descending priority
