@@ -4,17 +4,18 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+
 	"github.com/gocql/gocql"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
-    "github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func (store *CassandraStore) KvPut(ctx context.Context, key []byte, value []byte) (err error) {
 	dir, name := genDirAndName(key)
 
 	if err := store.session.Query(
-		"INSERT INTO filemeta (dirhash,directory,name,meta) VALUES(?,?,?) USING TTL ? ",
-		util.Md5String([]byte(dir)), name, value, 0).Exec(); err != nil {
+		"INSERT INTO filemeta (dirhash,directory,name,meta) VALUES(?,?,?,?) USING TTL ? ",
+		util.Md5String([]byte(dir)), dir, name, value, 0).Exec(); err != nil {
 		return fmt.Errorf("kv insert: %s", err)
 	}
 
