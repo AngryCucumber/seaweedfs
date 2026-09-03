@@ -106,8 +106,8 @@ func (store *CassandraStore) InsertEntry(ctx context.Context, entry *filer.Entry
 	}
 
 	if err := store.session.Query(
-		"INSERT INTO filemeta (directory,name,meta) VALUES(?,?,?) USING TTL ? ",
-		dir, name, meta, entry.TtlSec).Exec(); err != nil {
+		"INSERT INTO filemeta (dirhash,directory,name,meta) VALUES(?,?,?,?) USING TTL ? ",
+		util.Md5String([]byte(dir)), dir, name, meta, entry.TtlSec).Exec(); err != nil {
 		return fmt.Errorf("insert %s: %s", entry.FullPath, err)
 	}
 
@@ -128,8 +128,8 @@ func (store *CassandraStore) FindEntry(ctx context.Context, fullpath util.FullPa
 
 	var data []byte
 	if err := store.session.Query(
-		"SELECT meta FROM filemeta WHERE directory=? AND name=?",
-		dir, name).Scan(&data); err != nil {
+		"SELECT meta FROM filemeta WHERE dirhash=? AND name=?",
+		util.Md5String([]byte(dir)), name).Scan(&data); err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return nil, filer_pb.ErrNotFound
 		}
@@ -155,8 +155,8 @@ func (store *CassandraStore) DeleteEntry(ctx context.Context, fullpath util.Full
 	}
 
 	if err := store.session.Query(
-		"DELETE FROM filemeta WHERE directory=? AND name=?",
-		dir, name).Exec(); err != nil {
+		"DELETE FROM filemeta WHERE dirhash=? AND name=?",
+		util.Md5String([]byte(dir)), name).Exec(); err != nil {
 		return fmt.Errorf("delete %s : %v", fullpath, err)
 	}
 
@@ -169,8 +169,8 @@ func (store *CassandraStore) DeleteFolderChildren(ctx context.Context, fullpath 
 	}
 
 	if err := store.session.Query(
-		"DELETE FROM filemeta WHERE directory=?",
-		fullpath).Exec(); err != nil {
+		"DELETE FROM filemeta WHERE dirhash=?",
+		util.Md5String([]byte(fullpath))).Exec(); err != nil {
 		return fmt.Errorf("delete %s : %v", fullpath, err)
 	}
 
@@ -187,14 +187,14 @@ func (store *CassandraStore) ListDirectoryEntries(ctx context.Context, dirPath u
 		return // nil, filer.ErrUnsupportedSuperLargeDirectoryListing
 	}
 
-	cqlStr := "SELECT NAME, meta FROM filemeta WHERE directory=? AND name>? ORDER BY NAME ASC LIMIT ?"
+	cqlStr := "SELECT NAME, meta FROM filemeta WHERE dirhash=? AND name>? ORDER BY NAME ASC LIMIT ?"
 	if includeStartFile {
-		cqlStr = "SELECT NAME, meta FROM filemeta WHERE directory=? AND name>=? ORDER BY NAME ASC LIMIT ?"
+		cqlStr = "SELECT NAME, meta FROM filemeta WHERE dirhash=? AND name>=? ORDER BY NAME ASC LIMIT ?"
 	}
 
 	var data []byte
 	var name string
-	iter := store.session.Query(cqlStr, string(dirPath), startFileName, limit+1).Iter()
+	iter := store.session.Query(cqlStr, util.Md5String([]byte(string(dirPath))), startFileName, limit+1).Iter()
 	for iter.Scan(&name, &data) {
 		entry := &filer.Entry{
 			FullPath: util.NewFullPath(string(dirPath), name),

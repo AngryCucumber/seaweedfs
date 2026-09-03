@@ -6,14 +6,15 @@ import (
 	"fmt"
 	"github.com/gocql/gocql"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+    "github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func (store *CassandraStore) KvPut(ctx context.Context, key []byte, value []byte) (err error) {
 	dir, name := genDirAndName(key)
 
 	if err := store.session.Query(
-		"INSERT INTO filemeta (directory,name,meta) VALUES(?,?,?) USING TTL ? ",
-		dir, name, value, 0).Exec(); err != nil {
+		"INSERT INTO filemeta (dirhash,directory,name,meta) VALUES(?,?,?) USING TTL ? ",
+		util.Md5String([]byte(dir)), name, value, 0).Exec(); err != nil {
 		return fmt.Errorf("kv insert: %s", err)
 	}
 
@@ -24,8 +25,8 @@ func (store *CassandraStore) KvGet(ctx context.Context, key []byte) (data []byte
 	dir, name := genDirAndName(key)
 
 	if err := store.session.Query(
-		"SELECT meta FROM filemeta WHERE directory=? AND name=?",
-		dir, name).Scan(&data); err != nil {
+		"SELECT meta FROM filemeta WHERE dirhash=? AND name=?",
+		util.Md5String([]byte(dir)), name).Scan(&data); err != nil {
 		if err != gocql.ErrNotFound {
 			return nil, filer.ErrKvNotFound
 		}
@@ -42,8 +43,8 @@ func (store *CassandraStore) KvDelete(ctx context.Context, key []byte) (err erro
 	dir, name := genDirAndName(key)
 
 	if err := store.session.Query(
-		"DELETE FROM filemeta WHERE directory=? AND name=?",
-		dir, name).Exec(); err != nil {
+		"DELETE FROM filemeta WHERE dirhash=? AND name=?",
+		util.Md5String([]byte(dir)), name).Exec(); err != nil {
 		return fmt.Errorf("kv delete: %v", err)
 	}
 
