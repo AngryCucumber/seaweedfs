@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/gocql/gocql"
 	"time"
 
+	"github.com/gocql/gocql"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -20,6 +20,7 @@ func init() {
 type CassandraStore struct {
 	cluster                 *gocql.ClusterConfig
 	session                 *gocql.Session
+	layout                  fileMetaLayout
 	superLargeDirectoryHash map[string]string
 }
 
@@ -61,7 +62,20 @@ func (store *CassandraStore) initialize(keyspace string, hosts []string, usernam
 
 	store.session, err = store.cluster.CreateSession()
 	if err != nil {
-		glog.V(0).Infof("Failed to open cassandra store, hosts %v, keyspace %s", hosts, keyspace)
+		return fmt.Errorf("open cassandra store %s: %w", keyspace, err)
+	}
+	defer func() {
+		if err != nil {
+			store.session.Close()
+		}
+	}()
+	metadata, err := store.session.KeyspaceMetadata(keyspace)
+	if err != nil {
+		return fmt.Errorf("read cassandra schema for %s: %w", keyspace, err)
+	}
+	store.layout, err = detectFileMetaLayout(metadata.Tables["filemeta"])
+	if err != nil {
+		return fmt.Errorf("initialize cassandra store %s: %w", keyspace, err)
 	}
 
 	// set directory hash
@@ -72,7 +86,7 @@ func (store *CassandraStore) initialize(keyspace string, hosts []string, usernam
 		dirHash := util.Md5String([]byte(dir))[:4]
 		store.superLargeDirectoryHash[dir] = dirHash
 		if existingDir, found := existingHash[dirHash]; found {
-			glog.Fatalf("directory %s has the same hash as %s", dir, existingDir)
+			return fmt.Errorf("super large directory %s has the same hash as %s", dir, existingDir)
 		}
 		existingHash[dirHash] = dir
 	}
@@ -105,9 +119,7 @@ func (store *CassandraStore) InsertEntry(ctx context.Context, entry *filer.Entry
 		meta = util.MaybeGzipData(meta)
 	}
 
-	if err := store.session.Query(
-		"INSERT INTO filemeta (directory,name,meta) VALUES(?,?,?) USING TTL ? ",
-		dir, name, meta, entry.TtlSec).Exec(); err != nil {
+	if err := store.insertQuery(dir, name, meta, entry.TtlSec).WithContext(ctx).Exec(); err != nil {
 		return fmt.Errorf("insert %s: %s", entry.FullPath, err)
 	}
 
@@ -128,8 +140,8 @@ func (store *CassandraStore) FindEntry(ctx context.Context, fullpath util.FullPa
 
 	var data []byte
 	if err := store.session.Query(
-		"SELECT meta FROM filemeta WHERE directory=? AND name=?",
-		dir, name).Scan(&data); err != nil {
+		store.layout.find,
+		store.layout.partitionValue(dir), name).WithContext(ctx).Scan(&data); err != nil {
 		if errors.Is(err, gocql.ErrNotFound) {
 			return nil, filer_pb.ErrNotFound
 		}
@@ -155,8 +167,8 @@ func (store *CassandraStore) DeleteEntry(ctx context.Context, fullpath util.Full
 	}
 
 	if err := store.session.Query(
-		"DELETE FROM filemeta WHERE directory=? AND name=?",
-		dir, name).Exec(); err != nil {
+		store.layout.deleteEntry,
+		store.layout.partitionValue(dir), name).WithContext(ctx).Exec(); err != nil {
 		return fmt.Errorf("delete %s : %v", fullpath, err)
 	}
 
@@ -169,8 +181,8 @@ func (store *CassandraStore) DeleteFolderChildren(ctx context.Context, fullpath 
 	}
 
 	if err := store.session.Query(
-		"DELETE FROM filemeta WHERE directory=?",
-		fullpath).Exec(); err != nil {
+		store.layout.deleteChildren,
+		store.layout.partitionValue(string(fullpath))).WithContext(ctx).Exec(); err != nil {
 		return fmt.Errorf("delete %s : %v", fullpath, err)
 	}
 
@@ -187,14 +199,14 @@ func (store *CassandraStore) ListDirectoryEntries(ctx context.Context, dirPath u
 		return // nil, filer.ErrUnsupportedSuperLargeDirectoryListing
 	}
 
-	cqlStr := "SELECT NAME, meta FROM filemeta WHERE directory=? AND name>? ORDER BY NAME ASC LIMIT ?"
+	cqlStr := store.layout.listExclusive
 	if includeStartFile {
-		cqlStr = "SELECT NAME, meta FROM filemeta WHERE directory=? AND name>=? ORDER BY NAME ASC LIMIT ?"
+		cqlStr = store.layout.listInclusive
 	}
 
 	var data []byte
 	var name string
-	iter := store.session.Query(cqlStr, string(dirPath), startFileName, limit+1).Iter()
+	iter := store.session.Query(cqlStr, store.layout.partitionValue(string(dirPath)), startFileName, limit+1).WithContext(ctx).Iter()
 	for iter.Scan(&name, &data) {
 		entry := &filer.Entry{
 			FullPath: util.NewFullPath(string(dirPath), name),
@@ -209,13 +221,15 @@ func (store *CassandraStore) ListDirectoryEntries(ctx context.Context, dirPath u
 			break
 		}
 	}
-	if err := iter.Close(); err != nil {
-		glog.V(0).Infof("list iterator close: %v", err)
+	if closeErr := iter.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("list %s: %w", dirPath, closeErr))
 	}
 
 	return lastFileName, err
 }
 
 func (store *CassandraStore) Shutdown() {
-	store.session.Close()
+	if store.session != nil {
+		store.session.Close()
+	}
 }

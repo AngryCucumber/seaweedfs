@@ -1,14 +1,7 @@
-1. create a keyspace
+See README.md for setup, compatibility, migration boundaries, and tests.
 
-CREATE KEYSPACE seaweedfs WITH replication = {'class':'SimpleStrategy', 'replication_factor' : 1};
-
-2. create filemeta table
-
- USE seaweedfs;
-
- CREATE TABLE filemeta (
-    directory varchar,
-    name varchar,
-    meta blob,
-    PRIMARY KEY (directory, name)
- ) WITH CLUSTERING ORDER BY (name ASC);
+For a new installation, create a keyspace with an appropriate replication
+policy and execute schema.cql in that keyspace. New tables use the varchar
+dirhash partition key. Existing PRIMARY KEY (directory, name) tables remain
+supported without migration; the filer detects the layout at initialization.
+It does not create, alter, or migrate tables automatically.

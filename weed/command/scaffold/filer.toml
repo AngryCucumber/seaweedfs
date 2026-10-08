@@ -140,12 +140,17 @@ enableUpsert = true
 upsertQuery = """UPSERT INTO "%[1]s" (dirhash,name,directory,meta) VALUES($1,$2,$3,$4)"""
 
 [cassandra]
+# New installations: weed/filer/cassandra/schema.cql
+# Existing PRIMARY KEY (directory, name) tables remain supported without migration.
+# Schema is checked once at startup; no table creation or migration is automatic.
 # CREATE TABLE filemeta (
+#    dirhash varchar,
 #    directory varchar,
 #    name varchar,
 #    meta blob,
-#    PRIMARY KEY (directory, name)
+#    PRIMARY KEY (dirhash, name)
 # ) WITH CLUSTERING ORDER BY (name ASC);
+# Do not point old directory-only binaries at a new dirhash-keyed table.
 enabled = false
 keyspace = "seaweedfs"
 hosts = [

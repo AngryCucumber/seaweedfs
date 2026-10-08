@@ -3,7 +3,9 @@ package cassandra
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+
 	"github.com/gocql/gocql"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 )
@@ -11,9 +13,7 @@ import (
 func (store *CassandraStore) KvPut(ctx context.Context, key []byte, value []byte) (err error) {
 	dir, name := genDirAndName(key)
 
-	if err := store.session.Query(
-		"INSERT INTO filemeta (directory,name,meta) VALUES(?,?,?) USING TTL ? ",
-		dir, name, value, 0).Exec(); err != nil {
+	if err := store.insertQuery(dir, name, value, 0).WithContext(ctx).Exec(); err != nil {
 		return fmt.Errorf("kv insert: %s", err)
 	}
 
@@ -24,11 +24,12 @@ func (store *CassandraStore) KvGet(ctx context.Context, key []byte) (data []byte
 	dir, name := genDirAndName(key)
 
 	if err := store.session.Query(
-		"SELECT meta FROM filemeta WHERE directory=? AND name=?",
-		dir, name).Scan(&data); err != nil {
-		if err != gocql.ErrNotFound {
+		store.layout.find,
+		store.layout.partitionValue(dir), name).WithContext(ctx).Scan(&data); err != nil {
+		if errors.Is(err, gocql.ErrNotFound) {
 			return nil, filer.ErrKvNotFound
 		}
+		return nil, fmt.Errorf("kv get: %w", err)
 	}
 
 	if len(data) == 0 {
@@ -42,8 +43,8 @@ func (store *CassandraStore) KvDelete(ctx context.Context, key []byte) (err erro
 	dir, name := genDirAndName(key)
 
 	if err := store.session.Query(
-		"DELETE FROM filemeta WHERE directory=? AND name=?",
-		dir, name).Exec(); err != nil {
+		store.layout.deleteEntry,
+		store.layout.partitionValue(dir), name).WithContext(ctx).Exec(); err != nil {
 		return fmt.Errorf("kv delete: %v", err)
 	}
 
