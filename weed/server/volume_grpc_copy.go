@@ -58,6 +58,9 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 		if nil != err {
 			return fmt.Errorf("read volume file status failed, %v", err)
 		}
+		if err = storage.ValidateCollectionName(volFileInfoResp.Collection); err != nil {
+			return err
+		}
 
 		diskType := volFileInfoResp.DiskType
 		if req.DiskType != "" {
@@ -318,6 +321,15 @@ func (vs *VolumeServer) ReadVolumeFileStatus(ctx context.Context, req *volume_se
 // The copying still stop at req.StopOffset, but you can set it to math.MaxUint64 in order to read all data.
 func (vs *VolumeServer) CopyFile(req *volume_server_pb.CopyFileRequest, stream volume_server_pb.VolumeServer_CopyFileServer) error {
 
+	if !isCopyFileExtAllowed(req.Ext, req.IsEcVolume) {
+		return fmt.Errorf("CopyFile does not serve extension %q", req.Ext)
+	}
+	if req.IsEcVolume {
+		if err := storage.ValidateCollectionName(req.Collection); err != nil {
+			return err
+		}
+	}
+
 	var fileName string
 	if !req.IsEcVolume {
 		v := vs.store.GetVolume(needle.VolumeId(req.VolumeId))
@@ -400,4 +412,26 @@ func (vs *VolumeServer) CopyFile(req *volume_server_pb.CopyFileRequest, stream v
 	}
 
 	return nil
+}
+
+// isCopyFileExtAllowed lists the files CopyFile may serve. The extension is
+// appended to a path on disk, so anything else could name an arbitrary file.
+func isCopyFileExtAllowed(ext string, isEcVolume bool) bool {
+	if !isEcVolume {
+		switch ext {
+		case ".dat", ".idx", ".vif":
+			return true
+		}
+		return false
+	}
+	switch ext {
+	case ".ecx", ".ecj", ".vif":
+		return true
+	}
+	for shardId := 0; shardId < erasure_coding.TotalShardsCount; shardId++ {
+		if ext == erasure_coding.ToExt(shardId) {
+			return true
+		}
+	}
+	return false
 }

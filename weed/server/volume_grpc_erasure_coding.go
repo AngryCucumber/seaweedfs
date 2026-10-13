@@ -98,6 +98,9 @@ func (vs *VolumeServer) VolumeEcShardsRebuild(ctx context.Context, req *volume_s
 
 	glog.V(0).Infof("VolumeEcShardsRebuild: %v", req)
 
+	if err := storage.ValidateCollectionName(req.Collection); err != nil {
+		return nil, err
+	}
 	baseFileName := erasure_coding.EcShardBaseFileName(req.Collection, int(req.VolumeId))
 
 	var rebuiltShardIds []uint32
@@ -140,6 +143,9 @@ func (vs *VolumeServer) VolumeEcShardsCopy(ctx context.Context, req *volume_serv
 
 	glog.V(0).Infof("VolumeEcShardsCopy: %v", req)
 
+	if err := storage.ValidateCollectionName(req.Collection); err != nil {
+		return nil, err
+	}
 	var location *storage.DiskLocation
 	if req.CopyEcxFile {
 		location = vs.store.FindFreeLocation(func(location *storage.DiskLocation) bool {
@@ -203,6 +209,9 @@ func (vs *VolumeServer) VolumeEcShardsCopy(ctx context.Context, req *volume_serv
 // the shard should not be mounted before calling this.
 func (vs *VolumeServer) VolumeEcShardsDelete(ctx context.Context, req *volume_server_pb.VolumeEcShardsDeleteRequest) (*volume_server_pb.VolumeEcShardsDeleteResponse, error) {
 
+	if err := storage.ValidateCollectionName(req.Collection); err != nil {
+		return nil, err
+	}
 	bName := erasure_coding.EcShardBaseFileName(req.Collection, int(req.VolumeId))
 
 	glog.V(0).Infof("ec volume %s shard delete %v", bName, req.ShardIds)

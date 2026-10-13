@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -71,6 +72,16 @@ func (v *Volume) String() string {
 	v.noWriteLock.RLock()
 	defer v.noWriteLock.RUnlock()
 	return fmt.Sprintf("Id:%v dir:%s dirIdx:%s Collection:%s dataFile:%v nm:%v noWrite:%v canDelete:%v", v.Id, v.dir, v.dirIdx, v.Collection, v.DataBackend, v.nm, v.noWriteOrDelete || v.noWriteCanDelete, v.noWriteCanDelete)
+}
+
+// ValidateCollectionName rejects collection names that would escape the volume
+// directory once joined into a file name. Collections come from untrusted
+// requests (assign, volume copy, EC shard operations).
+func ValidateCollectionName(collection string) error {
+	if strings.ContainsAny(collection, "/\\\x00") {
+		return fmt.Errorf("invalid collection name %q", collection)
+	}
+	return nil
 }
 
 func VolumeFileName(dir string, collection string, id int) (fileName string) {

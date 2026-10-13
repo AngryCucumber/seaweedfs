@@ -160,6 +160,9 @@ func (s *Store) FindFreeLocation(filterFn func(location *DiskLocation) bool) (re
 	return ret
 }
 func (s *Store) addVolume(vid needle.VolumeId, collection string, needleMapKind NeedleMapKind, replicaPlacement *super_block.ReplicaPlacement, ttl *needle.TTL, preallocate int64, memoryMapMaxSizeMb uint32, diskType DiskType, ldbTimeout int64) error {
+	if err := ValidateCollectionName(collection); err != nil {
+		return err
+	}
 	if s.findVolume(vid) != nil {
 		return fmt.Errorf("Volume Id %d already exists!", vid)
 	}
