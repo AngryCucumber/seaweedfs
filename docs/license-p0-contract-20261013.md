@@ -72,7 +72,7 @@ P0 只交付契约与核对记录，不含实现与运行测试。
 2. `product != "MassDB OSS"` → `LICENSE_PRODUCT_MISMATCH`；`deployment_id != cluster_id` → `LICENSE_DEPLOYMENT_MISMATCH`。
 3. `expires_at <= now` → `LICENSE_EXPIRED`（不接受已过期证书，避免高序号过期证书顶掉仍有效的证书）。
 4. 与 `newest` 比较：字节相同 → 幂等成功（只重新推送，不重置水位）；`sequence` 相同字节不同 → `LICENSE_SEQUENCE_CONFLICT`；`sequence` 更低 → `LICENSE_SEQUENCE_NOT_INCREASING`。
-5. 三类额度分别 ≥ 当前账本条目数，否则 `LICENSE_NODE_LIMIT_TOO_SMALL`；`newest` 未生效期间按 `min(prev, newest)` 校验。
+5. 新证书自身的三类额度分别 ≥ 当前账本条目数，否则 `LICENSE_NODE_LIMIT_TOO_SMALL`（P1 修订：它生效后只有它的额度适用；`min(prev, newest)` 只用于等待期的准入，不用于导入校验）。
 6. 缺少 `DATA_READ` 不拒绝导入，状态为 `FEATURE_MISSING`。
 7. master 不检查 `customer_id` 连续性与 `license_id` 唯一性（签发方登记与 `sign --previous` 负责）。
 
@@ -103,7 +103,7 @@ P0 只交付契约与核对记录，不含实现与运行测试。
 | `NOT_READY` | **仅节点** | 无缓存且未收到首帧 |
 | `NODE_REJECTED` | **仅节点** | 本节点注册因额度被拒；volume 经 `license_reject_reason`、filer 经 `PermissionDenied` 得知 |
 
-节点拒读原因的优先级（多个同时成立时取第一个）：`NOT_READY` > `NODE_REJECTED` > `CLOCK_SUSPECT` > `NO_LICENSE` > `NOT_YET_VALID` > `EXPIRED` > `FEATURE_MISSING`。master 的 `status` 在 `RECONCILING` 时优先显示 `RECONCILING`，其余同上（去掉两个仅节点码）。
+节点拒读原因的优先级（多个同时成立时取第一个）：`NODE_REJECTED` > `NOT_READY` > `CLOCK_SUSPECT` > `NO_LICENSE` > `NOT_YET_VALID` > `EXPIRED` > `FEATURE_MISSING`。master 的 `status` 在 `RECONCILING` 时优先显示 `RECONCILING`，其余同上（去掉两个仅节点码）。P1 修订：`NODE_REJECTED` 排到 `NOT_READY` 之前，否则首次心跳即被拒、没有缓存的新节点会显示 `NOT_READY`，与 S9 期望的 `NODE_REJECTED` 不符。
 
 ### 2.2 读拒绝的对外表现
 
@@ -175,7 +175,7 @@ HTTP body `{"error":"<码>","message":"<不含证书原文的说明>"}`；gRPC �
 | 状态文件 | master `<mdir>/license/state.json`；volume 第一个 `-dir` 下 `license-cache.json`；filer `-defaultStoreDir` 下 `license-cache.json`；均为写临时文件 + `fsync` + `rename` |
 | 无证书时的准入 | volume 0、filer 0；master 只允许 `-peers` ≤ 1 的新集群引导，动态加入 0（5.1） |
 | 宽限 | 10 分钟 |
-| 节点时钟 ticker | 500 ms |
+| 节点时钟 | 500 ms ticker；锚点为 `LicenseUpdate.master_now_unix_ms`（P1 修订为毫秒）加锚定后的单调流逝 |
 | 账本批次 | ≤ 5 秒合并一次，在途至多一个，超时 5 秒 |
 | 锁内 RPC 截止 | 单 peer 3 秒、整体 10 秒 |
 | 时钟可疑阈值 | 墙钟 < 水位 − 5 秒；水位每 60 秒落盘 |

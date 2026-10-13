@@ -208,7 +208,7 @@ SeaweedFS 没有 `ALTER SYSTEM ADD/DROP`，volume server 通过心跳自动注�
 message LicenseUpdate {
   string newest_certificate = 1;
   string prev_certificate = 2;      // 可空；与 newest 整体应用
-  int64  master_now_unix = 3;
+  int64  master_now_unix_ms = 3;   // P1 改为毫秒，到期判定误差不再多出 1 秒
   string cluster_id = 4;
   string master_deny_reason = 5;    // CLOCK_SUSPECT / NODE_REJECTED（RECONCILING 不下发，见 3.3）
   bytes  internal_read_key = 6;
@@ -237,14 +237,14 @@ rpc SyncLedger    (SyncLedgerRequest)    returns (SyncLedgerResponse);   // lead
 | `KeepConnected`（filer、follower master、broker、shell） | `addClient` 后在流上发首帧（`internal_read_key` 只对 filer 填，1.4）；既有 5 秒 ticker 分支（[master_grpc_server.go:325](../weed/server/master_grpc_server.go:325)）做版本比较并直接 `stream.Send`。**不走 `broadcastToClients`**（队列满丢消息，[master_grpc_server.go:346](../weed/server/master_grpc_server.go:346)） | 每客户端每 5 秒一次整数比较 |
 
 节点侧应用规则（幂等）：
-- `master_now_unix`、`master_deny_reason`、`internal_read_key`：每次收到都应用。
+- `master_now_unix_ms`、`master_deny_reason`、`internal_read_key`：每次收到都应用。
 - `newest/prev`：验签通过后按 3.2 比较整体替换；相同序号不重复落盘。
 - 客户端首帧与后续循环是两段代码（[masterclient.go:226](../weed/wdclient/masterclient.go:226)、`:248`），两处都调用 `OnLicenseUpdate`；KeepConnected 返回 `PermissionDenied` 且消息以 `license:` 开头时也调用，置 `NODE_REJECTED`。
 - [master_grpc_server.go:319](../weed/server/master_grpc_server.go:319) 发送失败日志改为只打印消息类型与版本号。
 
 ### 4.3 节点时间口径
 
-每个 `license.Node` 实例一个 500 ms ticker 维护原子时钟：有 master 锚点时取 `master_now_unix + 自锚定以来的单调流逝`，无锚点退回本地墙钟；不与本地墙钟取较大值。同一 ticker 按 3.2 推导生效证书并在变化时替换快照。
+每个 `license.Node` 实例一个 500 ms ticker 维护原子时钟：有 master 锚点时取 `master_now_unix_ms + 自锚定以来的单调流逝`（按毫秒累计后取整秒），无锚点退回本地墙钟；不与本地墙钟取较大值。同一 ticker 按 3.2 推导生效证书并在变化时替换快照。
 
 实现要点：manager 锁内同步等待的 RPC 只有四类低频操作（导入多数派推送、加入两阶段同步、移除前重提交、选主对账），都带截止时间（单 peer 3 秒、整体 10 秒）；普通账本复制按 3.4 在锁外发 RPC；mount 的限频重解析用 single-flight 保证同一句柄同时只有一次重建，重建结果只在当前分块表仍为失败态时写入，不覆盖并发写入已追加的块。
 
@@ -357,15 +357,16 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 
 | 文件 | 内容 |
 | --- | --- |
-| `claims.go` | 声明结构、严格解析、字段校验 |
-| `jws.go` | compact JWS 拆分、base64url、Ed25519 验签 |
-| `trust.go` | 内置公钥清单；测试根注入点 |
-| `state.go` | `LicenseState` 比较、`effective(now)` 推导、有效额度 |
-| `snapshot.go` | 不可变快照、`AllowRead()`、预序列化 403 |
-| `ledger.go` | 成员账本、宽限、快照序列化、原子预占 |
-| `manager.go` | master 侧：导入/验证/水位与 repair_seq/voter 多数派推送/任期与配置索引校验/选主对账与写回/账本 `(term,revision)` 复制与对账/对账期间注册延后/内部令牌/`CheckMasterJoin` 两阶段/`BeforeRemoveVoter`/`voters_acked` |
-| `node.go` | volume/filer 侧：接收 `LicenseUpdate`、整体替换、缓存、时间锚定、`NODE_REJECTED`、内部令牌校验 |
-| `errors.go` | 原因码与 HTTP 映射、403 写出（含清理对象头） |
+| `reason.go` | 状态码、管理错误码与 HTTP/gRPC 映射（P1 已完成） |
+| `strictjson.go`、`text.go` | 协议 v1 严格 JSON 解析与文本码点规则，与签发工具逐条一致（P1 已完成） |
+| `claims.go` | 声明结构、字段校验（P1 已完成） |
+| `jws.go` | compact JWS 拆分、规范 base64url、Ed25519 验签（P1 已完成） |
+| `trust.go` | 信任清单解析、内置公钥清单、测试根注入点（P1 已完成） |
+| `state.go` | `(newest, prev)` 比较、`Effective(now)` 推导、有效额度、导入校验、时钟水位与三分支修复（P1 已完成） |
+| `guard.go` | 不可变快照、`AllowRead()`、预序列化 403、内部令牌校验（P1 已完成） |
+| `ledger.go` | 成员账本、宽限、释放、接管转换、`(term, revision)` 排序（P1 已完成；原子预占由 P2 manager 锁提供） |
+| `manager.go`（P2） | master 侧：导入/验证/水位与 repair_seq/voter 多数派推送/任期与配置索引校验/选主对账与写回/账本 `(term,revision)` 复制与对账/对账期间注册延后/内部令牌/`CheckMasterJoin` 两阶段/`BeforeRemoveVoter`/`voters_acked` |
+| `node.go` | volume/filer 侧：接收 `LicenseUpdate`、整体替换、缓存、毫秒时间锚定、`NODE_REJECTED`（P1 已完成） |
 | `*_test.go` | 已知答案向量、到期边界、回拨与三分支修复、`(newest,prev)` 排序与生效推导、降额、账本与宽限、voter 多数派、任期拒绝、对账写回、`NOT_READY` 下无头/空头/错长度令牌拒绝、`AllocsPerRun`、Benchmark |
 
 ### 7.2 修改的既有文件
@@ -424,7 +425,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | 阶段 | 工作 | 完成证据 | 估时 |
 | --- | --- | --- | --- |
 | P0 契约 | 冻结 claims、挂点、原因码、第 9 节决策 | **已确认（2026-10-13）**：[P0 契约](license-p0-contract-20261013.md) | 0.5 天 |
-| P1 核心包 | `weed/license` 全部 + 单测 | `go test ./weed/license/...`；7.1 测试清单全部通过；Benchmark 达标 | 3 天 |
+| P1 核心包 | `weed/license` 除 `manager.go` 外全部 + 单测（manager 依赖 proto 与 raft，并入 P2） | **已完成（2026-10-13）**：`go test -race ./weed/license/` 通过；签发工具 + OpenSSL 3 签发的互通向量验证通过；`AllowRead` 0 分配，单核约 0.65 ns/op；7.1 测试清单中 voter 多数派、任期、对账写回三项随 manager 在 P2 完成 | 3 天 |
 | P2 master 管理 | proto（先行）、manager、HTTP/gRPC、voter 多数派、任期与配置索引、对账写回、账本 `(term,revision)` 复制与对账、对账期间注册延后、加入两阶段、移除前重提交、`voters_acked`、cluster_id、令牌、水位、页面 | 单 master 与 3 master（含 1 nonvoter 一组）、5 master 扩缩容实际导入/校验/切主/对账；页面导入；`license.init` 与 `-license.file`；日志无证书与令牌 | 6 天 |
 | P3 下发与拦截 | 按流对账、volume/filer 守卫、M1、G1（含 `filer.proto`、合并规则、客户端改动）、G2、缓存、内部令牌传递链、mount 错误传播、S3 两处 | S1–S8、S15–S20 | 6.5 天 |
 | P4 节点额度 | 账本、宽限、预占、`NODE_REJECTED`（volume 与 filer）、三个 master 加入入口、无证书额度 0 与 master 启动检查 | S9–S12、S21 | 2.5 天 |
