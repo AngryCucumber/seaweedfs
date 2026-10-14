@@ -42,6 +42,11 @@ const (
 	Seaweed_RaftAddServer_FullMethodName          = "/master_pb.Seaweed/RaftAddServer"
 	Seaweed_RaftRemoveServer_FullMethodName       = "/master_pb.Seaweed/RaftRemoveServer"
 	Seaweed_VolumeGrow_FullMethodName             = "/master_pb.Seaweed/VolumeGrow"
+	Seaweed_GetLicense_FullMethodName             = "/master_pb.Seaweed/GetLicense"
+	Seaweed_ImportLicense_FullMethodName          = "/master_pb.Seaweed/ImportLicense"
+	Seaweed_SyncLicense_FullMethodName            = "/master_pb.Seaweed/SyncLicense"
+	Seaweed_GetLedger_FullMethodName              = "/master_pb.Seaweed/GetLedger"
+	Seaweed_SyncLedger_FullMethodName             = "/master_pb.Seaweed/SyncLedger"
 )
 
 // SeaweedClient is the client API for Seaweed service.
@@ -71,6 +76,11 @@ type SeaweedClient interface {
 	RaftAddServer(ctx context.Context, in *RaftAddServerRequest, opts ...grpc.CallOption) (*RaftAddServerResponse, error)
 	RaftRemoveServer(ctx context.Context, in *RaftRemoveServerRequest, opts ...grpc.CallOption) (*RaftRemoveServerResponse, error)
 	VolumeGrow(ctx context.Context, in *VolumeGrowRequest, opts ...grpc.CallOption) (*VolumeGrowResponse, error)
+	GetLicense(ctx context.Context, in *GetLicenseRequest, opts ...grpc.CallOption) (*GetLicenseResponse, error)
+	ImportLicense(ctx context.Context, in *ImportLicenseRequest, opts ...grpc.CallOption) (*ImportLicenseResponse, error)
+	SyncLicense(ctx context.Context, in *SyncLicenseRequest, opts ...grpc.CallOption) (*SyncLicenseResponse, error)
+	GetLedger(ctx context.Context, in *GetLedgerRequest, opts ...grpc.CallOption) (*GetLedgerResponse, error)
+	SyncLedger(ctx context.Context, in *SyncLedgerRequest, opts ...grpc.CallOption) (*SyncLedgerResponse, error)
 }
 
 type seaweedClient struct {
@@ -320,6 +330,56 @@ func (c *seaweedClient) VolumeGrow(ctx context.Context, in *VolumeGrowRequest, o
 	return out, nil
 }
 
+func (c *seaweedClient) GetLicense(ctx context.Context, in *GetLicenseRequest, opts ...grpc.CallOption) (*GetLicenseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetLicenseResponse)
+	err := c.cc.Invoke(ctx, Seaweed_GetLicense_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *seaweedClient) ImportLicense(ctx context.Context, in *ImportLicenseRequest, opts ...grpc.CallOption) (*ImportLicenseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ImportLicenseResponse)
+	err := c.cc.Invoke(ctx, Seaweed_ImportLicense_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *seaweedClient) SyncLicense(ctx context.Context, in *SyncLicenseRequest, opts ...grpc.CallOption) (*SyncLicenseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SyncLicenseResponse)
+	err := c.cc.Invoke(ctx, Seaweed_SyncLicense_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *seaweedClient) GetLedger(ctx context.Context, in *GetLedgerRequest, opts ...grpc.CallOption) (*GetLedgerResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetLedgerResponse)
+	err := c.cc.Invoke(ctx, Seaweed_GetLedger_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *seaweedClient) SyncLedger(ctx context.Context, in *SyncLedgerRequest, opts ...grpc.CallOption) (*SyncLedgerResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SyncLedgerResponse)
+	err := c.cc.Invoke(ctx, Seaweed_SyncLedger_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SeaweedServer is the server API for Seaweed service.
 // All implementations must embed UnimplementedSeaweedServer
 // for forward compatibility.
@@ -347,6 +407,11 @@ type SeaweedServer interface {
 	RaftAddServer(context.Context, *RaftAddServerRequest) (*RaftAddServerResponse, error)
 	RaftRemoveServer(context.Context, *RaftRemoveServerRequest) (*RaftRemoveServerResponse, error)
 	VolumeGrow(context.Context, *VolumeGrowRequest) (*VolumeGrowResponse, error)
+	GetLicense(context.Context, *GetLicenseRequest) (*GetLicenseResponse, error)
+	ImportLicense(context.Context, *ImportLicenseRequest) (*ImportLicenseResponse, error)
+	SyncLicense(context.Context, *SyncLicenseRequest) (*SyncLicenseResponse, error)
+	GetLedger(context.Context, *GetLedgerRequest) (*GetLedgerResponse, error)
+	SyncLedger(context.Context, *SyncLedgerRequest) (*SyncLedgerResponse, error)
 	mustEmbedUnimplementedSeaweedServer()
 }
 
@@ -425,6 +490,21 @@ func (UnimplementedSeaweedServer) RaftRemoveServer(context.Context, *RaftRemoveS
 }
 func (UnimplementedSeaweedServer) VolumeGrow(context.Context, *VolumeGrowRequest) (*VolumeGrowResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method VolumeGrow not implemented")
+}
+func (UnimplementedSeaweedServer) GetLicense(context.Context, *GetLicenseRequest) (*GetLicenseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLicense not implemented")
+}
+func (UnimplementedSeaweedServer) ImportLicense(context.Context, *ImportLicenseRequest) (*ImportLicenseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ImportLicense not implemented")
+}
+func (UnimplementedSeaweedServer) SyncLicense(context.Context, *SyncLicenseRequest) (*SyncLicenseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SyncLicense not implemented")
+}
+func (UnimplementedSeaweedServer) GetLedger(context.Context, *GetLedgerRequest) (*GetLedgerResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLedger not implemented")
+}
+func (UnimplementedSeaweedServer) SyncLedger(context.Context, *SyncLedgerRequest) (*SyncLedgerResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SyncLedger not implemented")
 }
 func (UnimplementedSeaweedServer) mustEmbedUnimplementedSeaweedServer() {}
 func (UnimplementedSeaweedServer) testEmbeddedByValue()                 {}
@@ -828,6 +908,96 @@ func _Seaweed_VolumeGrow_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Seaweed_GetLicense_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetLicenseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SeaweedServer).GetLicense(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Seaweed_GetLicense_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SeaweedServer).GetLicense(ctx, req.(*GetLicenseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Seaweed_ImportLicense_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ImportLicenseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SeaweedServer).ImportLicense(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Seaweed_ImportLicense_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SeaweedServer).ImportLicense(ctx, req.(*ImportLicenseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Seaweed_SyncLicense_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SyncLicenseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SeaweedServer).SyncLicense(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Seaweed_SyncLicense_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SeaweedServer).SyncLicense(ctx, req.(*SyncLicenseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Seaweed_GetLedger_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetLedgerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SeaweedServer).GetLedger(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Seaweed_GetLedger_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SeaweedServer).GetLedger(ctx, req.(*GetLedgerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Seaweed_SyncLedger_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SyncLedgerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SeaweedServer).SyncLedger(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Seaweed_SyncLedger_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SeaweedServer).SyncLedger(ctx, req.(*SyncLedgerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Seaweed_ServiceDesc is the grpc.ServiceDesc for Seaweed service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -914,6 +1084,26 @@ var Seaweed_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "VolumeGrow",
 			Handler:    _Seaweed_VolumeGrow_Handler,
+		},
+		{
+			MethodName: "GetLicense",
+			Handler:    _Seaweed_GetLicense_Handler,
+		},
+		{
+			MethodName: "ImportLicense",
+			Handler:    _Seaweed_ImportLicense_Handler,
+		},
+		{
+			MethodName: "SyncLicense",
+			Handler:    _Seaweed_SyncLicense_Handler,
+		},
+		{
+			MethodName: "GetLedger",
+			Handler:    _Seaweed_GetLedger_Handler,
+		},
+		{
+			MethodName: "SyncLedger",
+			Handler:    _Seaweed_SyncLedger_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

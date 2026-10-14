@@ -153,18 +153,9 @@ func (n *Node) InternalKey() []byte {
 }
 
 func (n *Node) parseCerts(newest, prev string) (Certs, error) {
-	var c Certs
-	if newest == "" {
-		return c, nil
-	}
-	var err error
-	if c.Newest, err = ParseCertificate([]byte(newest), n.trust); err != nil {
+	c, err := parseCertPair(n.trust, newest, prev)
+	if err != nil {
 		return Certs{}, err
-	}
-	if prev != "" {
-		if c.Prev, err = ParseCertificate([]byte(prev), n.trust); err != nil {
-			return Certs{}, err
-		}
 	}
 	for _, cert := range []*Certificate{c.Newest, c.Prev} {
 		if cert != nil && n.clusterID != "" && cert.Claims.DeploymentID != n.clusterID {

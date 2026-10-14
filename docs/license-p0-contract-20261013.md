@@ -143,6 +143,8 @@ HTTP body `{"error":"<码>","message":"<不含证书原文的说明>"}`；gRPC �
 
 `validate` 与 `import` 共用 1.5 的检查与错误码，成功时返回 200 和摘要（不含原文），不落盘、不推送。
 
+P2 修订：请求体除 `{"certificate":"<jws>"}` 与 multipart `file` 外也接受证书原文；`NOT_LEADER` 的 `leader` 是 leader 的 HTTP 地址；移除 voter 前的重提交未达剩余 voter 多数派时返回 `PARTIAL_COMMIT`。
+
 ### 2.4 注册结果
 
 | 场景 | volume（`SendHeartbeat`） | filer（`KeepConnected`） | master 加入 |
@@ -262,6 +264,8 @@ MassDB SQL 的规则是“无可信额度仅允许已证明的新集群首 FE �
 | `weed server` 单进程 | 内置 master 可启动，内置 volume 与 filer 在导入前注册被拒；评估与开发环境也需要证书（可签发短期试用证书） |
 | 运维告警 | `<mdir>` 位于 `os.TempDir()` 之下时 master 启动打 warn（`-mdir` 默认值就是临时目录） |
 | 边界 | `-clusterId` 与手改 `state.json` 等价，集群绑定只防误用、不防有意复制 |
+
+P2 修订：每个 master 在 raft 启动前把 `-license.file` 按 1.5 第 1–5 条（额度按本地账本，master 数由启动检查判定）应用到自己的 `state.json`，已应用或被更高序号取代的文件跳过；启动检查与选主对账都基于这份本地状态。
 
 ### 5.2 决策 4：volume gRPC 数据读守卫（G2）
 

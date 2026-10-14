@@ -78,6 +78,8 @@
         </div>
     </div>
 
+    {{ with .License }}{{ template "license" . }}{{ end }}
+
     <div class="row">
         <h2>Topology</h2>
         <table class="table table-striped">

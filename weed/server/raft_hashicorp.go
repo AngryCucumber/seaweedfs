@@ -4,6 +4,7 @@ package weed_server
 // https://github.com/Jille/raft-grpc-example/blob/cd5bcab0218f008e044fbeee4facdd01b06018ad/application.go#L18
 
 import (
+	"context"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -66,7 +67,7 @@ func (s *RaftServer) monitorLeaderLoop(updatePeers bool) {
 			if isLeader {
 
 				if updatePeers {
-					s.updatePeers()
+					go s.updatePeers()
 					updatePeers = false
 				}
 
@@ -83,7 +84,23 @@ func (s *RaftServer) monitorLeaderLoop(updatePeers bool) {
 	}
 }
 
+// updatePeers aligns the raft configuration with -peers. Joins and
+// removals go through the license manager, which needs the leader's
+// license reconcile to finish first.
 func (s *RaftServer) updatePeers() {
+	ctx, cancel := context.WithTimeout(context.Background(), updatePeersTimeout)
+	defer cancel()
+	if err := s.license.WaitReconciled(ctx); err != nil {
+		glog.Warningf("not updating raft peers: %v", err)
+		return
+	}
+	remove := func(peer string) {
+		if err := s.license.RemoveMaster(ctx, peer, func() error {
+			return s.RaftHashicorp.RemoveServer(raft.ServerID(peer), 0, 0).Error()
+		}); err != nil {
+			glog.Warningf("removing raft peer %s: %v", peer, err)
+		}
+	}
 	peerLeader := string(s.serverAddr)
 	existsPeerName := make(map[string]bool)
 	for _, server := range s.RaftHashicorp.GetConfiguration().Configuration().Servers {
@@ -98,18 +115,19 @@ func (s *RaftServer) updatePeers() {
 			continue
 		}
 		glog.V(0).Infof("adding new peer: %s", peerName)
-		s.RaftHashicorp.AddVoter(
-			raft.ServerID(peerName), raft.ServerAddress(peer.ToGrpcAddress()), 0, 0)
+		if err := s.license.JoinMaster(ctx, peerName, peer.ToGrpcAddress(), true); err != nil {
+			glog.Warningf("adding raft peer %s: %v", peerName, err)
+		}
 	}
 	for peer := range existsPeerName {
 		if _, found := s.peers[peer]; !found {
 			glog.V(0).Infof("removing old peer: %s", peer)
-			s.RaftHashicorp.RemoveServer(raft.ServerID(peer), 0, 0)
+			remove(peer)
 		}
 	}
 	if _, found := s.peers[peerLeader]; !found {
 		glog.V(0).Infof("removing old leader peer: %s", peerLeader)
-		s.RaftHashicorp.RemoveServer(raft.ServerID(peerLeader), 0, 0)
+		remove(peerLeader)
 	}
 }
 
@@ -119,6 +137,7 @@ func NewHashicorpRaftServer(option *RaftServerOption) (*RaftServer, error) {
 		serverAddr: option.ServerAddr,
 		dataDir:    option.DataDir,
 		topo:       option.Topo,
+		license:    option.License,
 	}
 
 	c := raft.DefaultConfig()
@@ -143,6 +162,10 @@ func NewHashicorpRaftServer(option *RaftServerOption) (*RaftServer, error) {
 	}
 
 	if option.RaftBootstrap {
+		// Check before the raft data is wiped.
+		if err := s.license.CheckBootstrap(len(s.peers)); err != nil {
+			return nil, err
+		}
 		os.RemoveAll(path.Join(s.dataDir, ldbFile))
 		os.RemoveAll(path.Join(s.dataDir, sdbFile))
 		os.RemoveAll(path.Join(s.dataDir, "snapshots"))
@@ -177,6 +200,11 @@ func NewHashicorpRaftServer(option *RaftServerOption) (*RaftServer, error) {
 
 	updatePeers := false
 	if option.RaftBootstrap || len(s.RaftHashicorp.GetConfiguration().Configuration().Servers) == 0 {
+		// A new configuration needs the license check; members with an
+		// existing configuration restart without it (contract 5.1).
+		if err := s.license.CheckBootstrap(len(s.peers)); err != nil {
+			return nil, err
+		}
 		cfg := s.AddPeersConfiguration()
 		// Need to get lock, in case all servers do this at the same time.
 		peerIdx := getPeerIdx(s.serverAddr, s.peers)

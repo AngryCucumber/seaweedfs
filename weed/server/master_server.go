@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/license"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/sequence"
@@ -52,6 +53,8 @@ type MasterOption struct {
 	MetricsAddress          string
 	MetricsIntervalSec      int
 	IsFollower              bool
+	// LicenseFile is -license.file, applied to <mdir>/license before raft starts.
+	LicenseFile string
 }
 
 type MasterServer struct {
@@ -76,6 +79,8 @@ type MasterServer struct {
 	adminLocks *AdminLocks
 
 	Cluster *cluster.Cluster
+
+	License *license.Manager
 }
 
 func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.ServerAddress) *MasterServer {
@@ -131,6 +136,9 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 	ms.vg = topology.NewDefaultVolumeGrowth()
 	glog.V(0).Infoln("Volume Size Limit is", ms.option.VolumeSizeLimitMB, "MB")
 
+	ms.License = newLicenseManager(ms)
+	go ms.License.Run(nil)
+
 	ms.guard = security.NewGuard(append(ms.option.WhiteList, whiteList...), signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 
 	handleStaticResources2(r)
@@ -146,6 +154,11 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		r.HandleFunc("/vol/vacuum", ms.proxyToLeader(ms.guard.WhiteList(ms.volumeVacuumHandler)))
 		r.HandleFunc("/submit", ms.guard.WhiteList(ms.submitFromMasterServerHandler))
 		r.HandleFunc("/collection/info", ms.guard.WhiteList(ms.collectionInfoHandler))
+		r.HandleFunc("/license", ms.guard.WhiteList(ms.licenseStatusHandler))
+		r.HandleFunc("/license/deployment", ms.guard.WhiteList(ms.licenseDeploymentHandler))
+		r.HandleFunc("/license/validate", ms.guard.WhiteList(ms.licenseValidateHandler))
+		r.HandleFunc("/license/import", ms.guard.WhiteList(ms.licenseImportHandler))
+		r.HandleFunc("/license/nodes/{addr}", ms.guard.WhiteList(ms.licenseNodeHandler))
 		/*
 			r.HandleFunc("/stats/health", ms.guard.WhiteList(statsHealthHandler))
 			r.HandleFunc("/stats/counter", ms.guard.WhiteList(statsCounterHandler))
@@ -369,9 +382,7 @@ func (ms *MasterServer) OnPeerUpdate(update *master_pb.ClusterNodeUpdate, startF
 		}
 		if !raftServerFound {
 			glog.V(0).Infof("adding new raft server: %s", peerName)
-			ms.Topo.HashicorpRaft.AddVoter(
-				hashicorpRaft.ServerID(peerName),
-				hashicorpRaft.ServerAddress(peerAddress.ToGrpcAddress()), 0, 0)
+			go ms.licenseJoinMaster(peerName, peerAddress.ToGrpcAddress())
 		}
 	} else {
 		pb.WithMasterClient(false, peerAddress, ms.grpcDialOption, true, func(client master_pb.SeaweedClient) error {

@@ -1,0 +1,114 @@
+{{ define "license" }}
+<div class="row">
+    <div class="col-sm-12">
+        <h2>License</h2>
+        <table class="table table-condensed table-striped">
+            <tbody>
+            <tr>
+                <th class="col-sm-3">Status</th>
+                <td><span class="label {{ licenseLabel . }}">{{ .Status }}</span>
+                    {{ if eq .TrustRoot "test" }}<span class="label label-default">test trust root</span>{{ end }}
+                    <small>{{ .Role }}</small></td>
+            </tr>
+            <tr>
+                <th>Cluster ID</th>
+                <td><code>{{ .ClusterID }}</code></td>
+            </tr>
+            {{ with .Effective }}
+            <tr>
+                <th>Customer</th>
+                <td>{{ .CustomerID }} ({{ .Edition }})</td>
+            </tr>
+            <tr>
+                <th>Certificate in effect</th>
+                <td>{{ .LicenseID }}, sequence {{ .Sequence }}, valid {{ unixTime .NotBefore }} to {{ unixTime .ExpiresAt }}</td>
+            </tr>
+            {{ end }}
+            <tr class="{{ licenseExpiryClass . }}">
+                <th>Expires</th>
+                <td>{{ if .Effective }}{{ unixTime .ExpiresAt }} ({{ .DaysRemaining }} days left){{ else }}-{{ end }}</td>
+            </tr>
+            {{ if licensePending . }}{{ with .Newest }}
+            <tr>
+                <th>Next certificate</th>
+                <td>{{ .LicenseID }}, sequence {{ .Sequence }}, starts {{ unixTime .NotBefore }}</td>
+            </tr>
+            {{ end }}{{ end }}
+            {{ with .Nodes }}
+            <tr>
+                <th>Masters</th>
+                <td>{{ (index . "master").Online }} / {{ (index . "master").Limit }}</td>
+            </tr>
+            <tr>
+                <th>Volume servers</th>
+                <td>{{ (index . "volume_server").Online }} online, {{ (index . "volume_server").Grace }} in grace / {{ (index . "volume_server").Limit }}</td>
+            </tr>
+            <tr>
+                <th>Filers</th>
+                <td>{{ (index . "filer").Online }} online, {{ (index . "filer").Grace }} in grace / {{ (index . "filer").Limit }}</td>
+            </tr>
+            {{ end }}
+            <tr>
+                <th>Repair sequence</th>
+                <td>{{ .RepairSeq }}</td>
+            </tr>
+            </tbody>
+        </table>
+
+        <form id="license-form" onsubmit="return false;">
+            <div class="form-group">
+                <label for="license-file">Certificate</label>
+                <input type="file" id="license-file">
+                <textarea class="form-control" id="license-text" rows="3" placeholder="or paste the certificate"></textarea>
+            </div>
+            <button type="button" class="btn btn-default" onclick="licenseSubmit('validate')">Validate</button>
+            <button type="button" class="btn btn-primary" onclick="licenseSubmit('import')">Import</button>
+        </form>
+        <pre id="license-result" style="display: none; margin-top: 10px;"></pre>
+    </div>
+</div>
+<script>
+function licenseShow(text) {
+    var el = document.getElementById('license-result');
+    el.style.display = 'block';
+    el.textContent = text;
+}
+function licenseSend(action, certificate) {
+    var req = new XMLHttpRequest();
+    req.open('POST', '/license/' + action);
+    req.setRequestHeader('Content-Type', 'application/json');
+    req.onload = function () {
+        var body;
+        try { body = JSON.parse(req.responseText); } catch (e) { body = req.responseText; }
+        var text = req.status + ' ' + JSON.stringify(body, null, 2);
+        if (body && body.error === 'NOT_LEADER' && body.leader) {
+            text = 'This master is not the leader; import on http://' + body.leader + '/\n\n' + text;
+        }
+        licenseShow(text);
+        if (action === 'import' && req.status === 200) {
+            setTimeout(function () { location.reload(); }, 1500);
+        }
+    };
+    req.onerror = function () { licenseShow('request failed'); };
+    req.send(JSON.stringify({certificate: certificate.trim()}));
+}
+function licenseSubmit(action) {
+    if (action === 'import' && !confirm('Import this license certificate into the cluster?')) {
+        return;
+    }
+    var file = document.getElementById('license-file').files[0];
+    if (file) {
+        var reader = new FileReader();
+        reader.onload = function () { licenseSend(action, reader.result); };
+        reader.readAsText(file);
+        return;
+    }
+    var text = document.getElementById('license-text').value;
+    if (!text.trim()) {
+        licenseShow('choose a certificate file or paste the certificate');
+        return;
+    }
+    licenseSend(action, text);
+}
+</script>
+{{ end }}

@@ -17,7 +17,9 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 
 	"github.com/seaweedfs/raft"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
@@ -134,6 +136,11 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			if heartbeat.Ip == "" {
 				continue
 			} // ToDo must be removed after update major version
+			// A new leader admits no node before its license reconcile is
+			// done; the volume server retries.
+			if ms.License.Reconciling() {
+				return status.Error(codes.Unavailable, "license: RECONCILING")
+			}
 			dcName, rackName := ms.Topo.Configuration.Locate(heartbeat.Ip, heartbeat.DataCenter, heartbeat.Rack)
 			dc := ms.Topo.GetOrCreateDataCenter(dcName)
 			rack := dc.GetOrCreateRack(rackName)
@@ -262,6 +269,9 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 	if !ms.Topo.IsLeader() {
 		return ms.informNewLeader(stream)
 	}
+	if ms.License.Reconciling() {
+		return status.Error(codes.Unavailable, "license: RECONCILING")
+	}
 
 	clientAddress := req.ClientAddress
 	// Ensure that the clientAddress is unique.
@@ -318,7 +328,8 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 		select {
 		case message := <-messageChan:
 			if err := stream.Send(message); err != nil {
-				glog.V(0).Infof("=> client %v: %+v", clientName, message)
+				// Never log the message itself: it may carry license state.
+				glog.V(0).Infof("=> client %v: send %s: %v", clientName, keepConnectedKind(message), err)
 				return err
 			}
 		case <-ticker.C:
@@ -432,4 +443,17 @@ func (ms *MasterServer) GetMasterConfiguration(ctx context.Context, req *master_
 	}
 
 	return resp, nil
+}
+
+// keepConnectedKind names a KeepConnected message for logs.
+func keepConnectedKind(m *master_pb.KeepConnectedResponse) string {
+	switch {
+	case m.License != nil:
+		return fmt.Sprintf("license state_version %d", m.License.StateVersion)
+	case m.VolumeLocation != nil:
+		return "volume location"
+	case m.ClusterNodeUpdate != nil:
+		return "cluster node update"
+	}
+	return "empty message"
 }

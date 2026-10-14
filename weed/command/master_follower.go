@@ -39,6 +39,7 @@ func init() {
 	mf.metricsAddress = aws.String("")
 	mf.metricsIntervalSec = aws.Int(0)
 	mf.raftResumeState = aws.Bool(false)
+	mf.licenseFile = aws.String("")
 }
 
 var cmdMasterFollower = &Command{

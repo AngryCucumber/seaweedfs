@@ -16,6 +16,8 @@
 
 **v9 相对 v8 的变化（P0 契约冻结，用户确认第 9 节）：** 决策 2 改为对齐 MassDB SQL 的“无证书不能加入节点”（volume、filer 额度 0，master 只允许单 master 新集群引导，启动前做本地证书检查），补 `weed license.init` 与 `-license.file` 的先取证后部署/升级路径（3.4）；决策 4 改为封堵 volume gRPC 中返回数据正文的 7 个 RPC，volume↔volume 经 gRPC 元数据携带内部令牌（1.2 G2）；决策 9 改为封堵 gRPC 面内联正文，`filer.proto` 加 `content_hidden`，写入按合并规则保留正文，系统目录豁免，filer 之间带令牌，订阅/复制/备份遇隐藏正文停在事件处，mount 返回 `EIO` 并限频重取（1.5）。核对 v8 全部源码引用后修订：M1 补目录条目 `?metadata=true` 分支；F1 前移到 `checkPreconditions` 之前、限 GET、免清理对象头；F2 限 GET；`internal_read_key` 只发给 volume 与 filer；任期改用 `CurrentTerm()`；`-mdir` 默认临时目录告警。合计估时约 20.5 人天。
 
+**P2 完成（2026-10-13）：** master 侧 manager、proto（含 `filer.proto` 字段）、gRPC/HTTP 管理接口、选主对账与写回、成员变更两阶段与移除前重提交、账本复制、`license.init`、`-license.file`、master 启动检查、页面与 shell 命令已实现并经单 master、3 master（goraft 与 hashicorp）、3→5 master 扩容与缩容的真实进程验证；实现与本文的差异及未覆盖项见 8.1。
+
 本文是实施计划，不是功能已完成声明。第 9 节的取舍已于 2026-10-13 由用户确认（决策 2、4、9 改选备选），证书声明、原因码、线格式常量与源码挂点以 [P0 契约](license-p0-contract-20261013.md) 为准。
 
 ---
@@ -161,7 +163,7 @@ v3 的 `(active, pending)` 加“到点激活”转换被审核证明无法定�
 3. **`SyncLicense` 携带 `leader_address` 与 `leader_term`。** follower 只接受 `leader_address == Topo.Leader()` **且 `leader_term == 本地 raft 当前任期`**（hashicorp `CurrentTerm()`，goraft `Term()`）的请求；不用“最高已收到的 Sync 任期”，避免同一地址 term1 当选、落选、term3 再当选时 term1 的迟到请求被接受。
 4. leader 先写本地 `state.json`，再同步推送；voter 成功数（含自身）达到多数派返回 200；否则 503 `PARTIAL_COMMIT` 列出失败 peer，leader 本地保留已落盘状态。**相同字节的证书重试导入视为幂等**，只重新推送；同 `sequence` 不同内容 409。
 5. **选主对账并写回：** 成为 leader 后向所有 peer 调 `GetLicense`，需收到 voter 多数派（含自身）的响应；按 3.2 规则选出最高状态；**然后把选中的状态同步推送到 voter 多数派并得到确认，才退出 `RECONCILING`**。对账中 `GET /license` 为 `RECONCILING`，导入与成员变更返回 503；**不向节点下发任何拒读原因**，节点保留现有授权快照并按本地时钟评估，授权层的读写行为不变（可用性仍受 master 不可用期间既有行为影响，例如 filer 拿不到新的 volume 位置）；未达多数派每 5 秒重试，不在请求路径。审核中的反例（A 的 `PARTIAL_COMMIT` 少数派状态 11 被新 leader B 选中并下发，A/B 随后不可用，C/D/E 只能恢复到 10）在 v4 里 B 必须先把 11 写到 C/D/E 中至少两台才退出对账，之后任何多数派都能看到 11。
-6. follower 启动或重连 leader 时经 KeepConnected 首帧和按流对账拿到当前状态（4.2），按 3.2 替换。
+6. follower 启动或重连 leader 时经 KeepConnected 首帧和按流对账拿到当前状态（4.2），按 3.2 替换。**P2 实现：** 改为 leader 每 5 秒向尚未确认当前授权修订的成员重推 `SyncLicense`（带任期校验），follower master 不从 KeepConnected 应用授权状态；KeepConnected 的 `LicenseUpdate` 只给 volume/filer（P3）。
 7. **加入 voter 的两阶段流程（hashicorp）。** `SyncLicense` 要求接收方本地 raft 已认识当前 leader 且任期相同（第 3 条），全新节点在进入配置前拿不到这些状态，所以不能“先同步再加入”。顺序改为：(a) 三个加入入口先 `CheckMasterJoin()` 预占额度，然后以 **nonvoter** 加入（`AddNonvoter`）；(b) 等它的 raft 追平（`LastIndex` 接近 leader）并通过 KeepConnected 建流；(c) leader 在 manager 锁内向它 `SyncLicense` + `SyncLedger` 并等待确认，锁内同时排斥导入，因此“预同步完成到提升之间”不会漏掉新证书；(d) 确认后 `AddVoter` 提升。任一步失败保持 nonvoter 并告警，不计入 voter 多数派。`OnPeerUpdate` 与 `updatePeers` 的 `AddVoter` 改为走同一流程。
 8. **移除 voter 前先重提交。** `RaftRemoveServer`（[master_grpc_server_raft.go:87](../weed/server/master_grpc_server_raft.go:87)）、`updatePeers` 的 `RemoveServer`（[raft_hashicorp.go:107](../weed/server/raft_hashicorp.go:107)）、`OnPeerUpdate` 的远程移除（[master_server.go:383](../weed/server/master_server.go:383)）都先调 `License.BeforeRemoveVoter(target)`：计算移除后的 voter 集合，把当前已确认的 `LicenseState` 与账本重新推送到该集合并要求其多数派确认，成功才执行移除，否则拒绝并告警。审核反例（11 在 A/B 提交，C 仍为 10，先移 B 再移 A）在 v6 里移 B 时要先让 {A, C} 多数派持有 11，C 因此追平。
    **临界区：** “重提交确认 → 实际移除完成”整个区间持有 manager 互斥锁，与导入、加入两阶段、其他移除串行（现有 `RaftRemoveServer` 只拿 `RaftServerAccessLock` 读锁，[master_grpc_server_raft.go:64](../weed/server/master_grpc_server_raft.go:64)，不能提供这项互斥）。执行移除前再次核对“授权状态版本与配置索引都等于准备时记录的值”，不等则放弃本次移除并返回 409 让调用方重试。审核交错（两个移除分别完成确认后、执行前提交了 11，再依次移除 B、A 只剩持 10 的 C）因此不会发生：第二个移除的准备阶段要等第一个移除执行完，而导入被锁排斥到移除之后。锁内每个 peer 的 RPC 截止 3 秒、整个流程截止 10 秒，超时视为失败。
@@ -214,16 +216,20 @@ message LicenseUpdate {
   bytes  internal_read_key = 6;
   uint64 state_version = 7;         // 仅同流对账与展示；跨 master 不单调
 }
+message LicenseState { string cluster_id = 1; string newest_certificate = 2; string prev_certificate = 3;
+                       bytes internal_read_key = 4; int64 watermark = 5; int64 repair_seq = 6; }   // master 之间复制
 message NodeLedgerEntry { string address = 1; string node_type = 2; int64 last_seen_unix = 3; bool online = 4; }
 message NodeLedgerSnapshot { repeated NodeLedgerEntry entries = 1; uint64 term = 2; uint64 revision = 3; }
 HeartbeatResponse     { ... string license_reject_reason = 8; LicenseUpdate license = 9; }
 KeepConnectedResponse { ... LicenseUpdate license = 3; }
-rpc GetLicense    (GetLicenseRequest)    returns (GetLicenseResponse);
-rpc ImportLicense (ImportLicenseRequest) returns (ImportLicenseResponse);
-rpc SyncLicense   (SyncLicenseRequest)   returns (SyncLicenseResponse);  // leader_address、leader_term、config_index、LicenseState、watermark、repair_seq
-rpc GetLedger     (GetLedgerRequest)     returns (GetLedgerResponse);    // 选主对账
-rpc SyncLedger    (SyncLedgerRequest)    returns (SyncLedgerResponse);   // leader_address、leader_term、NodeLedgerSnapshot{(term,revision)}；voter 多数派确认
+rpc GetLicense    (GetLicenseRequest{include_state})          returns (GetLicenseResponse{status_json, state});
+rpc ImportLicense (ImportLicenseRequest{certificate, validate_only}) returns (ImportLicenseResponse{result_json});
+rpc SyncLicense   (SyncLicenseRequest{leader_address, leader_term, config_index, state}) returns (SyncLicenseResponse{state});
+rpc GetLedger     (GetLedgerRequest)                          returns (GetLedgerResponse{ledger});   // 选主对账
+rpc SyncLedger    (SyncLedgerRequest{leader_address, leader_term, ledger}) returns (SyncLedgerResponse); // voter 多数派确认
 ```
+
+P2 实现说明：`status_json`、`result_json` 与 HTTP 的 `GET /license`、`POST /license/import|validate` 是同一份 JSON，供 shell 打印；`include_state` 只给对账的 master 用（带 `internal_read_key`）。`SyncLicenseResponse.state` 是接收方应用后的状态，接收方更新时 leader 据此追平（8.1）。
 
 **带 `license` 的 `HeartbeatResponse` 必须同时填入当前 `VolumeSizeLimit` 与 `Preallocate`**（[volume_grpc_client_to_master.go:133](../weed/server/volume_grpc_client_to_master.go:133) 无条件读取）。
 
@@ -262,6 +268,7 @@ rpc SyncLedger    (SyncLedgerRequest)    returns (SyncLedgerResponse);   // lead
 
 - 每个 master 用自己的时钟每 60 秒把 `max(now, watermark)` 写入自己的 `state.json`。
 - 发现 `now < watermark - 5s`：`CLOCK_SUSPECT`，下发 `master_deny_reason`，节点拒读；墙钟重新超过水位后自动恢复。
+- 选主对账只采纳更高 `repair_seq` 的 `(watermark, repair_seq)`；同序号时 leader 保留自己的水位，不取各 peer 的最大值，避免一台时钟超前的 master 让新 leader 进入 `CLOCK_SUSPECT`（P2）。
 - 修复是带序号的显式操作：导入 `sequence` 更高且 `issued_at <= now` 的新证书时，leader 把 `watermark = issued_at`、`repair_seq = sequence` 持久化并经 `SyncLicense` 同步。**follower 三分支：** `repair_seq > 本地` 则无条件采用（允许降低水位）；`repair_seq == 本地` 则 `watermark = max`；`repair_seq < 本地` 忽略该请求的水位（v3 的“否则取 max”会让同任期迟到的低序号请求重新抬高水位）。重复导入现有证书不重置水位。
 - volume/filer 重启不缓存 `master_deny_reason`，到首帧前按缓存证书放行，秒级窗口，接受。
 
@@ -365,7 +372,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | `state.go` | `(newest, prev)` 比较、`Effective(now)` 推导、有效额度、导入校验、时钟水位与三分支修复（P1 已完成） |
 | `guard.go` | 不可变快照、`AllowRead()`、预序列化 403、内部令牌校验（P1 已完成） |
 | `ledger.go` | 成员账本、宽限、释放、接管转换、`(term, revision)` 排序（P1 已完成；原子预占由 P2 manager 锁提供） |
-| `manager.go`（P2） | master 侧：导入/验证/水位与 repair_seq/voter 多数派推送/任期与配置索引校验/选主对账与写回/账本 `(term,revision)` 复制与对账/对账期间注册延后/内部令牌/`CheckMasterJoin` 两阶段/`BeforeRemoveVoter`/`voters_acked` |
+| `manager.go`（P2 已完成）、`master_state.go` | master 侧：导入/验证/水位与 repair_seq/voter 多数派推送/任期与配置索引校验/选主对账与写回/账本 `(term,revision)` 复制与对账/对账期间注册延后/内部令牌/`CheckMasterJoin` 两阶段/`BeforeRemoveVoter`/`voters_acked` |
 | `node.go` | volume/filer 侧：接收 `LicenseUpdate`、整体替换、缓存、毫秒时间锚定、`NODE_REJECTED`（P1 已完成） |
 | `*_test.go` | 已知答案向量、到期边界、回拨与三分支修复、`(newest,prev)` 排序与生效推导、降额、账本与宽限、voter 多数派、任期拒绝、对账写回、`NOT_READY` 下无头/空头/错长度令牌拒绝、`AllocsPerRun`、Benchmark |
 
@@ -373,16 +380,16 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 
 | 文件 | 改动 | 估计行数 |
 | --- | --- | --- |
-| `weed/pb/master.proto` + 重新生成 | 4.1 | proto ~50 |
-| `weed/server/master_server.go` | manager 初始化；5 条路由；`OnPeerUpdate` 加入走两阶段、移除前 `BeforeRemoveVoter` | ~30 |
-| `weed/server/raft_hashicorp.go` | `updatePeers` 加入走两阶段、移除前 `BeforeRemoveVoter` | ~15 |
-| `weed/server/master_grpc_server_raft.go` | `RaftAddServer` 走两阶段；`RaftRemoveServer` 前 `BeforeRemoveVoter` | ~15 |
-| `weed/server/master_grpc_server.go` | `SendHeartbeat`：账本判新/预占/对账冻结 + 首帧与按流对账 + 响应填容量字段；`KeepConnected`：`addClient` 前预占 + 首帧 + ticker 对账；日志脱敏 | ~60 |
-| `weed/server/master_grpc_server_license.go`（新） | `GetLicense/ImportLicense/SyncLicense/GetLedger/SyncLedger`（任期与配置索引校验） | ~150 |
-| `weed/server/master_server_handlers_license.go`（新） | 5 个 HTTP handler | ~170 |
-| `weed/cluster/cluster.go` | `CountClusterNodes` | ~10 |
-| `weed/server/master_server_handlers_ui.go` | args 加 `License` | ~4 |
-| `weed/server/master_ui/master.html`、`masterNewRaft.html` | License 区块 | ~70 ×2 |
+| `weed/pb/master.proto` + 重新生成 | 4.1（P2 已完成） | proto ~90 |
+| `weed/server/master_server.go` | manager 初始化；5 条路由；`OnPeerUpdate` 加入走两阶段（后台等待对账完成）；远程移除经 `RaftRemoveServer` 已覆盖（P2 已完成） | ~30 |
+| `weed/server/raft_hashicorp.go`、`raft_server.go` | `updatePeers` 改为后台执行、等对账完成后加入走两阶段、移除前重提交；新配置引导前 `CheckBootstrap`（P2 已完成） | ~40 |
+| `weed/server/master_grpc_server_raft.go` | `RaftAddServer` 走两阶段；`RaftRemoveServer` 前重提交；不再跨调用持有 `RaftServerAccessLock`（P2 已完成） | ~15 |
+| `weed/server/master_grpc_server.go` | `SendHeartbeat`：账本判新/预占/对账冻结 + 首帧与按流对账 + 响应填容量字段；`KeepConnected`：`addClient` 前预占 + 首帧 + ticker 对账；日志脱敏（P2 已完成对账冻结与日志脱敏；首帧与按流对账 P3，预占 P4） | ~60 |
+| `weed/server/master_grpc_server_license.go`、`master_license.go`（新） | `GetLicense/ImportLicense/SyncLicense/GetLedger/SyncLedger`；raft 适配、peer RPC、类型转换（P2 已完成） | ~380 |
+| `weed/server/master_server_handlers_license.go`（新） | 5 个 HTTP handler（P2 已完成） | ~170 |
+| `weed/cluster/cluster.go` | `ListAllClusterNodes`（对账时保留在线 filer）（P2 已完成） | ~20 |
+| `weed/server/master_server_handlers_ui.go` | args 加 `License`（P2 已完成） | ~4 |
+| `weed/server/master_ui/license.html`（新）、`master.html`、`masterNewRaft.html`、`templates.go` | 两份模板共用一个 License 区块（P2 已完成） | ~130 |
 | `weed/wdclient/masterclient.go` | `OnLicenseUpdate` 回调；首帧、循环、`PermissionDenied license:` 三处调用 | ~20 |
 | `weed/server/volume_server.go` | `license *license.Node`；启动读缓存 | ~6 |
 | `weed/server/volume_grpc_client_to_master.go` | 处理 `in.License`、`in.LicenseRejectReason` | ~15 |
@@ -400,12 +407,12 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | `weed/server/filer_grpc_server*.go`（含 `_kv.go`、`_sub_meta.go`、`_traverse_meta.go`、`_rename.go`、`_remote.go`） | G1 隐藏点、`KvGet` 白名单、写入合并规则（v9） | ~110 |
 | `weed/pb/filer_pb_tail.go` 与 5 个复制/备份命令、`fs.cat`/`filer.cat`/`fs.meta.save`/`fs.meta.notify` | `FailOnHiddenContent` 与隐藏正文报错（v9） | ~35 |
 | `weed/server/volume_grpc_{copy,read_write,read_all,tail,copy_incremental,erasure_coding,query}.go`、`weed/operation/tail_volume.go`、`weed/storage/store_ec.go` | G2 入口守卫与 3 处出站令牌（v9） | ~80 |
-| `weed/command/license_init.go`（新） | 离线 `weed license.init`（v9，3.4） | ~80 |
+| `weed/command/license_init.go`（新） | 离线 `weed license.init`（v9，3.4）（P2 已完成） | ~60 |
 | `weed/s3api/s3api_object_handlers_copy.go` | 源状态校验 | ~4 |
 | `weed/s3api/s3api_object_handlers.go` | GetObject 403 映射 | ~5 |
 | `weed/stats/metrics.go` | 指标 | ~20 |
-| `weed/command/master.go`、`weed/command/server.go`（可选） | `-license.file` | ~10 |
-| `weed/shell/command_license_*.go`（新） | 3 个命令 | ~120 |
+| `weed/command/master.go`、`weed/command/server.go`、`master_follower.go` | `-license.file`、`-master.license.file`、`-mdir` 临时目录告警（P2 已完成） | ~40 |
+| `weed/shell/command_license.go`（新） | `license.show/import/validate`（P2 已完成） | ~140 |
 
 合计：新包约 1,700 行（含测试约 2,700 行）；既有 Go 文件修改约 720 行，模板约 140 行，新增 Go 文件约 550 行。不改 raft 状态机、不改 webdav；v9 起 `filer.proto` 增加一个字段，volume/filer gRPC 在拒读态的返回按 1.2 G1/G2 变化；mount 只改 1.6 的读取错误传播。
 
@@ -426,12 +433,48 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | --- | --- | --- | --- |
 | P0 契约 | 冻结 claims、挂点、原因码、第 9 节决策 | **已确认（2026-10-13）**：[P0 契约](license-p0-contract-20261013.md) | 0.5 天 |
 | P1 核心包 | `weed/license` 除 `manager.go` 外全部 + 单测（manager 依赖 proto 与 raft，并入 P2） | **已完成（2026-10-13）**：`go test -race ./weed/license/` 通过；签发工具 + OpenSSL 3 签发的互通向量验证通过；`AllowRead` 0 分配，单核约 0.65 ns/op；7.1 测试清单中 voter 多数派、任期、对账写回三项随 manager 在 P2 完成 | 3 天 |
-| P2 master 管理 | proto（先行）、manager、HTTP/gRPC、voter 多数派、任期与配置索引、对账写回、账本 `(term,revision)` 复制与对账、对账期间注册延后、加入两阶段、移除前重提交、`voters_acked`、cluster_id、令牌、水位、页面 | 单 master 与 3 master（含 1 nonvoter 一组）、5 master 扩缩容实际导入/校验/切主/对账；页面导入；`license.init` 与 `-license.file`；日志无证书与令牌 | 6 天 |
+| P2 master 管理 | proto（先行）、manager、HTTP/gRPC、voter 多数派、任期与配置索引、对账写回、账本 `(term,revision)` 复制与对账、对账期间注册延后、加入两阶段、移除前重提交、`voters_acked`、cluster_id、令牌、水位、页面 | **已完成（2026-10-13）**，证据与差异见 8.1：`go test -race ./weed/license/` 通过（含 19 个 manager 用例）；`server/command/shell/cluster/topology/wdclient/pb` 测试通过；真实进程验证单 master、goraft 与 hashicorp 3 master、3→5 扩容与缩容、切主对账、页面导入、`license.init` 与 `-license.file`、日志无证书与令牌 | 6 天 |
 | P3 下发与拦截 | 按流对账、volume/filer 守卫、M1、G1（含 `filer.proto`、合并规则、客户端改动）、G2、缓存、内部令牌传递链、mount 错误传播、S3 两处 | S1–S8、S15–S20 | 6.5 天 |
 | P4 节点额度 | 账本、宽限、预占、`NODE_REJECTED`（volume 与 filer）、三个 master 加入入口、无证书额度 0 与 master 启动检查 | S9–S12、S21 | 2.5 天 |
 | P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13 | 2 天 |
 
 合计约 20.5 人天（单人，不含签发工具 1 人天）。v9 增量见 P0 契约 8.1。
+
+### 8.1 P2 实施记录（2026-10-13）
+
+**交付：** `weed/license/manager.go`、`master_state.go` 与单测；`master.proto`（4.1）与 `filer.proto` 的 `content_hidden = 13`（含 `other/java` 副本）按原版本工具链重新生成，`master_pb`、`filer_pb` 的既有部分逐字节不变（`mq_agent.pb.go` 与其 proto 在上游已不一致，本次不重新生成）；7.2 中标注 “P2 已完成” 的文件。
+
+**验证：**
+
+| 项 | 方式 | 结果 |
+| --- | --- | --- |
+| 单 master 导入/校验/幂等/错误码（400/409/413/405/404/503） | 真实进程 + curl | 通过；`weed shell` 的 `license.show/validate/import` 通过 |
+| 未来生效证书 | 真实进程 | `newest=2, prev=1`，生效证书仍为 1，页面显示 “Next certificate” |
+| 无证书 3 master 启动 | goraft 真实进程 | 以 `license: NODE_LIMIT_EXCEEDED master 3/0 ...` 退出；hashicorp 走同一 `CheckBootstrap`（单测与代码路径） |
+| `license.init` + `-license.file` | goraft 与 hashicorp 各 3 master | 正常组建；冲突 id 拒绝；重复启动时已应用的证书跳过 |
+| 切主对账 | goraft（强杀 leader）、hashicorp（杀 leader） | 新 leader 在 1 秒内完成对账；对账期间 KeepConnected 返回 `Unavailable license: RECONCILING`，客户端按既有循环重试 |
+| 部分提交与追平 | goraft：1 台宕机时导入 | 200，`peers_failed` 列出宕机节点；重启后经 5 秒重推追平，`voters_acked` 由 2 台变为 3 台 |
+| 加入两阶段 | hashicorp 3→5（OnPeerUpdate） | 先 nonvoter、同步后提升 voter，5 台都确认当前状态 |
+| 额度 | hashicorp | 上限 4 时第 5 台加入被拒 `NODE_LIMIT_EXCEEDED master 4/4`；导入上限 3 被拒 `LICENSE_NODE_LIMIT_TOO_SMALL`；同序号不同字节 409、低序号 409 |
+| 移除前重提交 | hashicorp `cluster.raft.remove` | 重提交到剩余 4 台后移除 |
+| 页面 | 应用内浏览器 | 两份模板渲染；“Validate” 通过；在 follower 页导入提示 leader 地址；在 leader 页导入成功并刷新（浏览器面板自动取消 `confirm()`，导入经页面同一函数直接调用验证） |
+| 日志脱敏 | 扫描全部进程日志 | 无证书片段、无 `internal_read_key`；`state.json` 权限 0600、目录 0700 |
+| S7b/S7c/S7d/S7e/S7h/S7i、S8 | 单测（假 raft 集群） | 未达多数派 503 与幂等重试、nonvoter 不计数、5 voter 写回后 C/D/E 仍得 11、旧任期请求被拒、移除被不可达 voter 阻止、配置变化返回 `MEMBERSHIP_CHANGED`、账本跨任期排序、时钟回拨与三分支修复。真实进程无法改系统时钟，S8 只有单测 |
+
+**与计划的差异：**
+
+1. follower master 追平改为 leader 每 5 秒重推（3.3 第 6 条），不依赖 KeepConnected。
+2. `SyncLicense` 的接收方若持有更高序号的状态，不报错而是返回自己的状态，leader 按 3.2 规则采纳并重推；只有返回状态与所推状态相同的 voter 才计入多数派。
+3. 选主对账只采纳更高 `repair_seq` 的时钟状态（4.5）。
+4. 对账的接管转换之后，把当前仍连在本 leader 上的 volume 与 filer 重新置为在线（`Connected` 回调），覆盖“同一 master 失去又重获 leader、流未断开”时连接不会重新注册的情况。
+5. 每个 master 在 raft 启动前把 `-license.file` 应用到自己的本地状态（不只是 leader）；leader 的对账取多数派中的最高状态并写回后才开放注册，满足 3.4 “开放注册之前提交” 的要求。
+6. 推送前若账本有未发出的变更，先分配新版本，保证同一版本号只对应一份内容。
+7. `master.follower` 的 manager 不落盘（它不参与 raft）。
+8. 移除前重提交失败返回 `PARTIAL_COMMIT`（503）。
+9. 导入与校验除 JSON 与 multipart 外也接受证书原文作为请求体（便于 `curl --data-binary @cert`）。
+10. 原计划 P4 的 master 启动检查与 P3 的对账期间注册延后已在 P2 完成；volume/filer 的准入预占（`AdmitNode/DisconnectNode` 已实现并有单测）仍在 P4 接入心跳与 KeepConnected，首帧与按流对账在 P3。
+
+**发现的上游行为（未改）：** 没有任何 volume server 时 KeepConnected 不发首帧，`weed shell` 一直等待连接；`-peers` 只允许奇数个 master，扩容验证因此按 3→5 进行。
 
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 

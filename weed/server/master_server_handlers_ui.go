@@ -7,6 +7,7 @@ import (
 	hashicorpRaft "github.com/hashicorp/raft"
 	"github.com/seaweedfs/raft"
 
+	"github.com/seaweedfs/seaweedfs/weed/license"
 	ui "github.com/seaweedfs/seaweedfs/weed/server/master_ui"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -16,6 +17,8 @@ func (ms *MasterServer) uiStatusHandler(w http.ResponseWriter, r *http.Request) 
 	infos := make(map[string]interface{})
 	infos["Up Time"] = time.Now().Sub(startTime).String()
 	infos["Max Volume Id"] = ms.Topo.GetMaxVolumeId()
+	// Read before taking the raft lock: the license manager takes it too.
+	licenseStatus := ms.License.Status()
 
 	ms.Topo.RaftServerAccessLock.RLock()
 	defer ms.Topo.RaftServerAccessLock.RUnlock()
@@ -28,6 +31,7 @@ func (ms *MasterServer) uiStatusHandler(w http.ResponseWriter, r *http.Request) 
 			Stats             map[string]interface{}
 			Counters          *stats.ServerStats
 			VolumeSizeLimitMB uint32
+			License           *license.Status
 		}{
 			util.Version(),
 			ms.Topo.ToInfo(),
@@ -35,6 +39,7 @@ func (ms *MasterServer) uiStatusHandler(w http.ResponseWriter, r *http.Request) 
 			infos,
 			serverStats,
 			ms.option.VolumeSizeLimitMB,
+			licenseStatus,
 		}
 		ui.StatusTpl.Execute(w, args)
 	} else if ms.Topo.HashicorpRaft != nil {
@@ -45,6 +50,7 @@ func (ms *MasterServer) uiStatusHandler(w http.ResponseWriter, r *http.Request) 
 			Stats             map[string]interface{}
 			Counters          *stats.ServerStats
 			VolumeSizeLimitMB uint32
+			License           *license.Status
 		}{
 			util.Version(),
 			ms.Topo.ToInfo(),
@@ -52,6 +58,7 @@ func (ms *MasterServer) uiStatusHandler(w http.ResponseWriter, r *http.Request) 
 			infos,
 			serverStats,
 			ms.option.VolumeSizeLimitMB,
+			licenseStatus,
 		}
 		ui.StatusNewRaftTpl.Execute(w, args)
 	}

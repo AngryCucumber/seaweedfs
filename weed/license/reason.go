@@ -6,6 +6,7 @@
 package license
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -109,6 +110,12 @@ func (e *Error) Error() string {
 		return "license: " + string(e.Code)
 	}
 	return "license: " + string(e.Code) + " " + e.Message
+}
+
+// IsCode reports whether err is a license error with code.
+func IsCode(err error, code Code) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Code == code
 }
 
 func errorf(code Code, format string, args ...interface{}) *Error {

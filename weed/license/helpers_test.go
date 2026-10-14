@@ -85,10 +85,3 @@ func certWith(t testing.TB, seq, notBefore, expiresAt int64, features ...string)
 		c["features"] = f
 	})
 }
-
-func codeOf(err error) Code {
-	if e, ok := err.(*Error); ok {
-		return e.Code
-	}
-	return ""
-}

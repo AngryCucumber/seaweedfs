@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/license"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
@@ -59,6 +61,7 @@ type MasterOptions struct {
 	electionTimeout    *time.Duration
 	raftHashicorp      *bool
 	raftBootstrap      *bool
+	licenseFile        *string
 }
 
 func init() {
@@ -86,6 +89,7 @@ func init() {
 	m.electionTimeout = cmdMaster.Flag.Duration("electionTimeout", 10*time.Second, "election timeout of master servers")
 	m.raftHashicorp = cmdMaster.Flag.Bool("raftHashicorp", false, "use hashicorp raft")
 	m.raftBootstrap = cmdMaster.Flag.Bool("raftBootstrap", false, "Whether to bootstrap the Raft cluster")
+	m.licenseFile = cmdMaster.Flag.String("license.file", "", "license certificate to apply on start; needs a cluster_id from \"weed license.init\"")
 }
 
 var cmdMaster = &Command{
@@ -119,6 +123,7 @@ func runMaster(cmd *Command, args []string) bool {
 	if err := util.TestFolderWritable(util.ResolvePath(*m.metaFolder)); err != nil {
 		glog.Fatalf("Check Meta Folder (-mdir) Writable %s : %s", *m.metaFolder, err)
 	}
+	warnIfTempDir(*m.metaFolder)
 
 	masterWhiteList := util.StringSplit(*m.whiteList, ",")
 	if *m.volumeSizeLimitMB > util.VolumeSizeLimitGB*1000 {
@@ -178,6 +183,7 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 		HeartbeatInterval: *masterOption.heartbeatInterval,
 		ElectionTimeout:   *masterOption.electionTimeout,
 		RaftBootstrap:     *masterOption.raftBootstrap,
+		License:           ms.License,
 	}
 	var raftServer *weed_server.RaftServer
 	var err error
@@ -187,6 +193,9 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 		}
 	} else {
 		raftServer, err = weed_server.NewRaftServer(raftServerOption)
+		if license.IsCode(err, license.CodeNodeLimitExceeded) {
+			glog.Fatalf("%v", err)
+		}
 		if raftServer == nil {
 			glog.Fatalf("please verify %s is writable, see https://github.com/seaweedfs/seaweedfs/issues/717: %s", *masterOption.metaFolder, err)
 		}
@@ -325,5 +334,25 @@ func (m *MasterOptions) toMasterOption(whiteList []string) *weed_server.MasterOp
 		DisableHttp:             *m.disableHttp,
 		MetricsAddress:          *m.metricsAddress,
 		MetricsIntervalSec:      *m.metricsIntervalSec,
+		LicenseFile:             *m.licenseFile,
+	}
+}
+
+// warnIfTempDir warns when -mdir is under the temporary directory: the
+// license state there holds the cluster_id and certificate, and losing it
+// leaves the cluster unlicensed with a new cluster_id.
+func warnIfTempDir(mdir string) {
+	abs := func(p string) string {
+		if p, err := filepath.Abs(p); err == nil {
+			if r, err := filepath.EvalSymlinks(p); err == nil {
+				return r
+			}
+			return p
+		}
+		return p
+	}
+	rel, err := filepath.Rel(abs(os.TempDir()), abs(util.ResolvePath(mdir)))
+	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		glog.Warningf("-mdir %s is under the temporary directory; %s/%s keeps the cluster_id and license and must persist", mdir, mdir, license.StateDirName)
 	}
 }

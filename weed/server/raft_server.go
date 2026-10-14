@@ -18,6 +18,7 @@ import (
 	"github.com/seaweedfs/raft"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/license"
 	"github.com/seaweedfs/seaweedfs/weed/topology"
 )
 
@@ -31,6 +32,8 @@ type RaftServerOption struct {
 	HeartbeatInterval time.Duration
 	ElectionTimeout   time.Duration
 	RaftBootstrap     bool
+	// License checks a new raft configuration and gates membership changes.
+	License *license.Manager
 }
 
 type RaftServer struct {
@@ -41,6 +44,7 @@ type RaftServer struct {
 	dataDir          string
 	serverAddr       pb.ServerAddress
 	topo             *topology.Topology
+	license          *license.Manager
 	*raft.GrpcServer
 }
 
@@ -106,6 +110,13 @@ func NewRaftServer(option *RaftServerOption) (*RaftServer, error) {
 		serverAddr: option.ServerAddr,
 		dataDir:    option.DataDir,
 		topo:       option.Topo,
+		license:    option.License,
+	}
+
+	// goraft starts every master with a fresh configuration below, so the
+	// license check runs on every start.
+	if err := s.license.CheckBootstrap(len(s.peers)); err != nil {
+		return nil, err
 	}
 
 	if glog.V(4) {

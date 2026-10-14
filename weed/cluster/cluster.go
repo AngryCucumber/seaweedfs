@@ -138,6 +138,27 @@ func (cluster *Cluster) ListClusterNode(filerGroup FilerGroupName, nodeType stri
 	return
 }
 
+// ListAllClusterNodes lists the addresses of nodeType in every group.
+func (cluster *Cluster) ListAllClusterNodes(nodeType string) (addresses []pb.ServerAddress) {
+	var g *ClusterNodeGroups
+	switch nodeType {
+	case FilerType:
+		g = cluster.filerGroups
+	case BrokerType:
+		g = cluster.brokerGroups
+	default:
+		return nil
+	}
+	g.RLock()
+	defer g.RUnlock()
+	for _, m := range g.groupMembers {
+		for address := range m.members {
+			addresses = append(addresses, address)
+		}
+	}
+	return
+}
+
 func buildClusterNodeUpdateMessage(isAdd bool, filerGroup FilerGroupName, nodeType string, address pb.ServerAddress) (result []*master_pb.KeepConnectedResponse) {
 	result = append(result, &master_pb.KeepConnectedResponse{
 		ClusterNodeUpdate: &master_pb.ClusterNodeUpdate{

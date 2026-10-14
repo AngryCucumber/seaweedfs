@@ -150,6 +150,16 @@ func (l *Ledger) TakeOver(now int64) {
 	}
 }
 
+// markOnline puts a node that is connected right now back online,
+// whether or not it fits the quota: it is already registered.
+func (l *Ledger) markOnline(t NodeType, addr string, now int64) {
+	if e, ok := l.entries[ledgerKey{t, addr}]; ok {
+		e.Online, e.LastSeen = true, now
+		return
+	}
+	l.entries[ledgerKey{t, addr}] = &LedgerEntry{Address: addr, Type: t, LastSeen: now, Online: true}
+}
+
 // Usage counts entries per node type.
 func (l *Ledger) Usage() Usage {
 	var u Usage

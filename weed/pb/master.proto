@@ -53,6 +53,16 @@ service Seaweed {
   }
   rpc VolumeGrow (VolumeGrowRequest) returns (VolumeGrowResponse) {
   }
+  rpc GetLicense (GetLicenseRequest) returns (GetLicenseResponse) {
+  }
+  rpc ImportLicense (ImportLicenseRequest) returns (ImportLicenseResponse) {
+  }
+  rpc SyncLicense (SyncLicenseRequest) returns (SyncLicenseResponse) {
+  }
+  rpc GetLedger (GetLedgerRequest) returns (GetLedgerResponse) {
+  }
+  rpc SyncLedger (SyncLedgerRequest) returns (SyncLedgerResponse) {
+  }
 }
 
 //////////////////////////////////////////////////
@@ -91,6 +101,8 @@ message HeartbeatResponse {
   repeated StorageBackend storage_backends = 5;
   repeated string duplicated_uuids = 6;
   bool preallocate = 7;
+  string license_reject_reason = 8;
+  LicenseUpdate license = 9;
 }
 
 message VolumeInformationMessage {
@@ -178,6 +190,7 @@ message ClusterNodeUpdate {
 message KeepConnectedResponse {
   VolumeLocation volume_location = 1;
   ClusterNodeUpdate cluster_node_update = 2;
+  LicenseUpdate license = 3;
 }
 
 message LookupVolumeRequest {
@@ -437,4 +450,80 @@ message RaftListClusterServersResponse {
 }
 
 message VolumeGrowResponse {
+}
+
+//////////////////////////////////////////////////
+// MassDB OSS license
+
+// LicenseUpdate is the license state a master sends to volume servers and filers.
+message LicenseUpdate {
+  string newest_certificate = 1;
+  string prev_certificate = 2; // applied together with newest
+  int64 master_now_unix_ms = 3;
+  string cluster_id = 4;
+  string master_deny_reason = 5; // empty, CLOCK_SUSPECT or NODE_REJECTED
+  bytes internal_read_key = 6; // filers only
+  uint64 state_version = 7; // per master; not comparable across masters
+}
+
+// LicenseState is the license state replicated between masters.
+message LicenseState {
+  string cluster_id = 1;
+  string newest_certificate = 2;
+  string prev_certificate = 3;
+  bytes internal_read_key = 4;
+  int64 watermark = 5;
+  int64 repair_seq = 6;
+}
+
+message NodeLedgerEntry {
+  string address = 1;
+  string node_type = 2;
+  int64 last_seen_unix = 3;
+  bool online = 4;
+}
+message NodeLedgerSnapshot {
+  repeated NodeLedgerEntry entries = 1;
+  uint64 term = 2;
+  uint64 revision = 3;
+}
+
+message GetLicenseRequest {
+  bool include_state = 1; // for masters reconciling; carries internal_read_key
+}
+message GetLicenseResponse {
+  string status_json = 1; // same document as GET /license
+  LicenseState state = 2;
+}
+
+message ImportLicenseRequest {
+  string certificate = 1;
+  bool validate_only = 2;
+}
+message ImportLicenseResponse {
+  string result_json = 1; // same document as POST /license/import or /license/validate
+}
+
+message SyncLicenseRequest {
+  string leader_address = 1;
+  uint64 leader_term = 2;
+  uint64 config_index = 3;
+  LicenseState state = 4;
+}
+message SyncLicenseResponse {
+  LicenseState state = 1; // receiver state after applying, so a leader can catch up
+}
+
+message GetLedgerRequest {
+}
+message GetLedgerResponse {
+  NodeLedgerSnapshot ledger = 1;
+}
+
+message SyncLedgerRequest {
+  string leader_address = 1;
+  uint64 leader_term = 2;
+  NodeLedgerSnapshot ledger = 3;
+}
+message SyncLedgerResponse {
 }

@@ -38,25 +38,21 @@ func (ms *MasterServer) RaftAddServer(ctx context.Context, req *master_pb.RaftAd
 	resp := &master_pb.RaftAddServerResponse{}
 
 	ms.Topo.RaftServerAccessLock.RLock()
-	defer ms.Topo.RaftServerAccessLock.RUnlock()
+	hashicorp := ms.Topo.HashicorpRaft
+	ms.Topo.RaftServerAccessLock.RUnlock()
 
-	if ms.Topo.HashicorpRaft == nil {
+	if hashicorp == nil {
 		return resp, nil
 	}
 
-	if ms.Topo.HashicorpRaft.State() != raft.Leader {
-		return nil, fmt.Errorf("raft add server %s failed: %s is no current leader", req.Id, ms.Topo.HashicorpRaft.String())
+	if hashicorp.State() != raft.Leader {
+		return nil, fmt.Errorf("raft add server %s failed: %s is no current leader", req.Id, hashicorp.String())
 	}
 
-	var idxFuture raft.IndexFuture
-	if req.Voter {
-		idxFuture = ms.Topo.HashicorpRaft.AddVoter(raft.ServerID(req.Id), raft.ServerAddress(req.Address), 0, 0)
-	} else {
-		idxFuture = ms.Topo.HashicorpRaft.AddNonvoter(raft.ServerID(req.Id), raft.ServerAddress(req.Address), 0, 0)
-	}
-
-	if err := idxFuture.Error(); err != nil {
-		return nil, err
+	// The license manager checks the master quota and adds a voter as a
+	// nonvoter first, promoting it once it holds the license state.
+	if err := ms.License.JoinMaster(ctx, req.Id, req.Address, req.Voter); err != nil {
+		return nil, licenseGrpcError(err)
 	}
 	return resp, nil
 }
@@ -65,14 +61,15 @@ func (ms *MasterServer) RaftRemoveServer(ctx context.Context, req *master_pb.Raf
 	resp := &master_pb.RaftRemoveServerResponse{}
 
 	ms.Topo.RaftServerAccessLock.RLock()
-	defer ms.Topo.RaftServerAccessLock.RUnlock()
+	hashicorp := ms.Topo.HashicorpRaft
+	ms.Topo.RaftServerAccessLock.RUnlock()
 
-	if ms.Topo.HashicorpRaft == nil {
+	if hashicorp == nil {
 		return resp, nil
 	}
 
-	if ms.Topo.HashicorpRaft.State() != raft.Leader {
-		return nil, fmt.Errorf("raft remove server %s failed: %s is no current leader", req.Id, ms.Topo.HashicorpRaft.String())
+	if hashicorp.State() != raft.Leader {
+		return nil, fmt.Errorf("raft remove server %s failed: %s is no current leader", req.Id, hashicorp.String())
 	}
 
 	if !req.Force {
@@ -84,9 +81,12 @@ func (ms *MasterServer) RaftRemoveServer(ctx context.Context, req *master_pb.Raf
 		}
 	}
 
-	idxFuture := ms.Topo.HashicorpRaft.RemoveServer(raft.ServerID(req.Id), 0, 0)
-	if err := idxFuture.Error(); err != nil {
-		return nil, err
+	// Removing a voter first recommits the license state to a majority of
+	// the voters that remain.
+	if err := ms.License.RemoveMaster(ctx, req.Id, func() error {
+		return hashicorp.RemoveServer(raft.ServerID(req.Id), 0, 0).Error()
+	}); err != nil {
+		return nil, licenseGrpcError(err)
 	}
 	return resp, nil
 }

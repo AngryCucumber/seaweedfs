@@ -29,6 +29,7 @@ var Commands = []*Command{
 	cmdFix,
 	cmdFuse,
 	cmdIam,
+	cmdLicenseInit,
 	cmdMaster,
 	cmdMasterFollower,
 	cmdMount,
