@@ -193,6 +193,7 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 		StartTsNs:              startFrom.UnixNano(),
 		StopTsNs:               0,
 		EventErrorType:         eventErrorType,
+		FailOnHiddenContent:    true,
 	}
 
 	return pb.FollowMetadata(sourceFiler, grpcDialOption, metadataFollowOption, processEventFnWithOffset)

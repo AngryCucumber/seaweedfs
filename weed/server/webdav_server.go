@@ -551,6 +551,10 @@ func (f *WebDavFile) Read(p []byte) (readSize int, err error) {
 	if err != nil {
 		return 0, err
 	}
+	if f.entry.ContentHidden {
+		// The license hides the inline content; never return zeros instead.
+		return 0, filer_pb.ErrContentHidden
+	}
 	fileSize := int64(filer.FileSize(f.entry))
 	if fileSize == 0 {
 		return 0, io.EOF

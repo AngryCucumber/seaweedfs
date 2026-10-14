@@ -18,6 +18,8 @@
 
 **P2 完成（2026-10-13）：** master 侧 manager、proto（含 `filer.proto` 字段）、gRPC/HTTP 管理接口、选主对账与写回、成员变更两阶段与移除前重提交、账本复制、`license.init`、`-license.file`、master 启动检查、页面与 shell 命令已实现并经单 master、3 master（goraft 与 hashicorp）、3→5 master 扩容与缩容的真实进程验证；实现与本文的差异及未覆盖项见 8.1。
 
+**P3 完成（2026-10-14）：** 按流下发、volume/filer 守卫（V1、F1、F2、M1）、filer gRPC 内联正文隐藏与写入合并规则（G1）、volume gRPC 数据 RPC 守卫与 volume 之间的令牌（G2）、节点缓存、内部令牌传递链、订阅/备份/读取命令的隐藏正文处理、mount 错误传播、S3 两处已实现，并在 1 master + 2 volume + 3 filer（含 `-s3 -webdav` 同进程）、`weed server -filer -s3 -webdav` 与 Linux 虚拟机（mount、`-cipher`）上做了真实进程验证；P3 中修正的 P2 缺陷与上游问题、与本文的差异及未覆盖项见 8.2。
+
 本文是实施计划，不是功能已完成声明。第 9 节的取舍已于 2026-10-13 由用户确认（决策 2、4、9 改选备选），证书声明、原因码、线格式常量与源码挂点以 [P0 契约](license-p0-contract-20261013.md) 为准。
 
 ---
@@ -52,10 +54,11 @@
 
 ### 1.3 明确不封堵、作为已知边界
 
-- 内部令牌（1.4）是集群内共享的静态密钥，在 gRPC 明文内网中可被截获后用于直读 volume；`ClientType` 不鉴权，能连 master 且有空闲 filer 名额的客户端可自称 filer 经 `KeepConnected` 拿到令牌。开启 `security.toml` 的 gRPC mTLS 后这两条不成立，部署手册要求开启。不引入每请求 HMAC。
+- 内部令牌（1.4）是集群内共享的静态密钥，在 gRPC 明文内网中可被截获后用于直读 volume；`ClientType` 不鉴权，能连 master 且有空闲 filer 名额的客户端可自称 filer 经 `KeepConnected` 拿到令牌；master 之间对账用的 gRPC `GetLicense(include_state=true)` 同样不鉴权，能连 master 的任何客户端都可直接取得 `internal_read_key`（P3 补记）。开启 `security.toml` 的 gRPC mTLS 后这些都不成立，部署手册要求开启。不引入每请求 HMAC。
 - G2 只在建流时检查，证书有效期间已开始的 gRPC 数据流在到期后不中断。
 - 同进程的 webdav（`weed server -webdav`）解析 manifest 时会经内部通道读到 manifest 块（只含 chunk id 列表）；数据块经 `fetchChunkRange` 读取，不带令牌，仍被拦。
 - **内联正文的剩余边界（v9）：** 系统豁免路径（`/etc/` 全部、`/topics/` 下的 `topic.conf` 与 `*.offset`）的正文经 gRPC 照常可读，能经 filer HTTP 写 `/etc/` 的用户可借此存取小文件；`other/java` 客户端（不在构建内）读到空正文，回写依赖 protobuf-java 保留未知字段；证书到期前已发出的订阅事件不追回。
+- filer 按 `notification.toml` 向外部队列（Kafka、SQS 等）发送的元数据事件在服务端生成，内联正文不隐藏；该出口由运维配置，与内部维护同级（P3 补记）。
 - volume server `-dir` 下的 `.dat/.idx` 文件本身不加密；证书不是数据保密方案。整机时间与状态一起回滚、替换二进制，离线证书不能完全防住。
 - `filer.sync`、`filer.backup`、`filer.meta.backup`、`filer.remote.sync`、`filer.remote.gateway` 是独立进程，没有内部令牌，证书无效时被拦（第 9 节决策 3），遇到隐藏正文的事件停在原偏移，续期后续传（1.5）。S3 `CopyObject` 的源读取经 F1 被拦，并按 5.2 做状态校验。
 - master 的静态 `-peers` 由启动前的本地证书检查约束（v9，3.4）；hashicorp 已有 raft 配置的成员重启只计数不检查。
@@ -384,33 +387,33 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | `weed/server/master_server.go` | manager 初始化；5 条路由；`OnPeerUpdate` 加入走两阶段（后台等待对账完成）；远程移除经 `RaftRemoveServer` 已覆盖（P2 已完成） | ~30 |
 | `weed/server/raft_hashicorp.go`、`raft_server.go` | `updatePeers` 改为后台执行、等对账完成后加入走两阶段、移除前重提交；新配置引导前 `CheckBootstrap`（P2 已完成） | ~40 |
 | `weed/server/master_grpc_server_raft.go` | `RaftAddServer` 走两阶段；`RaftRemoveServer` 前重提交；不再跨调用持有 `RaftServerAccessLock`（P2 已完成） | ~15 |
-| `weed/server/master_grpc_server.go` | `SendHeartbeat`：账本判新/预占/对账冻结 + 首帧与按流对账 + 响应填容量字段；`KeepConnected`：`addClient` 前预占 + 首帧 + ticker 对账；日志脱敏（P2 已完成对账冻结与日志脱敏；首帧与按流对账 P3，预占 P4） | ~60 |
+| `weed/server/master_grpc_server.go` | `SendHeartbeat`：账本判新/预占/对账冻结 + 首帧与按流对账 + 响应填容量字段；`KeepConnected`：`addClient` 前预占 + 首帧 + ticker 对账；日志脱敏（P2 已完成对账冻结与日志脱敏；P3 已完成首帧与按流对账；预占 P4） | ~60 |
 | `weed/server/master_grpc_server_license.go`、`master_license.go`（新） | `GetLicense/ImportLicense/SyncLicense/GetLedger/SyncLedger`；raft 适配、peer RPC、类型转换（P2 已完成） | ~380 |
 | `weed/server/master_server_handlers_license.go`（新） | 5 个 HTTP handler（P2 已完成） | ~170 |
 | `weed/cluster/cluster.go` | `ListAllClusterNodes`（对账时保留在线 filer）（P2 已完成） | ~20 |
 | `weed/server/master_server_handlers_ui.go` | args 加 `License`（P2 已完成） | ~4 |
 | `weed/server/master_ui/license.html`（新）、`master.html`、`masterNewRaft.html`、`templates.go` | 两份模板共用一个 License 区块（P2 已完成） | ~130 |
-| `weed/wdclient/masterclient.go` | `OnLicenseUpdate` 回调；首帧、循环、`PermissionDenied license:` 三处调用 | ~20 |
-| `weed/server/volume_server.go` | `license *license.Node`；启动读缓存 | ~6 |
-| `weed/server/volume_grpc_client_to_master.go` | 处理 `in.License`、`in.LicenseRejectReason` | ~15 |
-| `weed/server/volume_server_handlers_read.go` | V1 守卫 + 拒绝路径令牌校验 | ~10 |
-| `weed/server/filer_server.go` | `license *license.Node`；注册回调；启动读缓存；`saveToFilerLimit>0` 告警；`filer.SetInternalReadToken` | ~12 |
-| `weed/server/filer_server_handlers_read.go` | F1 守卫 + 清理对象头；`?metadata=true` 隐藏 Content 并打标记 | ~14 |
-| `weed/server/filer_server_handlers_read_dir.go` | 目录 JSON 隐藏 Content 并打标记 | ~8 |
-| `weed/server/filer_server_handlers.go` | F2 守卫 | ~3 |
-| `weed/filer/filechunk_manifest.go`、`weed/filer/stream.go` | `retriedStreamFetchChunkData` 加 `extraHeader` 参数；`fetchWholeChunk`、`ChunkStreamReader`、`StreamContent` 三处附加令牌 | ~15 |
-| `weed/filer/internal_token.go`（新） | 包级 `SetInternalReadToken` | ~15 |
-| `weed/util/http/http_global_client_util.go` | `ReadUrlAsStreamWithHeader`（抽出内部实现） | ~12 |
-| `weed/mount/filehandle.go`、`weed/mount/filehandle_read.go` | 记录 manifest 解析错误与隐藏正文，失败状态下限频重解析/重取，读取时返回 `EIO`（1.6） | ~40 |
+| `weed/wdclient/masterclient.go` | `OnLicenseUpdate` 回调；首帧、循环、`PermissionDenied license:` 三处调用（P3 已完成） | ~20 |
+| `weed/server/volume_server.go` | `license *license.Node`；启动读缓存（P3 已完成） | ~6 |
+| `weed/server/volume_grpc_client_to_master.go` | 处理 `in.License`、`in.LicenseRejectReason`（P3 已完成） | ~15 |
+| `weed/server/volume_server_handlers_read.go` | V1 守卫 + 拒绝路径令牌校验；`ReadMode=proxy` 转发沿用原方法（P3 已完成，8.2） | ~10 |
+| `weed/server/filer_server.go` | `license *license.Node`；注册回调；启动读缓存；`saveToFilerLimit>0` 告警；`filer.SetInternalReadToken`（P3 已完成） | ~12 |
+| `weed/server/filer_server_handlers_read.go` | F1 守卫 + 清理对象头；`?metadata=true` 隐藏 Content 并打标记（P3 已完成） | ~14 |
+| `weed/server/filer_server_handlers_read_dir.go` | 目录 JSON 隐藏 Content 并打标记（P3 已完成） | ~8 |
+| `weed/server/filer_server_handlers.go` | F2 守卫（P3 已完成） | ~3 |
+| `weed/filer/filechunk_manifest.go`、`weed/filer/stream.go` | `retriedStreamFetchChunkData` 加 `extraHeader` 参数；`fetchWholeChunk`、`ChunkStreamReader`、`StreamContent` 三处附加令牌（P3 已完成） | ~15 |
+| `weed/filer/internal_token.go`（新） | 包级 `SetInternalReadToken`（P3 已完成） | ~15 |
+| `weed/util/http/http_global_client_util.go` | `ReadUrlAsStreamWithHeader`（抽出内部实现）（P3 已完成） | ~12 |
+| `weed/mount/filehandle.go`、`weed/mount/filehandle_read.go` | 记录 manifest 解析错误与隐藏正文，失败状态下限频重解析/重取，读取时返回 `EIO`（1.6）（P3 已完成，新增 `filehandle_license.go`；另修复 `weedfs_link.go`、`weedfs_attr.go` 的内联文件硬链接与截断，见 8.2） | ~40 |
 | `weed/pb/filer.proto` + 重新生成（含 `other/java` 副本） | `Entry.content_hidden = 13`（v9，1.5） | proto ~2 |
-| `weed/filer/entry.go`、`weed/filer/read_write.go`、`weed/filer/meta_aggregator.go`、`weed/filer/filer.go`、`weed/filer/meta_replay.go` | `ContentHidden` 映射；读取辅助报错；filer 间订阅与引导带令牌；Replay/引导拒收隐藏条目（v9） | ~40 |
-| `weed/server/filer_grpc_server*.go`（含 `_kv.go`、`_sub_meta.go`、`_traverse_meta.go`、`_rename.go`、`_remote.go`） | G1 隐藏点、`KvGet` 白名单、写入合并规则（v9） | ~110 |
-| `weed/pb/filer_pb_tail.go` 与 5 个复制/备份命令、`fs.cat`/`filer.cat`/`fs.meta.save`/`fs.meta.notify` | `FailOnHiddenContent` 与隐藏正文报错（v9） | ~35 |
-| `weed/server/volume_grpc_{copy,read_write,read_all,tail,copy_incremental,erasure_coding,query}.go`、`weed/operation/tail_volume.go`、`weed/storage/store_ec.go` | G2 入口守卫与 3 处出站令牌（v9） | ~80 |
+| `weed/filer/entry.go`、`weed/filer/read_write.go`、`weed/filer/meta_aggregator.go`、`weed/filer/filer.go`、`weed/filer/meta_replay.go` | `ContentHidden` 映射；读取辅助报错；filer 间订阅与引导带令牌；Replay/引导拒收隐藏条目（v9）（P3 已完成） | ~40 |
+| `weed/server/filer_grpc_server*.go`（含 `_kv.go`、`_sub_meta.go`、`_traverse_meta.go`、`_rename.go`、`_remote.go`） | G1 隐藏点、`KvGet` 白名单、写入合并规则（v9）（P3 已完成，新增 `filer_license.go`） | ~110 |
+| `weed/pb/filer_pb_tail.go` 与 5 个复制/备份命令、`fs.cat`/`filer.cat`/`fs.meta.save`/`fs.meta.notify` | `FailOnHiddenContent` 与隐藏正文报错（v9）（P3 已完成；另含 `filer.meta.backup` 首轮遍历、`volume.fsck`、webdav，见 8.2） | ~35 |
+| `weed/server/volume_grpc_{copy,read_write,read_all,tail,copy_incremental,erasure_coding,query}.go`、`weed/operation/tail_volume.go`、`weed/storage/store_ec.go` | G2 入口守卫与 3 处出站令牌（v9）（P3 已完成） | ~80 |
 | `weed/command/license_init.go`（新） | 离线 `weed license.init`（v9，3.4）（P2 已完成） | ~60 |
-| `weed/s3api/s3api_object_handlers_copy.go` | 源状态校验 | ~4 |
-| `weed/s3api/s3api_object_handlers.go` | GetObject 403 映射 | ~5 |
-| `weed/stats/metrics.go` | 指标 | ~20 |
+| `weed/s3api/s3api_object_handlers_copy.go` | 源状态校验（P3 已完成） | ~4 |
+| `weed/s3api/s3api_object_handlers.go` | GetObject 403 映射（P3 已完成） | ~5 |
+| `weed/stats/metrics.go` | 指标（P3 只做 `license_denied_reads_total`，其余随 P4/P5） | ~20 |
 | `weed/command/master.go`、`weed/command/server.go`、`master_follower.go` | `-license.file`、`-master.license.file`、`-mdir` 临时目录告警（P2 已完成） | ~40 |
 | `weed/shell/command_license.go`（新） | `license.show/import/validate`（P2 已完成） | ~140 |
 
@@ -434,7 +437,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | P0 契约 | 冻结 claims、挂点、原因码、第 9 节决策 | **已确认（2026-10-13）**：[P0 契约](license-p0-contract-20261013.md) | 0.5 天 |
 | P1 核心包 | `weed/license` 除 `manager.go` 外全部 + 单测（manager 依赖 proto 与 raft，并入 P2） | **已完成（2026-10-13）**：`go test -race ./weed/license/` 通过；签发工具 + OpenSSL 3 签发的互通向量验证通过；`AllowRead` 0 分配，单核约 0.65 ns/op；7.1 测试清单中 voter 多数派、任期、对账写回三项随 manager 在 P2 完成 | 3 天 |
 | P2 master 管理 | proto（先行）、manager、HTTP/gRPC、voter 多数派、任期与配置索引、对账写回、账本 `(term,revision)` 复制与对账、对账期间注册延后、加入两阶段、移除前重提交、`voters_acked`、cluster_id、令牌、水位、页面 | **已完成（2026-10-13）**，证据与差异见 8.1：`go test -race ./weed/license/` 通过（含 19 个 manager 用例）；`server/command/shell/cluster/topology/wdclient/pb` 测试通过；真实进程验证单 master、goraft 与 hashicorp 3 master、3→5 扩容与缩容、切主对账、页面导入、`license.init` 与 `-license.file`、日志无证书与令牌 | 6 天 |
-| P3 下发与拦截 | 按流对账、volume/filer 守卫、M1、G1（含 `filer.proto`、合并规则、客户端改动）、G2、缓存、内部令牌传递链、mount 错误传播、S3 两处 | S1–S8、S15–S20 | 6.5 天 |
+| P3 下发与拦截 | 按流对账、volume/filer 守卫、M1、G1（含 `filer.proto`、合并规则、客户端改动）、G2、缓存、内部令牌传递链、mount 错误传播、S3 两处 | **已完成（2026-10-14）**，证据与差异见 8.2：S1–S4、S6、S15–S20 真实进程通过（mount 与 `-cipher` 在 Linux 虚拟机上补测；mount 硬链接与截断的上游缺陷已修复）；S5、S7、S8 属 master 侧，P2 已验证；新增 server/filer/mount/wdclient/pb/license 单测通过 | 6.5 天 |
 | P4 节点额度 | 账本、宽限、预占、`NODE_REJECTED`（volume 与 filer）、三个 master 加入入口、无证书额度 0 与 master 启动检查 | S9–S12、S21 | 2.5 天 |
 | P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13 | 2 天 |
 
@@ -475,6 +478,61 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 10. 原计划 P4 的 master 启动检查与 P3 的对账期间注册延后已在 P2 完成；volume/filer 的准入预占（`AdmitNode/DisconnectNode` 已实现并有单测）仍在 P4 接入心跳与 KeepConnected，首帧与按流对账在 P3。
 
 **发现的上游行为（未改）：** 没有任何 volume server 时 KeepConnected 不发首帧，`weed shell` 一直等待连接；`-peers` 只允许奇数个 master，扩容验证因此按 3→5 进行。
+
+### 8.2 P3 实施记录（2026-10-14）
+
+**交付：** 7.2 中标注 “P3 已完成” 的文件。新增 `weed/server/license_node.go`（节点创建、HTTP/gRPC 读守卫、出站令牌、拒绝计数与限频日志）、`weed/server/filer_license.go`（G1 隐藏、M1 副本、写入合并规则、`KvGet` 白名单）、`weed/filer/internal_token.go`、`weed/mount/filehandle_license.go`，以及只供测试导入的 `weed/license/licensetest`（构造 VALID、NO_LICENSE、NOT_READY 状态的节点）和各自单测。
+
+**验证（真实进程：1 master + 2 volume + filer1（`-s3 -webdav`、`-saveToFilerLimit=1024`）+ filer2（独立存储）+ 冷启动的 filer3；另起一组 `weed server -filer -s3 -webdav`）：**
+
+| 场景 | 结果 |
+| --- | --- |
+| S1 无证书 | filer、S3 写入 201/200；filer HEAD、`?metadata=true`、目录列表与 S3 Head/List 200；volume GET、filer GET、Range 读、`?proxyChunkId=` 403 `NO_LICENSE`，body 与头符合契约 2.2；S3 GetObject 为 403 `AccessDenied` XML 并保留原因头；webdav 下载中断（curl 退出码 18） |
+| S2 导入 | 5.3 秒内全部节点恢复（≤ 1 个心跳周期）；其间曾有一次 filer 已放行而 volume 尚未更新，filer 返回 500，属两层守卫的过渡 |
+| S3 到期边界 | 60 秒有效期证书：到期秒起 volume、filer、S3 均 403 `EXPIRED`，写入与 HEAD 不受影响；续期后 5 秒恢复 |
+| S4 未来生效 | `prev` 在 +75 秒到期、`newest` 在 +45 秒生效：+75 秒之后读取仍放行，节点按本地时钟切换，master 未下发 |
+| S6 master 失联 | 停 master 30 秒，volume 直连与两个 filer 读取均 200；master 恢复后一致 |
+| S15 CopyObject | 无证书返回 `InvalidCopySource`（本版本文案为 `InvalidArgument` “Copy Source must mention…”），目标不存在；续期后复制成功且内容正确 |
+| S16 内部维护 | 10001 块（含 manifest）文件 gRPC `UpdateEntry` 成功，`?resolveManifest=true` 返回 10001 块；1001 次追加触发小块合并（合并后 2 块）；filer2 经对等订阅回放得到完整正文；从 0 订阅可回放持久化日志；filer.conf 修改后 filer2 热加载生效 |
+| S17 内联正文 | HTTP 文件与目录 `?metadata=true`、目录 JSON，gRPC Lookup/List/Traverse/Subscribe/StreamRename 均隐藏、保留 `FileSize`、HTTP 带 `X-MassDB-Content-Hidden`；`/etc/iam/identity.json`、`/etc/seaweedfs/filer.conf` 不隐藏；带正确令牌可见，错值与错长度令牌不放行；证书有效时不隐藏 |
+| S18 单进程 | `weed server -filer -s3 -webdav` 无证书：webdav 下载分块文件与内联文件均中断；S3 GetObject 403；manifest 文件 `UpdateEntry` 成功 |
+| S19 volume gRPC | 7 个 RPC 在无令牌、错值、错长度时均 `PermissionDenied license: NO_LICENSE`，正确令牌放行，`.idx/.vif` 不受限；`volume.move`、`ec.encode`、`ec.balance` 成功；EC 卷经只持 1 个分片的节点 HTTP DELETE 成功（跨节点读分片带令牌）；`weed backup` 报 `license: NO_LICENSE` |
+| S20 回写与复制 | S3 打标签、CopyObject REPLACE、gRPC 查后回写之后正文完整；带隐藏标志在不存在的路径创建返回 `CONTENT_HIDDEN`；`filer.backup` 停在隐藏事件，续期后从原偏移续传且目标端内容完整；`fs.meta.save`、`fs.cat`、`filer.cat`、`filer.meta.backup` 报 `CONTENT_HIDDEN`，`fs.meta.save` 不留下转储文件；冷启动的 filer3 引导后正文完整；S3 重启后 IAM 鉴权生效；`KvGet` 非偏移键被拒、偏移键可读 |
+| 缓存 | 重启 volume 后 0.4 秒内按缓存证书放行（不等首帧）；缓存文件 0600，只含 `newest/prev/cluster_id` |
+| 日志 | 全部进程日志无证书片段与令牌；拒绝日志每节点每分钟至多 1 条 |
+| 单测 | 新增 server、filer、mount、wdclient、pb、license 用例；明文与 `-cipher` 两种块读取都验证了令牌只出现在三个内部读取函数上、用户读取不带令牌；`go test -race`（license、filer、mount、wdclient、pb）与 CI 标签构建通过 |
+
+**Linux 补测（Parallels 虚拟机 Fedora 42 aarch64，FUSE 3；1 master + 2 volume + 1 filer（`-encryptVolumeData`、`-saveToFilerLimit=1024`）+ 1 mount（`-cacheCapacityMB=0`）；证书按虚拟机本地时钟签发）：**
+
+| 场景 | 结果 |
+| --- | --- |
+| S1 mount 读 | 无证书时全新挂载：分块加密文件、含 manifest 的文件、隐藏正文的内联文件 `read` 均返回 `EIO`，没有返回全零；`ls` 显示真实大小；写入新文件成功 |
+| S1b 原句柄恢复 | 保持三个句柄不关、每秒读一次；导入后分块文件 2.6 秒恢复，manifest 文件与内联文件 4.6 秒恢复（上限为心跳周期 + 5 秒）；失败期间每个句柄每 5 秒重试一次；之后重新 `open` 也可读 |
+| S17、S20 mount | 证书无效时重新挂载，meta cache 里缓存的是隐藏条目：`chmod`、`setfattr`、`touch` 发出的请求带 `content_hidden`，续期后正文完整、权限与 xattr 生效；续期后新打开的文件首次读取即恢复 |
+| S16 `-cipher` | 加密的 manifest 块在到期状态下经 mount `chmod` 触发的 `UpdateEntry` 成功；1001 次追加在加密集群上合并为 2 块；`filer.meta.tail -timeAgo=2h` 从头回放持久化日志无错误 |
+| `volume.fsck` | 到期时因 manifest 无法解析而中止报错；续期后正常完成，manifest 引用的 10001 个块没有被误判为孤儿 |
+
+同一环境用基线版本（`f2fcc241e`，不含证书代码）对照，确认 mount 的两个上游缺陷与证书无关，已在 P3 修复（见下方“P3 中修正的问题”第 5、6 条）：对内联文件做硬链接返回 `EIO`、留下无法 `stat` 的链接名并把原文件正文清成全零；对内联文件 `truncate -s 0` 不生效，filer 上正文不变。修复后在同一环境复测：证书有效时，经 HTTP 写入的内联与分块文件建硬链接（含第二个链接）成功，各名字 inode 相同、链接数正确、内容一致，删除一个名字后其余可读；截断到 0 得到空文件，截断到 5 字节得到前 5 字节。证书无效且 meta cache 中是隐藏条目时，建硬链接成功、续期后各名字正文完整；截断到 0 得到空文件；截断到非 0 长度在关闭时返回 `EIO`（字节未知，filer 返回 `CONTENT_HIDDEN`），正文不变。另外 mount 对每次失败的读取都按上游代码打一条 warning，失败态下应用反复读取会产生大量客户端日志（不发网络请求）。
+
+**P3 中修正的问题：**
+
+1. P2 的 `Manager.Update` 只给 filer 填 `internal_read_key`，volume 拿不到 key，一律拒绝令牌，manifest 解析、合并、日志回放在无证书时都会失败（与 1.4 第 1 条、契约第 3 节不符）。改为 volume 心跳流与 filer 的 KeepConnected 流都带 key，shell、broker 等其它客户端不带。
+2. 上游 volume 在 `ReadMode=proxy` 下把 HEAD 改成 GET 转发，无证书时 HEAD 也会被目标 volume 拒绝；改为沿用原方法。
+3. shell `volume.fsck` 在 shell 进程内解析 manifest（没有令牌），上游遇到解析失败只打印一行并继续，manifest 引用的数据块会被报告为孤儿，加 `-reallyDeleteFromVolume` 会误删在用数据。改为解析失败即中止并报错；契约 5.2 中“`volume.fsck` 只取 `.idx`、不受影响”对含 manifest 的文件不成立，已修订。
+4. 上游 `weed filer.cat` 吞掉全部错误、退出码为 0；改为错误打印到 stderr 并以 1 退出，隐藏正文时不会留下看似完整的空输出。
+5. 上游 mount 硬链接（`weedfs_link.go`）：经 filer HTTP 或 S3 写入的文件没有 inode 属性，`Link` 以 inode 0 回复内核，链接失败并返回 `EIO`；新名字的 `CreateEntry` 不带 `Content`，filer 按它重写共享的硬链接数据，内联正文被清空。改为 inode 为 0 时使用内核给出的旧 inode 并写回条目，新名字带上 `Content`、`ContentHidden`、`RemoteEntry`；filer 的写入合并规则在新名字不存在时以共享的硬链接数据作为已有条目，隐藏正文的文件也能建硬链接。
+6. 上游 mount 截断（`weedfs_attr.go`）只裁剪分块与 `FileSize`，内联正文原样保留，filer 继续返回旧字节；改为同时裁剪内联正文，截断到 0 时清除隐藏标志。
+
+**与计划的差异：**
+
+1. KeepConnected 首帧：授权帧先于卷位置单独发送，所有客户端（含 shell）都能收到首帧，顺带消除了 8.1 记录的“无 volume 时 shell 一直等待”。volume 心跳中带授权的响应不填 `Leader`：leader 自己的响应在上游从不带 `Leader`，填了会让以别名地址连接的 volume 多一次重定向。
+2. webdav 读入口对 `ContentHidden` 返回错误（2 行；计划原写“不改 webdav”），避免返回全零。上游 webdav 本身不读 `Entry.Content`，内联文件在证书有效时也返回全零，属上游缺陷，未改。
+3. mount：来自 meta cache 的隐藏条目在新打开的句柄上首次读取时立即向 filer 重取一次，之后仍 ≥ 5 秒一次，避免续期后每个新打开的文件都先失败 5 秒；mount 写入会丢弃内联正文（上游行为），写入后清除隐藏标志。
+4. 新 filer 引导遇到隐藏条目时每 5 秒重试，直到拿到令牌；元数据聚合在事件进入聚合日志与回放之前检查，遇到隐藏条目断开并从该事件重新订阅（不只在 Replay 内拒收）。
+5. 指标只实现了 `license_denied_reads_total{server,path}`（prometheus 名带仓库统一前缀，为 `SeaweedFS_license_denied_reads_total`），`license_state`、`license_expires_at_seconds` 与节点数量类指标随 P4/P5。
+6. `filer.Entry.ContentHidden` 在 HTTP JSON 里的字段名是 `ContentHidden`（与该结构其它字段一样为大驼峰）。
+
+**未覆盖：** `volume.check.disk` 只在副本间有差异时才读 needle，本次集群无副本，未触发（`ReadNeedleBlob` 守卫已由探测客户端验证）。`CacheRemoteObjectToLocalCluster` 未接远端存储，只有代码路径。S14（新旧混部）未测。被拒准入（`NODE_REJECTED`）的节点侧处理已实现，master 侧在 P4 接入。
 
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 

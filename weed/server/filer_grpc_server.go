@@ -32,8 +32,10 @@ func (fs *FilerServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.L
 		return nil, err
 	}
 
+	pbEntry := entry.ToProtoEntry()
+	fs.newLicenseContentFilter(ctx).apply(req.Directory, pbEntry)
 	return &filer_pb.LookupDirectoryEntryResponse{
-		Entry: entry.ToProtoEntry(),
+		Entry: pbEntry,
 	}, nil
 }
 
@@ -53,13 +55,16 @@ func (fs *FilerServer) ListEntries(req *filer_pb.ListEntriesRequest, stream file
 
 	lastFileName := req.StartFromFileName
 	includeLastFile := req.InclusiveStartFrom
+	contentFilter := fs.newLicenseContentFilter(stream.Context())
 	var listErr error
 	for limit > 0 {
 		var hasEntries bool
 		lastFileName, listErr = fs.filer.StreamListDirectoryEntries(stream.Context(), util.FullPath(req.Directory), lastFileName, includeLastFile, int64(paginationLimit), req.Prefix, "", "", func(entry *filer.Entry) bool {
 			hasEntries = true
+			pbEntry := entry.ToProtoEntry()
+			contentFilter.apply(req.Directory, pbEntry)
 			if err = stream.Send(&filer_pb.ListEntriesResponse{
-				Entry: entry.ToProtoEntry(),
+				Entry: pbEntry,
 			}); err != nil {
 				return false
 			}
@@ -142,6 +147,12 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 
 	resp = &filer_pb.CreateEntryResponse{}
 
+	if req.Entry.ContentHidden {
+		if err := fs.licenseMergeHiddenContent(ctx, util.NewFullPath(req.Directory, req.Entry.Name), nil, req.Entry); err != nil {
+			return nil, err
+		}
+	}
+
 	chunks, garbage, err2 := fs.cleanupChunks(util.Join(req.Directory, req.Entry.Name), nil, req.Entry)
 	if err2 != nil {
 		return &filer_pb.CreateEntryResponse{}, fmt.Errorf("CreateEntry cleanupChunks %s %s: %v", req.Directory, req.Entry.Name, err2)
@@ -175,6 +186,12 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 	entry, err := fs.filer.FindEntry(ctx, util.FullPath(fullpath))
 	if err != nil {
 		return &filer_pb.UpdateEntryResponse{}, fmt.Errorf("not found %s: %v", fullpath, err)
+	}
+
+	if req.Entry.ContentHidden {
+		if err := fs.licenseMergeHiddenContent(ctx, util.FullPath(fullpath), entry, req.Entry); err != nil {
+			return nil, err
+		}
 	}
 
 	chunks, garbage, err2 := fs.cleanupChunks(fullpath, entry, req.Entry)

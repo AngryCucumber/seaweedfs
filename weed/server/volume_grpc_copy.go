@@ -207,7 +207,8 @@ func (vs *VolumeServer) doCopyFile(client volume_server_pb.VolumeServerClient, i
 
 func (vs *VolumeServer) doCopyFileWithThrottler(client volume_server_pb.VolumeServerClient, isEcVolume bool, collection string, vid, compactRevision uint32, stopOffset uint64, baseFileName, ext string, isAppend, ignoreSourceFileNotFound bool, progressFn storage.ProgressFunc, throttler *util.WriteThrottler) (modifiedTsNs int64, err error) {
 
-	copyFileClient, err := client.CopyFile(context.Background(), &volume_server_pb.CopyFileRequest{
+	// Volume to volume copies carry the internal read token (contract 5.2).
+	copyFileClient, err := client.CopyFile(licenseOutgoingContext(vs.license, context.Background()), &volume_server_pb.CopyFileRequest{
 		VolumeId:                 vid,
 		Ext:                      ext,
 		CompactionRevision:       compactRevision,
@@ -324,6 +325,11 @@ func (vs *VolumeServer) CopyFile(req *volume_server_pb.CopyFileRequest, stream v
 	if !isCopyFileExtAllowed(req.Ext, req.IsEcVolume) {
 		return fmt.Errorf("CopyFile does not serve extension %q", req.Ext)
 	}
+	if !isCopyFileMetadataExt(req.Ext) {
+		if err := licenseGrpcReadAllowed(vs.license, stream.Context()); err != nil {
+			return err
+		}
+	}
 	if req.IsEcVolume {
 		if err := storage.ValidateCollectionName(req.Collection); err != nil {
 			return err
@@ -412,6 +418,16 @@ func (vs *VolumeServer) CopyFile(req *volume_server_pb.CopyFileRequest, stream v
 	}
 
 	return nil
+}
+
+// isCopyFileMetadataExt lists the CopyFile extensions that hold no file
+// content and so are served whatever the license (contract 5.2).
+func isCopyFileMetadataExt(ext string) bool {
+	switch ext {
+	case ".idx", ".ecx", ".ecj", ".vif":
+		return true
+	}
+	return false
 }
 
 // isCopyFileExtAllowed lists the files CopyFile may serve. The extension is

@@ -64,6 +64,8 @@ func (ms *MasterServer) UnRegisterUuids(ip string, port int) {
 
 func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServer) error {
 	var dn *topology.DataNode
+	// licenseSent is the license state_version last sent on this stream.
+	var licenseSent uint64
 
 	defer func() {
 		if dn != nil {
@@ -157,15 +159,31 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 				return err
 			}
 
+			licenseUpdate := ms.License.Update(true)
 			if err := stream.Send(&master_pb.HeartbeatResponse{
 				VolumeSizeLimit: uint64(ms.option.VolumeSizeLimitMB) * 1024 * 1024,
 				Preallocate:     ms.preallocateSize > 0,
+				License:         licenseUpdateToPb(licenseUpdate),
 			}); err != nil {
 				glog.Warningf("SendHeartbeat.Send volume size to %s:%d %v", dn.Ip, dn.Port, err)
 				return err
 			}
+			licenseSent = licenseUpdate.StateVersion
 			stats.MasterReceivedHeartbeatCounter.WithLabelValues("dataNode").Inc()
 			dn.Counter++
+		} else if ms.License.StateVersion() != licenseSent {
+			// The volume server compares Preallocate on every response, so
+			// license updates repeat the current volume options.
+			licenseUpdate := ms.License.Update(true)
+			if err := stream.Send(&master_pb.HeartbeatResponse{
+				VolumeSizeLimit: uint64(ms.option.VolumeSizeLimitMB) * 1024 * 1024,
+				Preallocate:     ms.preallocateSize > 0,
+				License:         licenseUpdateToPb(licenseUpdate),
+			}); err != nil {
+				glog.Warningf("SendHeartbeat.Send license state_version %d to %s:%d %v", licenseUpdate.StateVersion, dn.Ip, dn.Port, err)
+				return err
+			}
+			licenseSent = licenseUpdate.StateVersion
 		}
 
 		dn.AdjustMaxVolumeCounts(heartbeat.MaxVolumeCounts)
@@ -294,6 +312,15 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 		}
 		ms.deleteClient(clientName)
 	}()
+	// The license goes first, so every client gets a first frame even when
+	// no volume server is registered. Of the KeepConnected clients only
+	// filers get internal_read_key.
+	withKey := req.ClientType == cluster.FilerType
+	licenseUpdate := ms.License.Update(withKey)
+	if sendErr := stream.Send(&master_pb.KeepConnectedResponse{License: licenseUpdateToPb(licenseUpdate)}); sendErr != nil {
+		return sendErr
+	}
+	licenseSent := licenseUpdate.StateVersion
 	for i, message := range ms.Topo.ToVolumeLocations() {
 		if i == 0 {
 			if leader, err := ms.Topo.Leader(); err == nil {
@@ -340,6 +367,16 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 				return ms.informNewLeader(stream)
 			} else {
 				stats.MasterRaftIsleader.Set(1)
+			}
+			// Sent on this stream, not through broadcastToClients, which
+			// drops messages when a client queue is full.
+			if ms.License.StateVersion() != licenseSent {
+				licenseUpdate := ms.License.Update(withKey)
+				if err := stream.Send(&master_pb.KeepConnectedResponse{License: licenseUpdateToPb(licenseUpdate)}); err != nil {
+					glog.V(0).Infof("=> client %v: send license state_version %d: %v", clientName, licenseUpdate.StateVersion, err)
+					return err
+				}
+				licenseSent = licenseUpdate.StateVersion
 			}
 		case <-stopChan:
 			return nil

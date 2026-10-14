@@ -15,6 +15,9 @@ import (
 )
 
 func (vs *VolumeServer) VolumeTailSender(req *volume_server_pb.VolumeTailSenderRequest, stream volume_server_pb.VolumeServer_VolumeTailSenderServer) error {
+	if err := licenseGrpcReadAllowed(vs.license, stream.Context()); err != nil {
+		return err
+	}
 
 	v := vs.store.GetVolume(needle.VolumeId(req.VolumeId))
 	if v == nil {
@@ -90,7 +93,7 @@ func (vs *VolumeServer) VolumeTailReceiver(ctx context.Context, req *volume_serv
 
 	defer glog.V(1).Infof("receive tailing volume %d finished", v.Id)
 
-	return resp, operation.TailVolumeFromSource(pb.ServerAddress(req.SourceVolumeServer), vs.grpcDialOption, v.Id, req.SinceNs, int(req.IdleTimeoutSeconds), func(n *needle.Needle) error {
+	return resp, operation.TailVolumeFromSource(pb.ServerAddress(req.SourceVolumeServer), vs.grpcDialOption, v.Id, req.SinceNs, int(req.IdleTimeoutSeconds), vs.licenseInternalToken(), func(n *needle.Needle) error {
 		_, err := vs.store.WriteVolumeNeedle(v.Id, n, false, false)
 		return err
 	})

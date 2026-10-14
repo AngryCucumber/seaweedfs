@@ -216,3 +216,23 @@ func TestNodeClockUsesMilliseconds(t *testing.T) {
 		t.Fatalf("expiry must be seen 100ms later, not a second later: %s", denyReason(n))
 	}
 }
+
+func TestNodeLogDeniedRateLimit(t *testing.T) {
+	n := NewNode(testTrust(t), "")
+	n.guard.clock.Store(1000)
+	n.LogDenied("volume_http", ReasonNoLicense)
+	if n.lastDenyLog.Load() != 1000 || n.deniedSinceLog.Load() != 0 {
+		t.Fatal("first denial not logged")
+	}
+	n.guard.clock.Store(1059)
+	n.LogDenied("volume_http", ReasonNoLicense)
+	n.LogDenied("volume_http", ReasonNoLicense)
+	if n.lastDenyLog.Load() != 1000 || n.deniedSinceLog.Load() != 2 {
+		t.Fatal("denials within a minute were logged")
+	}
+	n.guard.clock.Store(1060)
+	n.LogDenied("volume_http", ReasonNoLicense)
+	if n.lastDenyLog.Load() != 1060 || n.deniedSinceLog.Load() != 0 {
+		t.Fatal("next minute not logged")
+	}
+}

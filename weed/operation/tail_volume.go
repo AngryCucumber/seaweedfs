@@ -7,7 +7,9 @@ import (
 	"io"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
+	"github.com/seaweedfs/seaweedfs/weed/license"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 )
@@ -24,13 +26,19 @@ func TailVolume(masterFn GetMasterFn, grpcDialOption grpc.DialOption, vid needle
 
 	volumeServer := lookup.Locations[0].ServerAddress()
 
-	return TailVolumeFromSource(volumeServer, grpcDialOption, vid, sinceNs, timeoutSeconds, fn)
+	return TailVolumeFromSource(volumeServer, grpcDialOption, vid, sinceNs, timeoutSeconds, "", fn)
 }
 
-func TailVolumeFromSource(volumeServer pb.ServerAddress, grpcDialOption grpc.DialOption, vid needle.VolumeId, sinceNs uint64, idleTimeoutSeconds int, fn func(n *needle.Needle) error) error {
+// TailVolumeFromSource streams needles of vid from volumeServer. A volume
+// server tailing another passes its internal read token, so the copy works
+// while the license denies reads; other callers pass "".
+func TailVolumeFromSource(volumeServer pb.ServerAddress, grpcDialOption grpc.DialOption, vid needle.VolumeId, sinceNs uint64, idleTimeoutSeconds int, internalReadToken string, fn func(n *needle.Needle) error) error {
 	return WithVolumeServerClient(true, volumeServer, grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+		if internalReadToken != "" {
+			ctx = metadata.AppendToOutgoingContext(ctx, license.InternalReadMetadataKey, internalReadToken)
+		}
 
 		stream, err := client.VolumeTailSender(ctx, &volume_server_pb.VolumeTailSenderRequest{
 			VolumeId:           uint32(vid),

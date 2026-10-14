@@ -279,6 +279,7 @@ func (fo *FilerOptions) startFiler() {
 		DataCenter:            *fo.dataCenter,
 		Rack:                  *fo.rack,
 		DefaultLevelDbDir:     defaultLevelDbDirectory,
+		DefaultStoreDir:       util.ResolvePath(*fo.defaultLevelDbDirectory),
 		DisableHttp:           *fo.disableHttp,
 		Host:                  filerAddress,
 		Cipher:                *fo.cipher,

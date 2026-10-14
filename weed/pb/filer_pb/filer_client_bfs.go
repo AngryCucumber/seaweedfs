@@ -70,8 +70,13 @@ func processOneDirectory(filerClient FilerClient, parentPath util.FullPath, queu
 }
 
 func StreamBfs(client SeaweedFilerClient, dir util.FullPath, olderThanTsNs int64, fn func(parentPath util.FullPath, entry *Entry) error) (err error) {
+	return StreamBfsWithContext(context.Background(), client, dir, olderThanTsNs, fn)
+}
+
+// StreamBfsWithContext is StreamBfs with the context of the gRPC call.
+func StreamBfsWithContext(parent context.Context, client SeaweedFilerClient, dir util.FullPath, olderThanTsNs int64, fn func(parentPath util.FullPath, entry *Entry) error) (err error) {
 	glog.V(0).Infof("TraverseBfsMetadata %v if before %v", dir, time.Unix(0, olderThanTsNs))
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	stream, err := client.TraverseBfsMetadata(ctx, &TraverseBfsMetadataRequest{
 		Directory: string(dir),

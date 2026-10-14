@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/license"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"io"
 	"net/http"
@@ -176,6 +177,14 @@ func (s3a *S3ApiServer) proxyToFiler(w http.ResponseWriter, r *http.Request, des
 		return
 	}
 	defer util_http.CloseResponse(resp)
+
+	// The filer refused the read because of the license: answer with a
+	// standard S3 error and keep the reason header.
+	if reason := resp.Header.Get(license.ReasonHeader); reason != "" && resp.StatusCode == http.StatusForbidden {
+		w.Header().Set(license.ReasonHeader, reason)
+		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+		return
+	}
 
 	if resp.StatusCode == http.StatusPreconditionFailed {
 		s3err.WriteErrorResponse(w, r, s3err.ErrPreconditionFailed)

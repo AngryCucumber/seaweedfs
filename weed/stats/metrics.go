@@ -189,6 +189,14 @@ var (
 			Help:      "Counter of volume server requests.",
 		}, []string{"type", "code"})
 
+	LicenseDeniedReadsCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: "license",
+			Name:      "denied_reads_total",
+			Help:      "Counter of data reads denied by the license.",
+		}, []string{"server", "path"})
+
 	VolumeServerHandlerCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: Namespace,
@@ -378,6 +386,7 @@ func init() {
 
 	Gather.MustRegister(VolumeServerRequestCounter)
 	Gather.MustRegister(VolumeServerHandlerCounter)
+	Gather.MustRegister(LicenseDeniedReadsCounter)
 	Gather.MustRegister(VolumeServerRequestHistogram)
 	Gather.MustRegister(VolumeServerInFlightRequestsGauge)
 	Gather.MustRegister(VolumeServerVacuumingCompactCounter)

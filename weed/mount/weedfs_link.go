@@ -59,6 +59,12 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 		oldEntry.HardLinkCounter = 1
 	}
 	oldEntry.HardLinkCounter++
+	// Files written through the filer or S3 have no inode attribute. Both
+	// names must keep the inode the kernel already knows; replying with
+	// inode 0 makes the kernel fail the link with EIO.
+	if oldEntry.Attributes.Inode == 0 {
+		oldEntry.Attributes.Inode = in.Oldnodeid
+	}
 	updateOldEntryRequest := &filer_pb.UpdateEntryRequest{
 		Directory:  oldParentPath,
 		Entry:      oldEntry,
@@ -77,6 +83,11 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 			Extended:        oldEntry.Extended,
 			HardLinkId:      oldEntry.HardLinkId,
 			HardLinkCounter: oldEntry.HardLinkCounter,
+			// The filer rewrites the shared hard link data from this entry,
+			// so it must carry the inline content too.
+			Content:       oldEntry.Content,
+			ContentHidden: oldEntry.ContentHidden,
+			RemoteEntry:   oldEntry.RemoteEntry,
 		},
 		Signatures:               []int32{wfs.signature},
 		SkipCheckParentDirectory: true,

@@ -130,6 +130,12 @@ func (vs *VolumeServer) doHeartbeat(masterAddress pb.ServerAddress, grpcDialOpti
 				glog.Errorf("Shut down Volume Server due to duplicate volume directories: %v", duplicateDir)
 				os.Exit(1)
 			}
+			if reason := in.GetLicenseRejectReason(); reason != "" {
+				glog.Errorf("license: master %s refused this volume server: %s", vs.currentMaster, reason)
+				vs.license.Reject()
+			} else if in.License != nil {
+				vs.license.Apply(licenseUpdateFromPb(in.License))
+			}
 			volumeOptsChanged := false
 			if vs.store.GetPreallocate() != in.GetPreallocate() {
 				vs.store.SetPreallocate(in.GetPreallocate())

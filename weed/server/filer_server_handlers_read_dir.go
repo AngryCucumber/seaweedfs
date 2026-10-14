@@ -61,6 +61,8 @@ func (fs *FilerServer) listDirectoryHandler(w http.ResponseWriter, r *http.Reque
 	glog.V(4).Infof("listDirectory %s, last file %s, limit %d: %d items", path, lastFileName, limit, len(entries))
 
 	if r.Header.Get("Accept") == "application/json" {
+		shown, hidden := fs.licenseHideEntries(entries)
+		setContentHiddenHeader(w, hidden)
 		writeJsonQuiet(w, r, http.StatusOK, struct {
 			Version               string
 			Path                  string
@@ -72,7 +74,7 @@ func (fs *FilerServer) listDirectoryHandler(w http.ResponseWriter, r *http.Reque
 		}{
 			util.Version(),
 			path,
-			entries,
+			shown,
 			limit,
 			lastFileName,
 			shouldDisplayLoadMore,

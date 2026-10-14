@@ -122,7 +122,10 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if query.Get("metadata") == "true" {
-			writeJsonQuiet(w, r, http.StatusOK, entry)
+			// S3 directory key objects keep their content here (M1a).
+			shown, hidden := fs.licenseHideEntry(entry)
+			setContentHiddenHeader(w, hidden)
+			writeJsonQuiet(w, r, http.StatusOK, shown)
 			return
 		}
 		if entry.Attr.Mime == "" || (entry.Attr.Mime == s3_constants.FolderMimeType && r.Header.Get(s3_constants.AmzIdentityId) == "") {
@@ -154,8 +157,20 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 				return
 			}
 		}
-		writeJsonQuiet(w, r, http.StatusOK, entry)
+		shown, hidden := fs.licenseHideEntry(entry)
+		setContentHiddenHeader(w, hidden)
+		writeJsonQuiet(w, r, http.StatusOK, shown)
 		return
+	}
+
+	if r.Method == http.MethodGet {
+		if ok, snap := fs.license.Guard().AllowRead(); !ok {
+			// Not a directory key object to S3: the read is refused (F1).
+			w.Header().Del(s3_constants.SeaweedFSIsDirectoryKey)
+			fs.license.Guard().WriteDenied(w, snap)
+			licenseNoteDenied(fs.license, snap, "filer", licensePathFilerHttp)
+			return
+		}
 	}
 
 	if checkPreconditions(w, r, entry) {

@@ -54,6 +54,9 @@ func (c *commandFsCat) Do(args []string, commandEnv *CommandEnv, writer io.Write
 			return err
 		}
 
+		if respLookupEntry.Entry.ContentHidden {
+			return filer_pb.ErrContentHidden
+		}
 		if len(respLookupEntry.Entry.Content) > 0 {
 			_, err = writer.Write(respLookupEntry.Entry.Content)
 			return err

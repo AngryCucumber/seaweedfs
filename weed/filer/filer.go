@@ -2,6 +2,7 @@ package filer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3bucket"
 	"os"
@@ -93,13 +94,29 @@ func (f *Filer) MaybeBootstrapFromOnePeer(self pb.ServerAddress, existingNodes [
 
 	glog.V(0).Infof("bootstrap from %v clientId:%d", earliestNode.Address, f.UniqueFilerId)
 
-	return pb.WithFilerClient(false, f.UniqueFilerId, pb.ServerAddress(earliestNode.Address), f.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-		return filer_pb.StreamBfs(client, "/", snapshotTime.UnixNano(), func(parentPath util.FullPath, entry *filer_pb.Entry) error {
-			return f.Store.InsertEntry(context.Background(), FromPbEntry(string(parentPath), entry))
+	for {
+		// Filers read each other's inline content with the internal read
+		// token. Until it arrives from the master the peer may hide
+		// content; such entries are never stored, the bootstrap retries.
+		err = pb.WithFilerClient(false, f.UniqueFilerId, pb.ServerAddress(earliestNode.Address), f.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+			return filer_pb.StreamBfsWithContext(WithInternalReadToken(context.Background()), client, "/", snapshotTime.UnixNano(), func(parentPath util.FullPath, entry *filer_pb.Entry) error {
+				if entry.ContentHidden {
+					return fmt.Errorf("%s: %w", parentPath.Child(entry.Name), filer_pb.ErrContentHidden)
+				}
+				return f.Store.InsertEntry(context.Background(), FromPbEntry(string(parentPath), entry))
+			})
 		})
-	})
-
+		if !errors.Is(err, filer_pb.ErrContentHidden) {
+			return err
+		}
+		glog.Warningf("bootstrap from %v: %v; retrying", earliestNode.Address, err)
+		time.Sleep(bootstrapRetryInterval)
+	}
 }
+
+// bootstrapRetryInterval is how long a bootstrap waits before retrying
+// when the peer hid inline content.
+const bootstrapRetryInterval = 5 * time.Second
 
 func (f *Filer) AggregateFromPeers(self pb.ServerAddress, existingNodes []*master_pb.ClusterNodeUpdate, startFrom time.Time) {
 

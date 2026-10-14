@@ -287,10 +287,10 @@ func TestManagerSingleMaster(t *testing.T) {
 		t.Fatalf("status %+v", s)
 	}
 	if u := a.Update(false); u.NewestCertificate == "" || u.InternalReadKey != nil || u.ClusterID != testDeployment {
-		t.Fatalf("volume update %+v", u)
+		t.Fatalf("update for a shell or broker %+v", u)
 	}
 	if u := a.Update(true); len(u.InternalReadKey) != InternalKeySize {
-		t.Fatal("filer update must carry internal_read_key")
+		t.Fatal("volume server and filer updates must carry internal_read_key")
 	}
 
 	out, err = a.Import(certRaw(t, 1, nil))

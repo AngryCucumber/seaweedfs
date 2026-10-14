@@ -147,6 +147,17 @@ func LookupEntry(client SeaweedFilerClient, request *LookupDirectoryEntryRequest
 
 var ErrNotFound = errors.New("filer: no entry is found in filer store")
 
+// ErrContentHidden is returned for an entry whose inline content the filer
+// withheld because the license denies reads: the bytes are unknown, so the
+// entry cannot be printed, dumped, copied or replicated.
+var ErrContentHidden = errors.New("license: CONTENT_HIDDEN")
+
+// EventHasHiddenContent reports whether either entry of a metadata event
+// has its inline content hidden.
+func EventHasHiddenContent(event *EventNotification) bool {
+	return event != nil && (event.OldEntry.GetContentHidden() || event.NewEntry.GetContentHidden())
+}
+
 func IsEmpty(event *SubscribeMetadataResponse) bool {
 	return event.EventNotification.NewEntry == nil && event.EventNotification.OldEntry == nil
 }

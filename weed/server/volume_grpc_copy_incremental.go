@@ -11,6 +11,9 @@ import (
 )
 
 func (vs *VolumeServer) VolumeIncrementalCopy(req *volume_server_pb.VolumeIncrementalCopyRequest, stream volume_server_pb.VolumeServer_VolumeIncrementalCopyServer) error {
+	if err := licenseGrpcReadAllowed(vs.license, stream.Context()); err != nil {
+		return err
+	}
 
 	v := vs.store.GetVolume(needle.VolumeId(req.VolumeId))
 	if v == nil {

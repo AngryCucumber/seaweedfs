@@ -9,6 +9,9 @@ import (
 )
 
 func (vs *VolumeServer) ReadNeedleBlob(ctx context.Context, req *volume_server_pb.ReadNeedleBlobRequest) (resp *volume_server_pb.ReadNeedleBlobResponse, err error) {
+	if err := licenseGrpcReadAllowed(vs.license, ctx); err != nil {
+		return nil, err
+	}
 	resp = &volume_server_pb.ReadNeedleBlobResponse{}
 	v := vs.store.GetVolume(needle.VolumeId(req.VolumeId))
 	if v == nil {

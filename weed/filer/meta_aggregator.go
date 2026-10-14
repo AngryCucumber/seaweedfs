@@ -161,6 +161,11 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 	}
 
 	processEventFn := func(event *filer_pb.SubscribeMetadataResponse) error {
+		// Without the internal read token the peer hides inline content;
+		// stop here and resubscribe from this event (contract 5.3).
+		if filer_pb.EventHasHiddenContent(event.EventNotification) {
+			return fmt.Errorf("event at %d: %w", event.TsNs, filer_pb.ErrContentHidden)
+		}
 		data, err := proto.Marshal(event)
 		if err != nil {
 			glog.Errorf("failed to marshal subscribed filer_pb.SubscribeMetadataResponse %+v: %v", event, err)
@@ -177,7 +182,7 @@ func (ma *MetaAggregator) doSubscribeToOneFiler(f *Filer, self pb.ServerAddress,
 
 	glog.V(0).Infof("subscribing remote %s meta change: %v, clientId:%d", peer, time.Unix(0, lastTsNs), ma.filer.UniqueFilerId)
 	err = pb.WithFilerClient(true, 0, peer, ma.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(WithInternalReadToken(context.Background()))
 		defer cancel()
 		atomic.AddInt32(&ma.filer.UniqueFilerEpoch, 1)
 		stream, err := client.SubscribeLocalMetadata(ctx, &filer_pb.SubscribeMetadataRequest{

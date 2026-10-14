@@ -80,6 +80,7 @@ func followUpdatesAndUploadToRemote(option *RemoteSyncOptions, filerSource *sour
 		StartTsNs:              lastOffsetTs.UnixNano(),
 		StopTsNs:               0,
 		EventErrorType:         pb.RetryForeverOnError,
+		FailOnHiddenContent:    true,
 	}
 
 	return pb.FollowMetadata(pb.ServerAddress(*option.filerAddress), option.grpcDialOption, metadataFollowOption, processEventFnWithOffset)

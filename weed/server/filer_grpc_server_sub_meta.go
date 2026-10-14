@@ -214,6 +214,9 @@ func eachLogEntryFn(eachEventNotificationFn func(dirPath string, eventNotificati
 
 func (fs *FilerServer) eachEventNotificationFn(req *filer_pb.SubscribeMetadataRequest, stream filer_pb.SeaweedFiler_SubscribeMetadataServer, clientName string) func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error {
 	filtered := 0
+	// Each event is decoded anew for every subscriber, so it is safe to
+	// hide content in place.
+	contentFilter := fs.newLicenseContentFilter(stream.Context())
 
 	return func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error {
 		defer func() {
@@ -276,6 +279,7 @@ func (fs *FilerServer) eachEventNotificationFn(req *filer_pb.SubscribeMetadataRe
 		// collect timestamps for path
 		stats.FilerServerLastSendTsOfSubscribeGauge.WithLabelValues(fs.option.Host.String(), req.ClientName, req.PathPrefix).Set(float64(tsNs))
 
+		contentFilter.applyEvent(dirPath, eventNotification)
 		message := &filer_pb.SubscribeMetadataResponse{
 			Directory:         dirPath,
 			EventNotification: eventNotification,

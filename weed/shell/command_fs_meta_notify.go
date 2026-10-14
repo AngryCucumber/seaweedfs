@@ -3,6 +3,7 @@ package shell
 import (
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/seaweedfs/seaweedfs/weed/notification"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -46,8 +47,19 @@ func (c *commandFsMetaNotify) Do(args []string, commandEnv *CommandEnv, writer i
 	notification.LoadConfiguration(v, "notification.")
 
 	var dirCount, fileCount uint64
+	// An entry whose inline content the license hides is not notified:
+	// the receiver would store an empty file.
+	var hiddenOnce sync.Once
+	var hiddenErr error
 
 	err = filer_pb.TraverseBfs(commandEnv, util.FullPath(path), func(parentPath util.FullPath, entry *filer_pb.Entry) {
+
+		if entry.ContentHidden {
+			hiddenOnce.Do(func() {
+				hiddenErr = fmt.Errorf("%s: %w", parentPath.Child(entry.Name), filer_pb.ErrContentHidden)
+			})
+			return
+		}
 
 		if entry.IsDirectory {
 			dirCount++
@@ -70,6 +82,7 @@ func (c *commandFsMetaNotify) Do(args []string, commandEnv *CommandEnv, writer i
 
 	if err == nil {
 		fmt.Fprintf(writer, "\ntotal notified %d directories, %d files\n", dirCount, fileCount)
+		err = hiddenErr
 	}
 
 	return err

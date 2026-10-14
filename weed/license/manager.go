@@ -1323,9 +1323,10 @@ func (m *Manager) ReleaseNode(addr string) error {
 	return nil
 }
 
-// Update returns the LicenseUpdate for a volume server, or for a filer
-// when forFiler is set; only filers receive internal_read_key.
-func (m *Manager) Update(forFiler bool) *Update {
+// Update returns the LicenseUpdate sent to a node. withKey adds
+// internal_read_key: volume servers check the token with it and filers
+// present it; other KeepConnected clients never get it (plan 1.4).
+func (m *Manager) Update(withKey bool) *Update {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	u := &Update{
@@ -1336,7 +1337,7 @@ func (m *Manager) Update(forFiler bool) *Update {
 		MasterDenyReason:  string(m.denyReason),
 		StateVersion:      m.version.Load(),
 	}
-	if forFiler {
+	if withKey {
 		u.InternalReadKey = append([]byte(nil), m.key...)
 	}
 	return u

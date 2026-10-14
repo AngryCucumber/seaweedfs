@@ -8,6 +8,11 @@ import (
 
 func (fs *FilerServer) KvGet(ctx context.Context, req *filer_pb.KvGetRequest) (*filer_pb.KvGetResponse, error) {
 
+	offsetOnly, err := fs.licenseKvGetCheck(ctx, req.Key)
+	if err != nil {
+		return nil, err
+	}
+
 	value, err := fs.filer.Store.KvGet(ctx, req.Key)
 	if err == filer.ErrKvNotFound {
 		return &filer_pb.KvGetResponse{}, nil
@@ -15,6 +20,12 @@ func (fs *FilerServer) KvGet(ctx context.Context, req *filer_pb.KvGetRequest) (*
 
 	if err != nil {
 		return &filer_pb.KvGetResponse{Error: err.Error()}, nil
+	}
+
+	if offsetOnly && len(value) > licenseKvMaxOffsetBytes {
+		if ok, snap := fs.license.Guard().AllowRead(); !ok {
+			return nil, fs.licenseKvDenied(snap)
+		}
 	}
 
 	return &filer_pb.KvGetResponse{

@@ -11,6 +11,9 @@ import (
 
 func Replay(filerStore FilerStore, resp *filer_pb.SubscribeMetadataResponse) error {
 	message := resp.EventNotification
+	if filer_pb.EventHasHiddenContent(message) {
+		return filer_pb.ErrContentHidden
+	}
 	var oldPath util.FullPath
 	var newEntry *Entry
 	if message.OldEntry != nil {

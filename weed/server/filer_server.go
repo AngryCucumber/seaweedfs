@@ -42,6 +42,7 @@ import (
 	_ "github.com/seaweedfs/seaweedfs/weed/filer/sqlite"
 	_ "github.com/seaweedfs/seaweedfs/weed/filer/ydb"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/license"
 	"github.com/seaweedfs/seaweedfs/weed/notification"
 	_ "github.com/seaweedfs/seaweedfs/weed/notification/aws_sqs"
 	_ "github.com/seaweedfs/seaweedfs/weed/notification/gocdk_pub_sub"
@@ -63,6 +64,7 @@ type FilerOption struct {
 	Rack                  string
 	DataNode              string
 	DefaultLevelDbDir     string
+	DefaultStoreDir       string
 	DisableHttp           bool
 	Host                  pb.ServerAddress
 	recursiveDelete       bool
@@ -101,6 +103,8 @@ type FilerServer struct {
 	// track known metadata listeners
 	knownListenersLock sync.Mutex
 	knownListeners     map[int32]int32
+
+	license *license.Node
 }
 
 func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption) (fs *FilerServer, err error) {
@@ -152,6 +156,15 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 		}
 	})
 	fs.filer.Cipher = option.Cipher
+	fs.license = newLicenseNode(option.DefaultStoreDir)
+	fs.filer.MasterClient.OnLicenseUpdate = fs.applyLicenseUpdate
+	fs.filer.MasterClient.OnLicenseReject = func(message string) {
+		glog.Errorf("license: master refused this filer: %s", message)
+		fs.license.Reject()
+	}
+	if option.SaveToFilerLimit > 0 {
+		glog.Warningf("license: -saveToFilerLimit=%d stores small files inline in the filer store; their content is hidden from metadata reads while the license denies reads", option.SaveToFilerLimit)
+	}
 	whiteList := util.StringSplit(v.GetString("guard.white_list"), ",")
 	fs.filerGuard = security.NewGuard(whiteList, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 	fs.volumeGuard = security.NewGuard([]string{}, volumeSigningKey, volumeExpiresAfterSec, volumeReadSigningKey, volumeReadExpiresAfterSec)
@@ -217,6 +230,13 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	fs.filer.Dlm.LockRing.SetTakeSnapshotCallback(fs.OnDlmChangeSnapshot)
 
 	return fs, nil
+}
+
+// applyLicenseUpdate applies the license state from the leader master and
+// hands the internal read key to the filer's maintenance reads.
+func (fs *FilerServer) applyLicenseUpdate(update *master_pb.LicenseUpdate) {
+	fs.license.Apply(licenseUpdateFromPb(update))
+	filer.SetInternalReadToken(fs.license.InternalKey())
 }
 
 func (fs *FilerServer) checkWithMaster() {

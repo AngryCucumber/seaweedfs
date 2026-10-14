@@ -73,6 +73,7 @@ func (wfs *WFS) Read(cancel <-chan struct{}, in *fuse.ReadIn, buff []byte) (fuse
 }
 
 func readDataByFileHandle(buff []byte, fhIn *FileHandle, offset int64) (int64, error) {
+	fhIn.maybeRetryRead()
 	// read data from source file
 	size := len(buff)
 	fhIn.lockForRead(offset, size)

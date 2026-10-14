@@ -1,6 +1,7 @@
 package weed_server
 
 import (
+	"context"
 	"net/http"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/license"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 )
@@ -51,6 +53,7 @@ type VolumeServer struct {
 	fileSizeLimitBytes      int64
 	isHeartbeating          bool
 	stopChan                chan bool
+	license                 *license.Node
 }
 
 func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
@@ -109,9 +112,18 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	whiteList = append(whiteList, util.StringSplit(v.GetString("guard.white_list"), ",")...)
 	vs.SeedMasterNodes = masterNodes
 
+	licenseCacheDir := ""
+	if len(folders) > 0 {
+		licenseCacheDir = util.ResolvePath(folders[0])
+	}
+	vs.license = newLicenseNode(licenseCacheDir)
+
 	vs.checkWithMaster()
 
 	vs.store = storage.NewStore(vs.grpcDialOption, ip, port, grpcPort, publicUrl, folders, maxCounts, minFreeSpaces, idxFolder, vs.needleMapKind, diskTypes, ldbTimeout)
+	vs.store.InternalReadContext = func(ctx context.Context) context.Context {
+		return licenseOutgoingContext(vs.license, ctx)
+	}
 	vs.guard = security.NewGuard(whiteList, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 
 	handleStaticResources(adminMux)

@@ -188,6 +188,8 @@ P2 修订：请求体除 `{"certificate":"<jws>"}` 与 multipart `file` 外也�
 | raft 任期 | hashicorp 用 `Raft.CurrentTerm()`（v1.7.2 提供，替代计划 v8 的 `Stats()["term"]` 解析）；goraft 用 `Server.Term()` |
 | raft 配置索引 | hashicorp `GetConfiguration().Index()`；goraft 无，记 0 |
 
+P3 修订：`internal_read_key` 按第 7 节“key 分发”的规则只在 volume 心跳与 filer 的 KeepConnected 流里下发（P2 实现漏发给 volume，P3 修正）。指标在 P3 只实现 `license_denied_reads_total`，prometheus 名为 `SeaweedFS_license_denied_reads_total`（仓库统一前缀），其余随 P4/P5。
+
 ---
 
 ## 4. 源码挂点（基线行号）
@@ -229,6 +231,8 @@ P2 修订：请求体除 `{"certificate":"<jws>"}` 与 multipart `file` 外也�
 | MS3 | `weed/server/master_grpc_server_raft.go:51`、`weed/server/master_server.go:372`、`weed/server/raft_hashicorp.go:101` | 三处 `AddVoter` | 加入两阶段 + `CheckMasterJoin` |
 | MS4 | `weed/server/master_grpc_server_raft.go:87`、`weed/server/raft_hashicorp.go:107`、`weed/server/master_server.go:383` | 三处移除 | `BeforeRemoveVoter`，manager 锁覆盖到移除完成 |
 | MS5 | `weed/server/master_server.go` 的 `if !ms.option.DisableHttp` 路由块 | — | `/license*` 5 条路由 |
+
+P3 修订：MS2 的授权首帧在 `addClient` 之后、卷位置之前单独发送（`KeepConnectedResponse` 只填 `license`），没有 volume 时客户端也能收到首帧。MS1 带授权的心跳响应填 `VolumeSizeLimit` 与 `Preallocate`，不填 `Leader`（leader 自己的响应在上游从不带 `Leader`）。
 
 ### 4.4 volume、filer、客户端
 
@@ -291,6 +295,12 @@ P2 修订：每个 master 在 raft 启动前把 `-license.file` 按 1.5 第 1–
 6. 剩余边界：任何能对 master 打开 `KeepConnected` 并自称 `ClientType="filer"`、且有空闲 filer 名额的 gRPC 客户端能拿到 `internal_read_key`（`ClientType` 不鉴权）；未启用 gRPC mTLS 时令牌明文传输。部署要求开启 `security.toml` 的 gRPC mTLS 才能让这两项不成立。
 7. 盘点中发现的上游路径穿越漏洞（与证书无关）已在当前分支先行修复，见第 7 节；G2 的扩展名白名单与之共用 `isCopyFileExtAllowed`。
 
+P3 修订：
+
+- 上表 `CopyFile` 行“shell `volume.fsck`、`volume.check.disk` 只取 `.idx`/`.ecx`”对 `volume.fsck` 不完整：它还在 shell 进程内经 volume HTTP 解析 manifest（无令牌）。上游遇到解析失败只打印一行并继续，会把 manifest 引用的数据块报告为孤儿（加 `-reallyDeleteFromVolume` 会删除在用数据）；P3 改为解析失败即中止并报错，证书无效且存在 manifest 文件时 `volume.fsck` 不可用。
+- `volume.check.disk` 只在副本之间有差异时才调用 `ReadNeedleBlob`；副本一致时证书无效也能完成。
+- volume HTTP 在 `ReadMode=proxy` 下转发沿用原方法（上游把 HEAD 改成 GET），HEAD 经代理也不受证书影响（第 1 节“保留”）。
+
 ### 5.3 决策 9：filer gRPC 内联正文隐藏（G1）
 
 目标：证书无效时，经 filer gRPC 也读不到内联正文，同时不让任何回写、复制、备份流程因“读到空正文”而清空或伪造数据。
@@ -345,6 +355,16 @@ P2 修订：每个 master 在 raft 启动前把 `-license.file` 按 1.5 第 1–
 | mount 读（`mount/filehandle_read.go:57` 之前） | 条目 `ContentHidden` 时返回 `EIO`；失败态下距上次 ≥ 5 秒才用 `LookupDirectoryEntry` 重取，未隐藏则替换句柄条目并写回 meta cache 后正常读（single-flight，与 1.6 的 manifest 重解析共用节流）。原因：mount meta cache 与打开的句柄会无限期保留隐藏条目，续期不产生事件 |
 
 **仍是边界：** `other/java`（不在构建内）的读取方读到空正文；Java 客户端回写依赖 protobuf-java 保留未知字段（需在使用 Java 客户端的部署中验证）。能经 filer HTTP 写 `/etc/` 的用户可把内联正文放在豁免路径下经 gRPC 读回（`/etc` 写入在 filer 强制内联，`filer_server_handlers_write.go:113-115`）。证书有效期间已建立的订阅流在到期后的事件开始隐藏，到期前已发出的事件不追回。
+
+P3 修订：
+
+- 隐藏判定：`!AllowRead()` 在每次 RPC 或每条事件时判断；令牌在流内第一次需要时读取一次。
+- 元数据聚合（`meta_aggregator.go`）在事件写入聚合日志与 Replay 之前检查隐藏条目，遇到即断开并从该事件重新订阅；新 filer 引导遇到隐藏条目每 5 秒重试，直到拿到令牌。
+- `weed filer.cat` 出错时打印到 stderr 并以 1 退出（上游吞掉全部错误）；`fs.meta.save` 遇到隐藏条目时删除未完成的转储文件；`filer.meta.backup` 首轮遍历报错退出。
+- webdav 读入口对隐藏条目返回 `ErrContentHidden`（上游 webdav 不读 `Entry.Content`，内联文件本就返回全零，这一上游缺陷未改）。
+- mount：来自 meta cache 的隐藏条目在新句柄上首次读取立即重取一次，之后 ≥ 5 秒一次；mount 写入丢弃内联正文（上游行为）后清除隐藏标志。
+- 8.2 的 S20 中“mount 硬链接后正文完整”“mount 截断到 0 得到空文件”原受上游缺陷限制（基线版本的 mount 对内联文件做硬链接即返回 `EIO` 并清空原正文，`truncate -s 0` 对内联文件不生效），P3 已修复并验证。写入合并规则补充：带 `content_hidden` 新建的名字不存在已有条目但带 `hard_link_id` 时，以共享的硬链接数据作为已有条目；隐藏正文的文件截断到非 0 长度返回 `CONTENT_HIDDEN`。
+- 边界补充：master 的 gRPC `GetLicense(include_state=true)`（master 之间对账用）不鉴权，能连 master 的任何客户端都可取得 `internal_read_key`；filer 按 `notification.toml` 发往外部队列的事件不隐藏内联正文。前者与 5.2 第 6 条同样只能靠 gRPC mTLS 消除。
 
 ---
 

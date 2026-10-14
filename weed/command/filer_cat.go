@@ -96,7 +96,7 @@ func runFilerCat(cmd *Command, args []string) bool {
 		writer = f
 	}
 
-	pb.WithFilerClient(false, util.RandomInt32(), filerCat.filerAddress, filerCat.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	err = pb.WithFilerClient(false, util.RandomInt32(), filerCat.filerAddress, filerCat.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 
 		request := &filer_pb.LookupDirectoryEntryRequest{
 			Name:      name,
@@ -107,6 +107,9 @@ func runFilerCat(cmd *Command, args []string) bool {
 			return err
 		}
 
+		if respLookupEntry.Entry.ContentHidden {
+			return filer_pb.ErrContentHidden
+		}
 		if len(respLookupEntry.Entry.Content) > 0 {
 			_, err = writer.Write(respLookupEntry.Entry.Content)
 			return err
@@ -117,6 +120,12 @@ func runFilerCat(cmd *Command, args []string) bool {
 		return filer.StreamContent(&filerCat, writer, respLookupEntry.Entry.GetChunks(), 0, int64(filer.FileSize(respLookupEntry.Entry)))
 
 	})
+	if err != nil {
+		// Fail loudly, e.g. on license: CONTENT_HIDDEN, instead of
+		// leaving an empty or partial output that looks complete.
+		fmt.Fprintf(os.Stderr, "read %s: %v\n", filerSource, err)
+		os.Exit(1)
+	}
 
 	return true
 }

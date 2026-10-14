@@ -177,13 +177,15 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 		return createErr
 	}
 	if stream != nil {
+		pbEntry := newEntry.ToProtoEntry()
+		fs.newLicenseContentFilter(stream.Context()).apply(string(newParent), pbEntry)
 		if err := stream.Send(&filer_pb.StreamRenameEntryResponse{
 			Directory: string(oldParent),
 			EventNotification: &filer_pb.EventNotification{
 				OldEntry: &filer_pb.Entry{
 					Name: entry.Name(),
 				},
-				NewEntry:           newEntry.ToProtoEntry(),
+				NewEntry:           pbEntry,
 				DeleteChunks:       false,
 				NewParentPath:      string(newParent),
 				IsFromOtherCluster: false,

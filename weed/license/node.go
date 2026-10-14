@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -13,6 +14,7 @@ import (
 
 const (
 	nodeTickInterval  = 500 * time.Millisecond
+	denyLogInterval   = 60
 	maxCacheFileBytes = 4 * MaxCertificateBytes
 	// CacheFileName is the node cache under the volume's first -dir or the
 	// filer's -defaultStoreDir.
@@ -46,6 +48,10 @@ type Node struct {
 	received   bool
 	masterDeny Reason
 	rejected   bool
+
+	// lastDenyLog and deniedSinceLog rate-limit LogDenied.
+	lastDenyLog    atomic.Int64
+	deniedSinceLog atomic.Int64
 }
 
 // NewNode creates a node license state and loads cachePath if present; an
@@ -142,6 +148,18 @@ func (n *Node) Reject() {
 	defer n.mu.Unlock()
 	n.rejected = true
 	n.publishLocked(n.guard.Now())
+}
+
+// LogDenied logs a denied read at most once a minute per node; the other
+// denials are counted into the next report.
+func (n *Node) LogDenied(path string, reason Reason) {
+	now := n.guard.Now()
+	last := n.lastDenyLog.Load()
+	if now-last < denyLogInterval || !n.lastDenyLog.CompareAndSwap(last, now) {
+		n.deniedSinceLog.Add(1)
+		return
+	}
+	glog.Warningf("license: denied %s read with %s (%d more since the last report)", path, reason, n.deniedSinceLog.Swap(0))
 }
 
 // InternalKey returns a copy of internal_read_key, or nil.

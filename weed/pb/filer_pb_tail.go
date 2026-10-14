@@ -33,6 +33,12 @@ type MetadataFollowOption struct {
 	StartTsNs              int64
 	StopTsNs               int64
 	EventErrorType         EventErrorType
+	// FailOnHiddenContent stops the subscription with
+	// filer_pb.ErrContentHidden at an event whose new entry has its inline
+	// content hidden by the license, before it is processed, so a follower
+	// that writes content elsewhere resumes from that event later instead
+	// of copying an empty file.
+	FailOnHiddenContent bool
 }
 
 type ProcessMetadataFunc func(resp *filer_pb.SubscribeMetadataResponse) error
@@ -82,6 +88,10 @@ func makeSubscribeMetadataFunc(option *MetadataFollowOption, processEventFn Proc
 			}
 			if listenErr != nil {
 				return listenErr
+			}
+
+			if option.FailOnHiddenContent && resp.EventNotification.GetNewEntry().GetContentHidden() {
+				return fmt.Errorf("event at %d: %w", resp.TsNs, filer_pb.ErrContentHidden)
 			}
 
 			if err := processEventFn(resp); err != nil {

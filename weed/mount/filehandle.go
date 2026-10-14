@@ -7,6 +7,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 type FileHandleId uint64
@@ -29,6 +30,11 @@ type FileHandle struct {
 	contentType   string
 
 	isDeleted bool
+
+	// readFailure is set while reads fail with EIO; readRetryLock lets one
+	// reader at a time try to clear it (filehandle_license.go).
+	readFailure   atomic.Pointer[readFailure]
+	readRetryLock sync.Mutex
 
 	// for debugging
 	mirrorFile *os.File
@@ -77,8 +83,11 @@ func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
 		var resolveManifestErr error
 		fh.entryChunkGroup, resolveManifestErr = filer.NewChunkGroup(fh.wfs.LookupFn(), fh.wfs.chunkCache, entry.Chunks)
 		if resolveManifestErr != nil {
-			glog.Warningf("failed to resolve manifest chunks in %+v", entry)
+			glog.Warningf("failed to resolve manifest chunks in %s: %v", entry.Name, resolveManifestErr)
 		}
+		// Reads fail instead of returning zeros until the chunks resolve
+		// or the content is no longer hidden (plan 1.6).
+		fh.setEntryReadFailure(entry, resolveManifestErr)
 	} else {
 		glog.Fatalf("setting file handle entry to nil")
 	}

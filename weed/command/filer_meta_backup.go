@@ -132,6 +132,12 @@ func (metaBackup *FilerMetaBackupOptions) traverseMetadata() (err error) {
 	traverseErr := filer_pb.TraverseBfs(metaBackup, util.FullPath(*metaBackup.filerDirectory), func(parentPath util.FullPath, entry *filer_pb.Entry) {
 
 		println("+", parentPath.Child(entry.Name))
+		if entry.ContentHidden {
+			// The license hides this entry's inline content; a backup
+			// without it would be wrong.
+			saveErr = fmt.Errorf("%s: %w", parentPath.Child(entry.Name), filer_pb.ErrContentHidden)
+			return
+		}
 		if err := metaBackup.store.InsertEntry(context.Background(), filer.FromPbEntry(string(parentPath), entry)); err != nil {
 			saveErr = fmt.Errorf("insert entry error: %v\n", err)
 			return
@@ -213,6 +219,7 @@ func (metaBackup *FilerMetaBackupOptions) streamMetadataBackup() error {
 		StartTsNs:              startTime.UnixNano(),
 		StopTsNs:               0,
 		EventErrorType:         pb.RetryForeverOnError,
+		FailOnHiddenContent:    true,
 	}
 
 	return pb.FollowMetadata(pb.ServerAddress(*metaBackup.filerAddress), metaBackup.grpcDialOption, metadataFollowOption, processEventFnWithOffset)

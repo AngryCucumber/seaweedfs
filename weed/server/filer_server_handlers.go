@@ -63,6 +63,10 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 		fileId = r.RequestURI[len("/?proxyChunkId="):]
 	}
 	if fileId != "" {
+		// The proxy forwards the request method; only GETs read data (F2).
+		if r.Method == http.MethodGet && !licenseHttpReadAllowed(fs.license, w, r, "filer", licensePathFilerProxy, false) {
+			return
+		}
 		fs.proxyToVolumeServer(w, r, fileId)
 		stats.FilerHandlerCounter.WithLabelValues(stats.ChunkProxy).Inc()
 		stats.FilerRequestHistogram.WithLabelValues(stats.ChunkProxy).Observe(time.Since(start).Seconds())

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"sync"
 	"time"
 
@@ -108,7 +109,9 @@ func fetchWholeChunk(bytesBuffer *bytes.Buffer, lookupFileIdFn wdclient.LookupFi
 		glog.Errorf("operation LookupFileId %s failed, err: %v", fileId, err)
 		return err
 	}
-	err = retriedStreamFetchChunkData(bytesBuffer, urlStrings, "", cipherKey, isGzipped, true, 0, 0)
+	// Manifest chunks hold only chunk ids; the filer reads them with its
+	// internal read token (plan 1.4).
+	err = retriedStreamFetchChunkData(bytesBuffer, urlStrings, "", internalReadHeader(), cipherKey, isGzipped, true, 0, 0)
 	if err != nil {
 		return err
 	}
@@ -124,7 +127,7 @@ func fetchChunkRange(buffer []byte, lookupFileIdFn wdclient.LookupFileIdFunction
 	return util_http.RetriedFetchChunkData(buffer, urlStrings, cipherKey, isGzipped, false, offset)
 }
 
-func retriedStreamFetchChunkData(writer io.Writer, urlStrings []string, jwt string, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64, size int) (err error) {
+func retriedStreamFetchChunkData(writer io.Writer, urlStrings []string, jwt string, extraHeader http.Header, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64, size int) (err error) {
 
 	var shouldRetry bool
 	var totalWritten int
@@ -133,7 +136,7 @@ func retriedStreamFetchChunkData(writer io.Writer, urlStrings []string, jwt stri
 		for _, urlString := range urlStrings {
 			var localProcessed int
 			var writeErr error
-			shouldRetry, err = util_http.ReadUrlAsStreamAuthenticated(urlString+"?readDeleted=true", jwt, cipherKey, isGzipped, isFullChunk, offset, size, func(data []byte) {
+			shouldRetry, err = util_http.ReadUrlAsStreamWithHeader(urlString+"?readDeleted=true", jwt, extraHeader, cipherKey, isGzipped, isFullChunk, offset, size, func(data []byte) {
 				if totalWritten > localProcessed {
 					toBeSkipped := totalWritten - localProcessed
 					if len(data) <= toBeSkipped {

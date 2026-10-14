@@ -85,6 +85,19 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 				fh.entryChunkGroup.SetChunks(chunks)
 			}
 		}
+		// Inline content has no chunks to cut; truncate it as well, or the
+		// filer keeps serving the old bytes.
+		if size < uint64(len(entry.Content)) {
+			entry.Content = entry.Content[:size]
+		}
+		if size == 0 {
+			// Nothing of a hidden inline content remains.
+			if fh != nil {
+				fh.clearHiddenContent(entry)
+			} else {
+				entry.ContentHidden = false
+			}
+		}
 		entry.Attributes.Mtime = time.Now().Unix()
 		entry.Attributes.FileSize = size
 

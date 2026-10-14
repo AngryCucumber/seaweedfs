@@ -44,6 +44,9 @@ type Entry struct {
 	Remote             *filer_pb.RemoteEntry
 	Quota              int64
 	WORMEnforcedAtTsNs int64
+	// ContentHidden marks a copy whose inline Content was withheld because
+	// the license denies reads. Filers never store it as true.
+	ContentHidden bool `json:",omitempty"`
 }
 
 func (entry *Entry) Size() uint64 {
@@ -72,6 +75,7 @@ func (entry *Entry) ShallowClone() *Entry {
 	newEntry.Content = entry.Content
 	newEntry.Remote = entry.Remote
 	newEntry.Quota = entry.Quota
+	newEntry.ContentHidden = entry.ContentHidden
 
 	return newEntry
 }
@@ -100,6 +104,7 @@ func (entry *Entry) ToExistingProtoEntry(message *filer_pb.Entry) {
 	message.RemoteEntry = entry.Remote
 	message.Quota = entry.Quota
 	message.WormEnforcedAtTsNs = entry.WORMEnforcedAtTsNs
+	message.ContentHidden = entry.ContentHidden
 }
 
 func FromPbEntryToExistingEntry(message *filer_pb.Entry, fsEntry *Entry) {
@@ -113,6 +118,7 @@ func FromPbEntryToExistingEntry(message *filer_pb.Entry, fsEntry *Entry) {
 	fsEntry.Quota = message.Quota
 	fsEntry.FileSize = FileSize(message)
 	fsEntry.WORMEnforcedAtTsNs = message.WormEnforcedAtTsNs
+	fsEntry.ContentHidden = message.ContentHidden
 }
 
 func (entry *Entry) ToProtoFullEntry() *filer_pb.FullEntry {

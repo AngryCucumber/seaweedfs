@@ -27,6 +27,7 @@ func (fs *FilerServer) TraverseBfsMetadata(req *filer_pb.TraverseBfsMetadataRequ
 		return fmt.Errorf("find dir %s: %v", req.Directory, err)
 	}
 	queue.Enqueue(dirEntry)
+	contentFilter := fs.newLicenseContentFilter(ctx)
 
 	for item := queue.Dequeue(); item != nil; item = queue.Dequeue() {
 		if excludedTrie.MatchPrefix([]byte(item.FullPath), func(key []byte, value bool) bool {
@@ -36,9 +37,11 @@ func (fs *FilerServer) TraverseBfsMetadata(req *filer_pb.TraverseBfsMetadataRequ
 			continue
 		}
 		parent, _ := item.FullPath.DirAndName()
+		pbEntry := item.ToProtoEntry()
+		contentFilter.apply(parent, pbEntry)
 		if err := stream.Send(&filer_pb.TraverseBfsMetadataResponse{
 			Directory: parent,
-			Entry:     item.ToProtoEntry(),
+			Entry:     pbEntry,
 		}); err != nil {
 			return fmt.Errorf("send traverse bfs metadata response: %v", err)
 		}

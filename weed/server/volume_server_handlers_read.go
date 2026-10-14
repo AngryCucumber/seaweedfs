@@ -50,6 +50,9 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 		writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
 		return
 	}
+	if r.Method == http.MethodGet && !licenseHttpReadAllowed(vs.license, w, r, "volumeServer", licensePathVolumeHttp, true) {
+		return
+	}
 
 	volumeId, err := needle.NewVolumeId(vid)
 	if err != nil {
@@ -86,7 +89,8 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 			u, _ := url.Parse(rawURL)
 			r.URL.Host = u.Host
 			r.URL.Scheme = u.Scheme
-			request, err := http.NewRequest(http.MethodGet, r.URL.String(), nil)
+			// Keep HEAD a HEAD: the target serves it whatever the license.
+			request, err := http.NewRequest(r.Method, r.URL.String(), nil)
 			if err != nil {
 				glog.V(0).Infof("failed to instance http request of url %s: %v", r.URL.String(), err)
 				InternalError(w)

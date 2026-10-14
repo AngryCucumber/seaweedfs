@@ -94,6 +94,12 @@ func (s3a *S3ApiServer) CopyObjectHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer util_http.CloseResponse(resp)
+	// DownloadFile does not check the status; an error body, such as a
+	// license denial, must not become the copy's content.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidCopySource)
+		return
+	}
 
 	tagErr := processMetadata(r.Header, resp.Header, replaceMeta, replaceTagging, s3a.getTags, dir, name)
 	if tagErr != nil {

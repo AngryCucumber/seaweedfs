@@ -18,6 +18,9 @@ func ReadEntry(masterClient *wdclient.MasterClient, filerClient filer_pb.Seaweed
 	if err != nil {
 		return err
 	}
+	if respLookupEntry.Entry.ContentHidden {
+		return filer_pb.ErrContentHidden
+	}
 	if len(respLookupEntry.Entry.Content) > 0 {
 		_, err = byteBuffer.Write(respLookupEntry.Entry.Content)
 		return err
@@ -35,6 +38,9 @@ func ReadInsideFiler(filerClient filer_pb.SeaweedFilerClient, dir, name string) 
 	respLookupEntry, err := filer_pb.LookupEntry(filerClient, request)
 	if err != nil {
 		return
+	}
+	if respLookupEntry.Entry.ContentHidden {
+		return nil, filer_pb.ErrContentHidden
 	}
 	content = respLookupEntry.Entry.Content
 	return
@@ -66,6 +72,7 @@ func SaveInsideFiler(client filer_pb.SeaweedFilerClient, dir, name string, conte
 	} else if err == nil {
 		entry := resp.Entry
 		entry.Content = content
+		entry.ContentHidden = false
 		entry.Attributes.Mtime = time.Now().Unix()
 		entry.Attributes.FileSize = uint64(len(content))
 		err = filer_pb.UpdateEntry(client, &filer_pb.UpdateEntryRequest{

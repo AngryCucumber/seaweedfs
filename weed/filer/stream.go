@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -80,7 +81,13 @@ func noJwtFunc(string) string {
 	return ""
 }
 
+// PrepareStreamContentWithThrottler serves user reads; it never carries the
+// internal read token.
 func PrepareStreamContentWithThrottler(masterClient wdclient.HasLookupFileIdFunction, jwtFunc VolumeServerJwtFunction, chunks []*filer_pb.FileChunk, offset int64, size int64, downloadMaxBytesPs int64) (DoStreamContent, error) {
+	return prepareStreamContent(masterClient, jwtFunc, nil, chunks, offset, size, downloadMaxBytesPs)
+}
+
+func prepareStreamContent(masterClient wdclient.HasLookupFileIdFunction, jwtFunc VolumeServerJwtFunction, extraHeader http.Header, chunks []*filer_pb.FileChunk, offset int64, size int64, downloadMaxBytesPs int64) (DoStreamContent, error) {
 	glog.V(4).Infof("prepare to stream content for chunks: %d", len(chunks))
 	chunkViews := ViewFromChunks(masterClient.GetLookupFileIdFunction(), chunks, offset, size)
 
@@ -127,7 +134,7 @@ func PrepareStreamContentWithThrottler(masterClient wdclient.HasLookupFileIdFunc
 			urlStrings := fileId2Url[chunkView.FileId]
 			start := time.Now()
 			jwt := jwtFunc(chunkView.FileId)
-			err := retriedStreamFetchChunkData(writer, urlStrings, jwt, chunkView.CipherKey, chunkView.IsGzipped, chunkView.IsFullChunk(), chunkView.OffsetInChunk, int(chunkView.ViewSize))
+			err := retriedStreamFetchChunkData(writer, urlStrings, jwt, extraHeader, chunkView.CipherKey, chunkView.IsGzipped, chunkView.IsFullChunk(), chunkView.OffsetInChunk, int(chunkView.ViewSize))
 			offset += int64(chunkView.ViewSize)
 			remaining -= int64(chunkView.ViewSize)
 			stats.FilerRequestHistogram.WithLabelValues("chunkDownload").Observe(time.Since(start).Seconds())
@@ -150,8 +157,10 @@ func PrepareStreamContentWithThrottler(masterClient wdclient.HasLookupFileIdFunc
 	}, nil
 }
 
+// StreamContent reads configuration files (filer.conf, IAM) inside a filer
+// process, with the internal read token (plan 1.4).
 func StreamContent(masterClient wdclient.HasLookupFileIdFunction, writer io.Writer, chunks []*filer_pb.FileChunk, offset int64, size int64) error {
-	streamFn, err := PrepareStreamContent(masterClient, noJwtFunc, chunks, offset, size)
+	streamFn, err := prepareStreamContent(masterClient, noJwtFunc, internalReadHeader(), chunks, offset, size, 0)
 	if err != nil {
 		return err
 	}
@@ -351,7 +360,9 @@ func (c *ChunkStreamReader) fetchChunkToBuffer(chunkView *ChunkView) error {
 	var buffer bytes.Buffer
 	var shouldRetry bool
 	for _, urlString := range urlStrings {
-		shouldRetry, err = util_http.ReadUrlAsStream(urlString+"?readDeleted=true", chunkView.CipherKey, chunkView.IsGzipped, chunkView.IsFullChunk(), chunkView.OffsetInChunk, int(chunkView.ViewSize), func(data []byte) {
+		// Used by chunk merge and metadata log replay inside the filer,
+		// so it carries the internal read token (plan 1.4).
+		shouldRetry, err = util_http.ReadUrlAsStreamWithHeader(urlString+"?readDeleted=true", "", internalReadHeader(), chunkView.CipherKey, chunkView.IsGzipped, chunkView.IsFullChunk(), chunkView.OffsetInChunk, int(chunkView.ViewSize), func(data []byte) {
 			buffer.Write(data)
 		})
 		if !shouldRetry {

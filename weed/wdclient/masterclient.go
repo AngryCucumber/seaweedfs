@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,6 +12,8 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -31,6 +34,13 @@ type MasterClient struct {
 	vidMapCacheSize  int
 	OnPeerUpdate     func(update *master_pb.ClusterNodeUpdate, startFrom time.Time)
 	OnPeerUpdateLock sync.RWMutex
+
+	// OnLicenseUpdate receives the license state sent by the leader.
+	// OnLicenseReject is called when the leader refused this client's
+	// registration with a "license:" PermissionDenied error. Set both
+	// before KeepConnectedToMaster starts.
+	OnLicenseUpdate func(update *master_pb.LicenseUpdate)
+	OnLicenseReject func(message string)
 }
 
 func NewMasterClient(grpcDialOption grpc.DialOption, filerGroup string, clientType string, clientHost pb.ServerAddress, clientDataCenter string, rack string, masters pb.ServerDiscovery) *MasterClient {
@@ -219,6 +229,7 @@ func (mc *MasterClient) tryConnectToMaster(ctx context.Context, master pb.Server
 		if err != nil {
 			glog.V(0).Infof("%s.%s masterClient failed to receive from %s: %v", mc.FilerGroup, mc.clientType, master, err)
 			stats.MasterClientConnectCounter.WithLabelValues(stats.FailedToReceive).Inc()
+			mc.maybeLicenseReject(err)
 			return err
 		}
 
@@ -234,6 +245,9 @@ func (mc *MasterClient) tryConnectToMaster(ctx context.Context, master pb.Server
 			mc.updateVidMap(resp)
 		} else {
 			mc.resetVidMap()
+		}
+		if resp.License != nil && mc.OnLicenseUpdate != nil {
+			mc.OnLicenseUpdate(resp.License)
 		}
 		mc.setCurrentMaster(master)
 
@@ -254,6 +268,10 @@ func (mc *MasterClient) tryConnectToMaster(ctx context.Context, master pb.Server
 					return nil
 				}
 				mc.updateVidMap(resp)
+			}
+
+			if resp.License != nil && mc.OnLicenseUpdate != nil {
+				mc.OnLicenseUpdate(resp.License)
 			}
 
 			if resp.ClusterNodeUpdate != nil {
@@ -283,6 +301,17 @@ func (mc *MasterClient) tryConnectToMaster(ctx context.Context, master pb.Server
 		glog.V(1).Infof("%s.%s masterClient failed to connect with master %v: %v", mc.FilerGroup, mc.clientType, master, gprcErr)
 	}
 	return
+}
+
+// maybeLicenseReject reports a registration refused by the license node
+// quota. "license: RECONCILING" is Unavailable and leaves the state alone.
+func (mc *MasterClient) maybeLicenseReject(err error) {
+	if mc.OnLicenseReject == nil {
+		return
+	}
+	if st, ok := status.FromError(err); ok && st.Code() == codes.PermissionDenied && strings.HasPrefix(st.Message(), "license:") {
+		mc.OnLicenseReject(st.Message())
+	}
 }
 
 func (mc *MasterClient) updateVidMap(resp *master_pb.KeepConnectedResponse) {

@@ -82,7 +82,18 @@ func (c *commandFsMetaSave) Do(args []string, commandEnv *CommandEnv, writer io.
 		cipherKey = util.GenCipherKey()
 	}
 
+	// An entry whose inline content the license hides cannot be saved
+	// faithfully, so the dump is discarded.
+	var hiddenOnce sync.Once
+	var hiddenErr error
+
 	err = doTraverseBfsAndSaving(commandEnv, writer, path, *verbose, func(entry *filer_pb.FullEntry, outputChan chan interface{}) (err error) {
+		if entry.Entry.ContentHidden {
+			hiddenOnce.Do(func() {
+				hiddenErr = fmt.Errorf("%s: %w", util.NewFullPath(entry.Dir, entry.Entry.Name), filer_pb.ErrContentHidden)
+			})
+			return nil
+		}
 		if !entry.Entry.IsDirectory {
 			ext := filepath.Ext(entry.Entry.Name)
 			if encrypted, encErr := util.Encrypt([]byte(entry.Entry.Name), cipherKey); encErr == nil {
@@ -108,6 +119,11 @@ func (c *commandFsMetaSave) Do(args []string, commandEnv *CommandEnv, writer io.
 		}
 	})
 
+	if err == nil && hiddenErr != nil {
+		dst.Close()
+		os.Remove(fileName)
+		err = hiddenErr
+	}
 	if err == nil {
 		fmt.Fprintf(writer, "meta data for http://%s%s is saved to %s\n", commandEnv.option.FilerAddress.ToHttpAddress(), path, fileName)
 	}

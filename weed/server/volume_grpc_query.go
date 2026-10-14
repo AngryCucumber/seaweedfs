@@ -10,6 +10,9 @@ import (
 )
 
 func (vs *VolumeServer) Query(req *volume_server_pb.QueryRequest, stream volume_server_pb.VolumeServer_QueryServer) error {
+	if err := licenseGrpcReadAllowed(vs.license, stream.Context()); err != nil {
+		return err
+	}
 
 	for _, fid := range req.FromFileIds {
 

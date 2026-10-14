@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -55,6 +56,9 @@ type ReadOption struct {
  * A VolumeServer contains one Store
  */
 type Store struct {
+	// InternalReadContext adds the license internal read token to the
+	// context of a volume to volume data read; set by the volume server.
+	InternalReadContext func(ctx context.Context) context.Context
 	MasterAddress       pb.ServerAddress
 	grpcDialOption      grpc.DialOption
 	volumeSizeLimit     uint64      // read from the master

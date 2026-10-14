@@ -308,7 +308,13 @@ func (s *Store) doReadRemoteEcShardInterval(sourceDataNode pb.ServerAddress, nee
 	err = operation.WithVolumeServerClient(false, sourceDataNode, s.grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
 
 		// copy data slice
-		shardReadClient, err := client.VolumeEcShardRead(context.Background(), &volume_server_pb.VolumeEcShardReadRequest{
+		// EC deletes and needle status read remote shards too, so the read
+		// carries the internal read token (contract 5.2).
+		ctx := context.Background()
+		if s.InternalReadContext != nil {
+			ctx = s.InternalReadContext(ctx)
+		}
+		shardReadClient, err := client.VolumeEcShardRead(ctx, &volume_server_pb.VolumeEcShardReadRequest{
 			VolumeId: uint32(vid),
 			ShardId:  uint32(shardId),
 			Offset:   offset,

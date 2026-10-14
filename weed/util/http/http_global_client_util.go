@@ -45,11 +45,16 @@ func Get(url string) ([]byte, bool, error) {
 }
 
 func GetAuthenticated(url, jwt string) ([]byte, bool, error) {
+	return getAuthenticatedWithHeader(url, jwt, nil)
+}
+
+func getAuthenticatedWithHeader(url, jwt string, header http.Header) ([]byte, bool, error) {
 	request, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, true, err
 	}
 	maybeAddAuth(request, jwt)
+	addHeader(request, header)
 	request.Header.Add("Accept-Encoding", "gzip")
 
 	response, err := GetGlobalHttpClient().Do(request)
@@ -96,6 +101,16 @@ func Head(url string) (http.Header, error) {
 func maybeAddAuth(req *http.Request, jwt string) {
 	if jwt != "" {
 		req.Header.Set("Authorization", "BEARER "+string(jwt))
+	}
+}
+
+// addHeader sets extra request headers, such as the filer's internal read
+// token on its maintenance reads.
+func addHeader(req *http.Request, header http.Header) {
+	for k, v := range header {
+		if len(v) > 0 {
+			req.Header.Set(k, v[0])
+		}
 	}
 }
 
@@ -218,7 +233,7 @@ func ReadUrl(fileUrl string, cipherKey []byte, isContentCompressed bool, isFullC
 
 	if cipherKey != nil {
 		var n int
-		_, err := readEncryptedUrl(fileUrl, "", cipherKey, isContentCompressed, isFullChunk, offset, size, func(data []byte) {
+		_, err := readEncryptedUrl(fileUrl, "", nil, cipherKey, isContentCompressed, isFullChunk, offset, size, func(data []byte) {
 			n = copy(buf, data)
 		})
 		return int64(n), err
@@ -291,15 +306,22 @@ func ReadUrlAsStream(fileUrl string, cipherKey []byte, isContentGzipped bool, is
 }
 
 func ReadUrlAsStreamAuthenticated(fileUrl, jwt string, cipherKey []byte, isContentGzipped bool, isFullChunk bool, offset int64, size int, fn func(data []byte)) (retryable bool, err error) {
+	return ReadUrlAsStreamWithHeader(fileUrl, jwt, nil, cipherKey, isContentGzipped, isFullChunk, offset, size, fn)
+}
+
+// ReadUrlAsStreamWithHeader is ReadUrlAsStreamAuthenticated with extra
+// request headers, sent on both the plain and the encrypted read.
+func ReadUrlAsStreamWithHeader(fileUrl, jwt string, header http.Header, cipherKey []byte, isContentGzipped bool, isFullChunk bool, offset int64, size int, fn func(data []byte)) (retryable bool, err error) {
 	if cipherKey != nil {
-		return readEncryptedUrl(fileUrl, jwt, cipherKey, isContentGzipped, isFullChunk, offset, size, fn)
+		return readEncryptedUrl(fileUrl, jwt, header, cipherKey, isContentGzipped, isFullChunk, offset, size, fn)
 	}
 
 	req, err := http.NewRequest(http.MethodGet, fileUrl, nil)
-	maybeAddAuth(req, jwt)
 	if err != nil {
 		return false, err
 	}
+	maybeAddAuth(req, jwt)
+	addHeader(req, header)
 
 	if isFullChunk {
 		req.Header.Add("Accept-Encoding", "gzip")
@@ -351,8 +373,8 @@ func ReadUrlAsStreamAuthenticated(fileUrl, jwt string, cipherKey []byte, isConte
 
 }
 
-func readEncryptedUrl(fileUrl, jwt string, cipherKey []byte, isContentCompressed bool, isFullChunk bool, offset int64, size int, fn func(data []byte)) (bool, error) {
-	encryptedData, retryable, err := GetAuthenticated(fileUrl, jwt)
+func readEncryptedUrl(fileUrl, jwt string, header http.Header, cipherKey []byte, isContentCompressed bool, isFullChunk bool, offset int64, size int, fn func(data []byte)) (bool, error) {
+	encryptedData, retryable, err := getAuthenticatedWithHeader(fileUrl, jwt, header)
 	if err != nil {
 		return retryable, fmt.Errorf("fetch %s: %v", fileUrl, err)
 	}

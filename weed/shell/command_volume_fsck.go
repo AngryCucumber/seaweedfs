@@ -235,13 +235,21 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 		}
 	}()
 
-	return doTraverseBfsAndSaving(c.env, c.writer, c.getCollectFilerFilePath(), false,
+	// A manifest that cannot be read (for example while the license denies
+	// reads) hides the chunks it lists; reporting them as orphans could
+	// purge live data, so the check fails instead.
+	var resolveOnce sync.Once
+	var resolveFailure error
+	traverseErr := doTraverseBfsAndSaving(c.env, c.writer, c.getCollectFilerFilePath(), false,
 		func(entry *filer_pb.FullEntry, outputChan chan interface{}) (err error) {
 			if *c.verbose && entry.Entry.IsDirectory {
 				fmt.Fprintf(c.writer, "checking directory %s\n", util.NewFullPath(entry.Dir, entry.Entry.Name))
 			}
 			dataChunks, manifestChunks, resolveErr := filer.ResolveChunkManifest(filer.LookupFn(c.env), entry.Entry.GetChunks(), 0, math.MaxInt64)
 			if resolveErr != nil {
+				resolveOnce.Do(func() {
+					resolveFailure = fmt.Errorf("resolve chunk manifest of %s: %v", util.NewFullPath(entry.Dir, entry.Entry.Name), resolveErr)
+				})
 				return fmt.Errorf("failed to ResolveChunkManifest: %+v", resolveErr)
 			}
 			dataChunks = append(dataChunks, manifestChunks...)
@@ -280,6 +288,10 @@ func (c *commandVolumeFsck) collectFilerFileIdAndPaths(dataNodeVolumeIdToVInfo m
 				}
 			}
 		})
+	if traverseErr != nil {
+		return traverseErr
+	}
+	return resolveFailure
 }
 
 func (c *commandVolumeFsck) findFilerChunksMissingInVolumeServers(volumeIdToVInfo map[uint32]VInfo, dataNodeId string, applyPurging bool) error {
