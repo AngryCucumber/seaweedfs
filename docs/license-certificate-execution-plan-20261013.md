@@ -135,7 +135,7 @@ v4 处理：只在只读 HTTP 接口（M1）隐藏，gRPC 面列为边界。部�
 | `limits` | `max_master_nodes`、`max_volume_servers`、`max_filers`；整数 ≥ 1。S3 网关、webdav、mount 不向 master 注册，不计数 |
 | 时间 | `not_before <= now < expires_at`，到期等号即失效，无宽限；节点判断粒度见 4.3 |
 | 续期 | 状态持有 `newest` 与 `prev` 两张证书（3.2）；`sequence` 严格递增；`deployment_id` 必须等于本集群 id；导入失败保旧 |
-| 签发 | 复用 `massdb-sql/tools/license-issuer/`，见 7.3 |
+| 签发 | 生产签发工具放在独立项目，不放入 massdb-sql；沿用协议 v1。massdb-sql 的签发工具只用于生成互通测试向量。见 7.3 |
 | 信任根 | 生产公钥清单编译进二进制（`weed/license/trust.go`）；测试根只经 `-ldflags -X` 或 build tag 注入 |
 
 申请 DTO（由 `GET /license/deployment` 导出）：
@@ -427,14 +427,21 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 
 合计：新包约 1,700 行（含测试约 2,700 行）；既有 Go 文件修改约 720 行，模板约 140 行，新增 Go 文件约 550 行。不改 raft 状态机、不改 webdav；v9 起 `filer.proto` 增加一个字段，volume/filer gRPC 在拒读态的返回按 1.2 G1/G2 变化；mount 只改 1.6 的读取错误传播。
 
-### 7.3 签发工具（massdb-sql 仓库，另计）
+### 7.3 签发工具（独立项目，另计；2026-10-14 修订）
 
-`validate_claims` 把 `product` 与 limits 字段写死（[license_issuer.py:167](/Users/angrycucumbers/project/license/massdb-sql/tools/license-issuer/license_issuer.py:167)），`sign/verify` 都调用它。加产品档案 `--product massdb-oss`，limits 为三个 OSS 字段，`prepare-claims` 加 `--max-*`，签发测试加 OSS 用例。约 1 人天，P5 依赖。
+不在 massdb-sql 的签发工具上加 OSS 产品档案（原计划的改法与第 9 节决策 7 原默认值作废）。massdb-sql 的 `tools/license-issuer/` 只作测试用：P1 用它和 OpenSSL 3 生成 `weed/license/testdata` 的互通向量（[gen_issuer_vectors.py](../weed/license/testdata/gen_issuer_vectors.py) 调用其内部 `_sign_claims`，绕过写死 SQL 产品的 `validate_claims`）；真实进程验证用一次性测试根。
+
+生产签发工具放在另一个独立项目（项目待定），须满足：
+- 协议 v1：compact JWS（Ed25519，`typ="massdb-license+jws"`）、严格 JSON 与文本码点规则、`export-trust` 信任清单格式，与 P0 契约第 1 节一致。
+- OSS 产品档案：`product="MassDB OSS"`，limits 为 `max_master_nodes`、`max_volume_servers`、`max_filers`，功能 `DATA_READ`；`prepare-claims` 从 `GET /license/deployment` 或 `weed license.init` 的申请生成声明并接受三个 `--max-*`；`sign`、`verify`、`export-trust`。
+- 发布前用它重新生成互通向量，并让 `weed/license` 的测试对它通过。
+
+它产出生产 kid 与公钥（7.4），是发布的前置条件；P5 的功能验收仍用测试根，不被它阻塞。工作量随项目另计。
 
 ### 7.4 开工前准备
 
 - protoc v5.28.3、protoc-gen-go v1.34.2、protoc-gen-go-grpc v1.5.1（本机未安装，版本须与现有生成文件一致；v9 起 `master.proto` 与 `filer.proto` 都要重新生成，`filer.proto` 同步到 `other/java`）。
-- 生产 kid 与公钥（发布前）；P1 用测试根。
+- 生产 kid 与公钥（发布前，由 7.3 的独立签发项目产出）；P1–P5 用测试根。
 
 ---
 
@@ -449,7 +456,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | P4 节点额度 | 账本、宽限、预占、`NODE_REJECTED`（volume 与 filer）、三个 master 加入入口、无证书额度 0 与 master 启动检查 | **已完成（2026-10-14）**，证据与差异见 8.3：S9–S12 与 S21 的节点部分真实进程通过（单 master、hashicorp 3 master 强杀切主、`weed server`、基线版本升级）；10 分钟宽限实测 603 秒自动释放；新增 license 单测通过（master 加入入口与启动检查的 S21 部分 P2 已验证） | 2.5 天 |
 | P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13 | 2 天 |
 
-合计约 20.5 人天（单人，不含签发工具 1 人天）。v9 增量见 P0 契约 8.1。
+合计约 20.5 人天（单人，不含签发工具；签发工具为独立项目，另计，见 7.3）。v9 增量见 P0 契约 8.1。
 
 ### 8.1 P2 实施记录（2026-10-13）
 
@@ -656,7 +663,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | 4 | volume gRPC 原始读 | 不封堵 | **封堵（已选；改为 handler 入口守卫，不用拦截器）** |
 | 5 | `HEAD` 与元数据接口 | 放行 | 全拦 |
 | 6 | 管理接口访问控制 | 依赖厂商签名；白名单不视为防护 | 导入口令 |
-| 7 | 签发工具 | massdb-sql 加产品档案 | 独立复制 |
+| 7 | 签发工具 | massdb-sql 加产品档案 | 独立项目（**2026-10-14 改选**；massdb-sql 的签发工具只作测试用，见 7.3） |
 | 8 | `-license.file` | 做 | 不做 |
 | 9 | `Entry.Content` | 两个只读 HTTP 接口隐藏并打标记；gRPC 面与 mount 列为边界 | filer.proto 加 `content_hidden` 标志，`UpdateEntry` 在该标志下忽略 `Content`，gRPC Lookup/List 也隐藏；需改 filer.proto 与 mount（**已选**，规则按 1.5 v9 细化） |
 | 10 | 内部令牌轮换接口 | 不做 | `POST /license/rotate-internal-key` |

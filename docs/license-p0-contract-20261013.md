@@ -81,9 +81,9 @@ P0 只交付契约与核对记录，不含实现与运行测试。
 - 时钟修复文档 `typ="massdb-license-clock-repair+jws"` 与挑战流程：OSS 用“导入更高序号且 `issued_at <= now` 的证书”修复（计划 4.5），不接受修复文档。
 - `purpose="time_repair"` 的信任 key。
 
-### 1.7 签发工具改动（massdb-sql 仓库，P5 前完成）
+### 1.7 签发工具（独立项目；2026-10-14 修订）
 
-`license_issuer.py` 加 `--product {massdb-sql,massdb-oss}` 产品档案：`validate_claims`、`_repair_binding`、`prepare_claims` 按档案取 `product` 字符串与 limits 字段集；`prepare-claims` 加 `--max-master-nodes/--max-volume-servers/--max-filers`；`verify` 的 `data_query_feature` 按档案改为检查 `DATA_READ`；签发测试加 OSS 用例。约 1 人天。
+原定在 massdb-sql 的 `license_issuer.py` 上加 `--product massdb-oss` 档案，现改为：massdb-sql 的签发工具只作测试用（`weed/license/testdata` 的互通向量），不加 OSS 档案；生产签发工具放在另一个独立项目（项目待定），按本节的声明、文本规则与信任清单格式实现协议 v1 与 OSS 产品档案，要求见计划 7.3。生产 kid 与公钥由它产出，是发布的前置条件，不阻塞 P5 的功能验收。
 
 ---
 
@@ -386,7 +386,7 @@ P3 修订：
 | 4 | volume gRPC 原始读 | **改选：封堵**，7 个 RPC 入口守卫 + volume↔volume 令牌（5.2）；不用拦截器 |
 | 5 | `HEAD` 与元数据接口 | 默认：放行（内联正文按 M1/G1 隐藏） |
 | 6 | 管理接口访问控制 | 默认：依赖厂商签名；白名单不视为防护 |
-| 7 | 签发工具 | 默认：massdb-sql 加产品档案（1.7） |
+| 7 | 签发工具 | **2026-10-14 改选：独立项目**，不改 massdb-sql；massdb-sql 的签发工具只作测试用（1.7） |
 | 8 | `-license.file` | 默认：做；因决策 2 成为升级路径的必需项 |
 | 9 | `Entry.Content` | **改选：封堵**，`content_hidden` + 写入合并规则 + 系统豁免 + 客户端改动（5.3） |
 | 10 | 内部令牌轮换接口 | 默认：不做 |
@@ -430,7 +430,7 @@ P3 修订：
 | 4 | 7 个 RPC 入口守卫与 gRPC 令牌校验（~60 行）、3 处出站附加令牌（~20 行）、单测 | +1 天（P3） |
 | 9 | `filer.proto` 字段与 Go/Java 生成、`filer.Entry` 映射、6 处隐藏点与 `KvGet`、写入合并规则、filer 间令牌与 Replay/引导防御、订阅选项与 5 个命令、读取辅助与 cat/meta 命令、mount `EIO` 与重取（合计 ~250 行 + 测试） | +2.5 天（P3） |
 
-合计由约 15.5 人天增至约 **20.5 人天**（不含签发工具 1 人天）。新包外的既有文件修改由约 310 行增至约 760 行；H2、H11 的措辞按 8.3 调整。
+合计由约 15.5 人天增至约 **20.5 人天**（不含签发工具；签发工具为独立项目，另计）。新包外的既有文件修改由约 310 行增至约 760 行；H2、H11 的措辞按 8.3 调整。
 
 ### 8.2 新增或修改的验收场景
 

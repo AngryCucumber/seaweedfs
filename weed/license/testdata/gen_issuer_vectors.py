@@ -8,7 +8,9 @@ manifest and the signed certificates are written here.
 
     python3 -I gen_issuer_vectors.py <path to license_issuer.py> <openssl 3> <output dir>
 
-The issuer has no OSS product profile yet, so this calls its internal
+The MassDB SQL issuer only serves as an independent implementation for
+these test vectors and will not get an OSS product profile (the production
+OSS issuer is a separate project, plan 7.3), so this calls its internal
 _sign_claims, which signs without validate_claims.
 """
 import importlib.util
