@@ -620,6 +620,155 @@ func TestManagerLedgerSurvivesTermReset(t *testing.T) {
 	}
 }
 
+func TestManagerAcksOnlyDurableState(t *testing.T) {
+	c := newFakeCluster(t, "a", "b", "c")
+	c.startAll()
+	c.elect("a")
+	a := c.m("a")
+	if _, err := a.Import(certRaw(t, 1, nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	failing := map[string]bool{}
+	setFailing := func(id string, fail bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		failing[filepath.Join(c.dirs[id], StateDirName, StateFileName)] = fail
+	}
+	saved := writeState
+	writeState = func(path string, s *stateFile) error {
+		mu.Lock()
+		fail := failing[path]
+		mu.Unlock()
+		if fail {
+			return errors.New("injected write failure")
+		}
+		return saved(path, s)
+	}
+	defer func() { writeState = saved }()
+	has := func(ids []string, id string) bool {
+		for _, x := range ids {
+			if x == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	// A follower whose disk fails is not counted, also when the same
+	// certificate is pushed again and its memory already holds it.
+	setFailing("b", true)
+	cert2 := certRaw(t, 2, nil)
+	for i := 0; i < 2; i++ {
+		out, err := a.Import(cert2)
+		if err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+		if has(out.VotersOK, "b") || !has(out.PeersFailed, "b") {
+			t.Fatalf("attempt %d: b counted without a durable write: %+v", i, out)
+		}
+	}
+	setFailing("b", false)
+	if out, err := a.Import(cert2); err != nil || !has(out.VotersOK, "b") {
+		t.Fatalf("after b recovers: %+v, %v", out, err)
+	}
+	c.start("b", nil)
+	if seq := newestSeq(c.m("b")); seq != 2 {
+		t.Fatalf("b restarted with sequence %d", seq)
+	}
+
+	// A leader whose disk fails refuses the import, also on a retry.
+	setFailing("a", true)
+	cert3 := certRaw(t, 3, nil)
+	for i := 0; i < 2; i++ {
+		if _, err := a.Import(cert3); err == nil {
+			t.Fatalf("attempt %d: import succeeded without a durable write", i)
+		}
+	}
+	setFailing("a", false)
+	if _, err := a.Import(cert3); err != nil {
+		t.Fatal(err)
+	}
+	c.start("a", nil)
+	if seq := newestSeq(c.m("a")); seq != 3 {
+		t.Fatalf("a restarted with sequence %d", seq)
+	}
+}
+
+func TestManagerPrevConverges(t *testing.T) {
+	c := newFakeCluster(t, "a", "b", "c")
+	c.startAll()
+	term := c.elect("a")
+	a := c.m("a")
+	now := c.now.Load()
+	cert := func(seq, notBefore, expiresAt int64) []byte {
+		return certRaw(t, seq, func(m map[string]interface{}) {
+			m["not_before"], m["expires_at"], m["issued_at"] = notBefore, expiresAt, min(notBefore, now)
+		})
+	}
+	c2 := cert(2, t2026, now+100) // expires soon
+	c3 := cert(3, t2026, t2027)
+	c4 := cert(4, now+1000, t2027) // starts later
+	if _, err := a.Import(c2); err != nil {
+		t.Fatal(err)
+	}
+
+	// b misses 3 and 4, then starts with -license.file 4 on top of 2:
+	// it holds (4, prev 2) while a and c hold (4, prev 3).
+	c.setDown(true, "b")
+	for _, raw := range [][]byte{c3, c4} {
+		if _, err := a.Import(raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file := filepath.Join(t.TempDir(), "cert.jws")
+	if err := os.WriteFile(file, c4, 0600); err != nil {
+		t.Fatal(err)
+	}
+	c.start("b", func(o *ManagerOption) { o.LicenseFile = file })
+	prevSeq := func(id string) int64 {
+		m := c.m(id)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.certs.Prev == nil {
+			return 0
+		}
+		return m.certs.Prev.Claims.Sequence
+	}
+	if prevSeq("b") != 2 {
+		t.Fatalf("setup: b prev %d", prevSeq("b"))
+	}
+	c.setDown(false, "b")
+
+	// The leader's push brings b the better Prev, and b counts only then.
+	c.now.Add(int64(retryInterval / time.Second))
+	a.pushPending(term)
+	waitFor(t, "b confirms the leader's Prev", func() bool {
+		a.mu.Lock()
+		acked := a.acked["b"] == a.rev
+		a.mu.Unlock()
+		return acked && prevSeq("b") == 3
+	})
+	c.now.Add(200) // 2 has expired, 4 has not started
+	if s := c.m("b").Status(); s.Status != ReasonValid {
+		t.Fatalf("b status %s", s.Status)
+	}
+
+	// A leader holding the worse Prev takes the better one at reconcile.
+	worse, err := ParseCertificate(c2, c.trust)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	a.certs.Prev = worse
+	a.mu.Unlock()
+	c.elect("a")
+	if prevSeq("a") != 3 || a.Status().Status != ReasonValid {
+		t.Fatalf("a prev %d, status %s after reconcile", prevSeq("a"), a.Status().Status)
+	}
+}
+
 func TestManagerAdmissionAndRelease(t *testing.T) {
 	c := newFakeCluster(t, "a")
 	a := c.start("a", nil)

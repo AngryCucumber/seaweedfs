@@ -154,6 +154,10 @@ type Manager struct {
 	clock     ClockState
 	ledger    *Ledger
 	ledgerVer LedgerVersion
+	// diskStale is set while the last state.json write failed: memory is
+	// ahead of the disk, and nothing may be acknowledged until a write
+	// succeeds (see ensureDurable).
+	diskStale bool
 	// ledgerEpoch is the term part of the ledger versions this master
 	// writes as leader; epochFor is the raft term+1 it was chosen for, 0 for
 	// none (see ledgerEpochFor).
@@ -310,7 +314,28 @@ func (m *Manager) persist() error {
 	if m.stateFile == "" {
 		return nil
 	}
-	return writeStateFile(m.stateFile, s)
+	err := writeState(m.stateFile, s)
+	m.mu.Lock()
+	m.diskStale = err != nil
+	m.mu.Unlock()
+	return err
+}
+
+// writeState writes state.json; tests replace it to inject failures.
+var writeState = writeStateFile
+
+// ensureDurable rewrites state.json if the last write failed. A master
+// confirms state to the leader, or counts itself as leader, only after it
+// succeeds: otherwise a retry of an unchanged state would be confirmed
+// while the disk still holds the old one.
+func (m *Manager) ensureDurable() error {
+	m.mu.Lock()
+	stale := m.diskStale
+	m.mu.Unlock()
+	if !stale {
+		return nil
+	}
+	return m.persist()
 }
 
 func (m *Manager) persistOrLog() {
@@ -662,6 +687,8 @@ func (m *Manager) merge(best *candidate, peer string, s State) {
 	case err != nil && codeOf(err) == CodeSequenceConflict:
 		glog.Errorf("license: reconcile: %s: %v", peer, err)
 		return
+	case replace && certs.Newest.SameBytes(best.certs.Newest):
+		best.certs = certs // a better Prev only
 	case replace:
 		best.clusterID, best.certs, best.key = s.ClusterID, certs, s.InternalReadKey
 	case best.certs.Newest == nil && best.clusterID == "" && s.ClusterID != "":
@@ -736,7 +763,8 @@ func (m *Manager) pushOne(ctx context.Context, from LeaderInfo, peer string, st 
 }
 
 func holds(got, want State) bool {
-	return got.ClusterID == want.ClusterID && got.Newest == want.Newest && bytes.Equal(got.InternalReadKey, want.InternalReadKey)
+	return got.ClusterID == want.ClusterID && got.Newest == want.Newest && got.Prev == want.Prev &&
+		bytes.Equal(got.InternalReadKey, want.InternalReadKey)
 }
 
 // commit pushes to every member and follows configuration changes while it
@@ -744,8 +772,13 @@ func holds(got, want State) bool {
 // configuration that hold the data and whether they are a majority.
 func (m *Manager) commit(ctx context.Context, term, rev uint64, st *State, led *LedgerSnapshot) (votersOK, failed []string, ok bool) {
 	attempted := map[string]bool{m.self: true}
-	okSet := map[string]bool{m.self: true}
+	okSet := map[string]bool{}
 	failedSet := map[string]string{}
+	if err := m.ensureDurable(); err != nil {
+		failedSet[m.self] = "write state: " + err.Error()
+	} else {
+		okSet[m.self] = true
+	}
 	votersOK, failed = []string{}, []string{}
 	var mem Membership
 	for round := 0; round < commitRounds; round++ {
@@ -812,11 +845,15 @@ func (m *Manager) adoptAhead(states []State) {
 		}
 		m.mu.Lock()
 		if replace, err := m.certs.Compare(certs); err == nil && replace && (m.certs.Newest == nil || m.clusterID == s.ClusterID) {
-			glog.Warningf("license: a peer holds license sequence %d; adopted it", certs.Newest.Claims.Sequence)
-			m.clusterID, m.certs = s.ClusterID, certs
-			if len(s.InternalReadKey) == InternalKeySize {
-				m.key = append([]byte(nil), s.InternalReadKey...)
+			if certs.Newest.SameBytes(m.certs.Newest) {
+				glog.Warningf("license: a peer holds previous certificate sequence %d under sequence %d; adopted it", certs.Prev.Claims.Sequence, certs.Newest.Claims.Sequence)
+			} else {
+				glog.Warningf("license: a peer holds license sequence %d; adopted it", certs.Newest.Claims.Sequence)
+				if len(s.InternalReadKey) == InternalKeySize {
+					m.key = append([]byte(nil), s.InternalReadKey...)
+				}
 			}
+			m.clusterID, m.certs = s.ClusterID, certs
 			m.bumpLocked()
 			changed = true
 		}
@@ -967,6 +1004,8 @@ func (m *Manager) Import(raw []byte) (*ImportOutcome, error) {
 			return nil, err
 		}
 		glog.V(0).Infof("license: imported %s sequence %d", c.Claims.LicenseID, c.Claims.Sequence)
+	} else if err := m.ensureDurable(); err != nil {
+		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), lockedOpTimeout)
@@ -1110,6 +1149,8 @@ func (m *Manager) ApplySync(from LeaderInfo, in State) (State, error) {
 		if err := m.persist(); err != nil {
 			return State{}, err
 		}
+	} else if err := m.ensureDurable(); err != nil {
+		return State{}, err
 	}
 	return st, nil
 }
@@ -1133,7 +1174,7 @@ func (m *Manager) ApplyLedgerSync(from LeaderInfo, in LedgerSnapshot) error {
 			glog.Errorf("license: ledger %d/%d from %s differs from the local copy", in.Term, in.Revision, from.Address)
 			return fmt.Errorf("license: ledger %d/%d differs from the local copy", in.Term, in.Revision)
 		}
-		return nil
+		return m.ensureDurable()
 	default:
 		cur := m.ledgerVer
 		m.mu.Unlock()

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net/http"
+	"path"
 	"strings"
 
 	"google.golang.org/grpc/codes"
@@ -31,8 +32,11 @@ var licenseKvOffsetPrefixes = [][]byte{
 
 // licenseContentExempt reports whether the inline content of dir/name is
 // configuration that S3, IAM, filers, mount and MQ read over gRPC; it is
-// never hidden (contract 5.3).
+// never hidden (contract 5.3). Lookups resolve "." and ".." in the request
+// directory (util.JoinPath), so the decision uses the resolved directory:
+// "/etc/../data" is "/data".
 func licenseContentExempt(dir, name string) bool {
+	dir = path.Clean(dir)
 	if dir == "/etc" || strings.HasPrefix(dir, filer.DirectoryEtcRoot) {
 		return true
 	}

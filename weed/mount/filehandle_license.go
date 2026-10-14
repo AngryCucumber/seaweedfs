@@ -116,7 +116,8 @@ func (fh *FileHandle) resolveChunksAgain() error {
 }
 
 // refetchHiddenEntry looks the entry up again. Once the filer no longer
-// hides its content, the handle and the meta cache take the new entry.
+// hides its content, the handle takes it (takeRefetchedEntry), and the
+// meta cache takes the new entry unless the handle keeps local changes.
 func (fh *FileHandle) refetchHiddenEntry() error {
 	fullPath := fh.FullPath()
 	fresh, err := filer_pb.GetEntry(fh.wfs, fullPath)
@@ -129,20 +130,41 @@ func (fh *FileHandle) refetchHiddenEntry() error {
 	if fresh.ContentHidden {
 		return filer_pb.ErrContentHidden
 	}
-	group, err := filer.NewChunkGroup(fh.wfs.LookupFn(), fh.wfs.chunkCache, fresh.Chunks)
+	chunks := fresh.Chunks
+	if fh.dirtyMetadata {
+		chunks = fh.entry.GetChunks()
+	}
+	group, err := filer.NewChunkGroup(fh.wfs.LookupFn(), fh.wfs.chunkCache, chunks)
 	if err != nil {
 		return err
 	}
-	fresh.Attributes.FileSize = filer.FileSize(fresh)
-
-	fh.entryLock.Lock()
-	fh.entryChunkGroup = group
-	fh.entry.SetEntry(fresh)
-	fh.entryLock.Unlock()
-
+	if !fh.takeRefetchedEntry(fresh, group) {
+		return nil
+	}
 	dir, _ := fullPath.DirAndName()
 	if err := fh.wfs.metaCache.UpdateEntry(context.Background(), filer.FromPbEntry(dir, fresh)); err != nil {
 		glog.V(1).Infof("update meta cache %s: %v", fullPath, err)
 	}
 	return nil
+}
+
+// takeRefetchedEntry installs an entry whose content the filer no longer
+// hides. chmod, chown, utimes or xattr changes made on this handle while
+// the content was hidden are not flushed yet; they stay, and only the
+// content is taken from the filer. It reports whether the filer entry
+// replaced the local one.
+func (fh *FileHandle) takeRefetchedEntry(fresh *filer_pb.Entry, group *filer.ChunkGroup) bool {
+	fh.entryLock.Lock()
+	defer fh.entryLock.Unlock()
+	fh.entryChunkGroup = group
+	if fh.dirtyMetadata {
+		fh.entry.UpdateEntry(func(e *filer_pb.Entry) {
+			e.Content = fresh.Content
+			e.ContentHidden = false
+		})
+		return false
+	}
+	fresh.Attributes.FileSize = filer.FileSize(fresh)
+	fh.entry.SetEntry(fresh)
+	return true
 }

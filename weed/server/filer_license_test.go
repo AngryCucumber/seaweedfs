@@ -29,6 +29,8 @@ func TestLicenseContentExempt(t *testing.T) {
 		{"/etc/remote", "mount.mapping"},
 		{"/topics/ns/t", "topic.conf"},
 		{"/topics/ns/t/v2025", "group.offset"},
+		{"/etc/", "a"},
+		{"/data/../etc/iam", "identity.json"},
 	}
 	for _, p := range exempt {
 		if !licenseContentExempt(p[0], p[1]) {
@@ -41,6 +43,10 @@ func TestLicenseContentExempt(t *testing.T) {
 		{"/buckets/b", "topic.conf"},
 		{"/topics/ns/t", "data"},
 		{"/buckets/etc", "identity.json"},
+		{"/etc/../data", "a"},
+		{"/etc/../../data", "a"},
+		{"/topics/../data", "topic.conf"},
+		{"etc/iam", "identity.json"},
 	}
 	for _, p := range hidden {
 		if licenseContentExempt(p[0], p[1]) {
@@ -76,6 +82,13 @@ func TestLicenseContentFilter(t *testing.T) {
 	denied.newLicenseContentFilter(context.Background()).apply("/etc/iam", e)
 	if string(e.Content) != "{}" || e.ContentHidden {
 		t.Fatalf("exempt entry hidden: %+v", e)
+	}
+
+	// A request for /etc/../data/a reads /data/a: not exempt.
+	e = inlineEntry("a", "secret")
+	denied.newLicenseContentFilter(context.Background()).apply("/etc/../data", e)
+	if e.Content != nil || !e.ContentHidden {
+		t.Fatalf("dot-dot path bypassed hiding: %+v", e)
 	}
 
 	internal := metadata.NewIncomingContext(context.Background(), metadata.Pairs(license.InternalReadMetadataKey, licensetest.Token()))

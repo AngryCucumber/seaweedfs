@@ -244,6 +244,31 @@ func TestNodeClockLocalFloor(t *testing.T) {
 	}
 }
 
+func TestNodeAdoptsBetterPrev(t *testing.T) {
+	now := int64(t2026 + 1000)
+	n, ft := newTestNode(t, "", now)
+	c2 := certWith(t, 2, t2026, now+100, FeatureDataRead)
+	c3 := certWith(t, 3, t2026, t2027, FeatureDataRead)
+	c4 := certWith(t, 4, now+5000, t2027, FeatureDataRead)
+	apply := func(prev *Certificate) {
+		n.Apply(&Update{ClusterID: testDeployment, MasterNowUnixMs: (now + 1) * 1000, NewestCertificate: c4.Raw(), PrevCertificate: prev.Raw()})
+	}
+	apply(c2)
+	apply(c3)
+	if !n.certs.Prev.SameBytes(c3) {
+		t.Fatalf("prev %d, want the better 3", n.certs.Prev.Claims.Sequence)
+	}
+	apply(c2)
+	if !n.certs.Prev.SameBytes(c3) {
+		t.Fatal("a worse prev replaced the better one")
+	}
+	ft.add(200 * time.Second) // 2 has expired, 4 has not started
+	n.Apply(&Update{ClusterID: testDeployment, MasterNowUnixMs: (now + 201) * 1000})
+	if !allow(n) {
+		t.Fatalf("denied with %s", denyReason(n))
+	}
+}
+
 func TestNodeLogDeniedRateLimit(t *testing.T) {
 	n := NewNode(testTrust(t), "")
 	n.guard.clock.Store(1000)

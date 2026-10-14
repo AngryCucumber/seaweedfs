@@ -317,7 +317,7 @@ P3 修订：
 
 **隐藏条件**（全部成立才隐藏）：`!AllowRead()`；请求没有有效内部令牌（gRPC 元数据 `x-massdb-internal-read`，流式 RPC 在建流时判定一次）；`len(Content) > 0`；条目不在系统豁免内。隐藏动作只作用在发往客户端的那份 proto 上：`Content = nil`，`ContentHidden = true`，若 `Attributes.FileSize == 0` 则补为原正文长度。不得在 `ToExistingProtoEntry` 层隐藏（它同时用于事件日志与存储编码）。
 
-**系统豁免**（这些路径的正文是配置，S3/IAM/filer/mount/MQ 依赖经 gRPC 读取，隐藏会让 S3 以无身份、鉴权关闭的状态启动等）：
+**系统豁免**（这些路径的正文是配置，S3/IAM/filer/mount/MQ 依赖经 gRPC 读取，隐藏会让 S3 以无身份、鉴权关闭的状态启动等；按规范化后的目录判断，2026-10-14 修订：查询会解析请求目录中的 `.` 与 `..`，`/etc/../data` 实际读取 `/data`，不得按 `/etc` 豁免）：
 
 | 豁免 | 读取方 |
 | --- | --- |

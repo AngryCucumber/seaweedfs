@@ -120,6 +120,8 @@ v4 处理：只在只读 HTTP 接口（M1）隐藏，gRPC 面列为边界。部�
 
 独立 `weed mount` 首次打开含 manifest 的文件时，要经 volume GET 解析 manifest，它没有内部令牌，证书无效时被拒。现有代码在 [filehandle.go:78](../weed/mount/filehandle.go:78) 对解析失败只打 `Warningf`，分块表为空；随后 [filechunk_group.go:59](../weed/filer/filechunk_group.go:59) 把缺失区间当作稀疏文件补零并返回成功，应用会拿到伪造的全零正文而不是错误。
 
+续期后对隐藏正文条目的重取（P3 实现，`refetchHiddenEntry`）**保留句柄上尚未 flush 的本地修改（2026-10-14 修订，8.6）**：证书无效期间在打开的句柄上做的 `chmod`、`chown`、`utimes`、`setfattr` 只记在句柄里，等 flush 才写回 filer；重取时若句柄有未提交修改，只取 filer 的正文、清除隐藏标志，其余字段保持本地，meta cache 等 flush 后更新；没有未提交修改时才整体替换。
+
 处理：`FileHandle` 记录 `resolveManifestErr` 与 `lastResolveAttempt`；读取入口（`filehandle_read.go`）在该错误非空时：若距上次尝试 ≥ 5 秒，用同一 entry 重新调用 `NewChunkGroup`，成功则清错并正常读，失败则更新时间戳并返回 `EIO`；5 秒内直接 `EIO`，不发网络请求。只在失败状态重试，正常读取不新增任何调用。这样续期或网络恢复后，原句柄与按 inode 复用的句柄（[filehandle_map.go:44](../weed/mount/filehandle_map.go:44) 只在 entry 指针变化时重解析）都会在目标 volume 新证书生效后、下一次满足重试间隔的读取时触发重解析并恢复，不需要关闭全部旧句柄；端到端时间见 S1b。写入不受该错误影响（写路径不依赖已解析的分块表）。v9 起同一入口还处理 `ContentHidden` 条目（1.5）：返回 `EIO`，失败态下 ≥ 5 秒用 `LookupDirectoryEntry` 重取，未隐藏则替换句柄条目并写回 meta cache；两类重试共用 single-flight 与节流。mount 改动合计约 40 行。同样的补零逻辑在 filer 进程内不触发：filer 的 manifest 解析带内部令牌（1.4）。S1b 验收。
 
 ---
@@ -160,6 +162,7 @@ v3 的 `(active, pending)` 加“到点激活”转换被审核证明无法定�
 - `LicenseState{cluster_id, newest, prev, internal_read_key}`。`newest` 是接受过的最高 `sequence` 证书；`prev` 只在 `newest.not_before` 尚未到来时保留，是导入 `newest` 那一刻正在生效的证书，否则为空。
 - **生效证书是时间的纯函数：** `effective(now) = newest` 若 `now >= newest.not_before`，否则 `prev`。master 与节点各自按本地原子时钟推导，不需要任何状态转换、不需要到点下发、不需要“清除 pending”消息。
 - **新旧顺序只看 `newest.sequence`：** 来者更高则整体替换（`newest` 与 `prev` 一起）；相等必须字节相同，否则拒绝（同序号不同内容）；更低拒绝。审核中的反例（A/C 多数派持 `(newest=12, prev=10)`，B 本地把 11 当作生效证书）在 v4 里 B 的状态是 `(newest=11, prev=10)`，序号 11 < 12，被 12 整体替换，B 的生效证书随即按时间推导为 10 或 12，与 A/C 一致。
+- **同一 `newest` 下 `prev` 的收敛（2026-10-14 修订，8.6）：** 落后的 master 以 `-license.file` 加载同一张未来证书时，`prev` 取的是它自己当时的生效证书，可能与其它 master 不同；只比较 `newest` 会让各方都认为已同步，而持旧 `prev` 的一方在过渡期误判 `EXPIRED`。规则：`newest` 字节相同时，`prev` 取序号更高的一张（有优于无，同序号按字节序），master 之间同步、对账合并、master 下发到节点都按此替换；确认同步时 `prev` 也须相同，持更好 `prev` 的 follower 不计入确认，leader 采纳后重推，最终收敛到同一张。
 - 有效额度：`newest` 未生效期间取 `min(prev.limit, newest.limit)`。
 - 导入校验：`new.sequence > newest.sequence`；`new.not_before <= now` 则状态为 `(new, nil)`，否则 `(new, effective(now))`。
 - `watermark/repair_seq` 独立于证书部分，同步规则见 4.5。
@@ -171,7 +174,7 @@ v3 的 `(active, pending)` 加“到点激活”转换被审核证明无法定�
 1. **只有 leader 接受导入。** 导入 handler 自检 `ms.Topo.IsLeader()`，否则 503；不依赖 `proxyToLeader`（找不到 leader 时它会直接调本地 handler，[master_server.go:222](../weed/server/master_server.go:222)）。
 2. **voter 多数派。** voter 集合取自当前 raft 配置：hashicorp 用 `GetConfiguration().Configuration().Servers` 中 `Suffrage == Voter` 的成员（现有 [RaftServer.Peers()](../weed/server/raft_server.go:173) 不区分，manager 内另取；`RaftAddServer` 支持 nonvoter，[master_grpc_server_raft.go:51](../weed/server/master_grpc_server_raft.go:51)）；goraft 全部成员是 voter。多数派 = `floor(voters/2)+1`，leader 自身计入。nonvoter 也推送，不计入多数派。
 3. **`SyncLicense` 携带 `leader_address` 与 `leader_term`。** follower 只接受 `leader_address == Topo.Leader()` **且 `leader_term == 本地 raft 当前任期`**（hashicorp `CurrentTerm()`，goraft `Term()`）的请求；不用“最高已收到的 Sync 任期”，避免同一地址 term1 当选、落选、term3 再当选时 term1 的迟到请求被接受。
-4. leader 先写本地 `state.json`，再同步推送；voter 成功数（含自身）达到多数派返回 200；否则 503 `PARTIAL_COMMIT` 列出失败 peer，leader 本地保留已落盘状态。**相同字节的证书重试导入视为幂等**，只重新推送；同 `sequence` 不同内容 409。
+4. leader 先写本地 `state.json`，再同步推送；voter 成功数（含自身）达到多数派返回 200；否则 503 `PARTIAL_COMMIT` 列出失败 peer，leader 本地保留已落盘状态。**相同字节的证书重试导入视为幂等**，只重新推送；同 `sequence` 不同内容 409。**只有已成功落盘的成员才计入确认（2026-10-14 修订，8.6）：** 写 `state.json` 失败时内存已是新状态，重试相同证书会被判为“未变化”而跳过写盘；因此每个 master 记录上次写盘是否失败，失败后的导入、`SyncLicense`、`SyncLedger` 应答与 leader 自身计票前都先重写成功，否则不确认（leader 自身计入 `peers_failed`）。
 5. **选主对账并写回：** 成为 leader 后向所有 peer 调 `GetLicense`，需收到 voter 多数派（含自身）的响应；按 3.2 规则选出最高状态；**然后把选中的状态同步推送到 voter 多数派并得到确认，才退出 `RECONCILING`**。对账中 `GET /license` 为 `RECONCILING`，导入与成员变更返回 503；**不向节点下发任何拒读原因**，节点保留现有授权快照并按本地时钟评估，授权层的读写行为不变（可用性仍受 master 不可用期间既有行为影响，例如 filer 拿不到新的 volume 位置）；未达多数派每 5 秒重试，不在请求路径。审核中的反例（A 的 `PARTIAL_COMMIT` 少数派状态 11 被新 leader B 选中并下发，A/B 随后不可用，C/D/E 只能恢复到 10）在 v4 里 B 必须先把 11 写到 C/D/E 中至少两台才退出对账，之后任何多数派都能看到 11。
 6. follower 启动或重连 leader 时经 KeepConnected 首帧和按流对账拿到当前状态（4.2），按 3.2 替换。**P2 实现：** 改为 leader 每 5 秒向尚未确认当前授权修订的成员重推 `SyncLicense`（带任期校验），follower master 不从 KeepConnected 应用授权状态；KeepConnected 的 `LicenseUpdate` 只给 volume/filer（P3）。
 7. **加入 voter 的两阶段流程（hashicorp）。** `SyncLicense` 要求接收方本地 raft 已认识当前 leader 且任期相同（第 3 条），全新节点在进入配置前拿不到这些状态，所以不能“先同步再加入”。顺序改为：(a) 三个加入入口先 `CheckMasterJoin()` 预占额度，然后以 **nonvoter** 加入（`AddNonvoter`）；(b) 等它的 raft 追平（`LastIndex` 接近 leader）并通过 KeepConnected 建流；(c) leader 在 manager 锁内向它 `SyncLicense` + `SyncLedger` 并等待确认，锁内同时排斥导入，因此“预同步完成到提升之间”不会漏掉新证书；(d) 确认后 `AddVoter` 提升。任一步失败保持 nonvoter 并告警，不计入 voter 多数派。`OnPeerUpdate` 与 `updatePeers` 的 `AddVoter` 改为走同一流程。
@@ -666,6 +669,19 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | 到期 | S3 GetObject 403 `AccessDenied`（`EXPIRED`），filer GET 403，webdav 下载中断（200 后 0 字节，curl 退出码 18）；S3 与 filer 写入正常 |
 | 续期 | 导入序号 2，4 秒内 S3 与 webdav 恢复 |
 | 进程重启 | 从 `state.json` 恢复 `VALID`（序号 2），约 20 秒（主要是 goraft 选主）后 S3、filer、webdav 可读，数据一致 |
+
+### 8.6 外部审核修复（2026-10-14）
+
+审核基于 `2ec303f03`，提出 4 项，均先复现后修复：
+
+| # | 问题 | 修复 | 验证 |
+| --- | --- | --- | --- |
+| 1（P1） | filer gRPC 的系统目录豁免按原始 `req.Directory` 判断，查询却经 `util.JoinPath` 解析了 `..`：`LookupDirectoryEntry` 以 `/etc/../data` 读 `/data/a` 时被当作 `/etc` 放行，证书无效时返回完整正文 | `licenseContentExempt` 先 `path.Clean` 目录，所有 gRPC 出口一并生效（契约 5.3） | 单测 `TestLicenseContentExempt`、`TestLicenseContentFilter` 增加 `..` 用例（去掉修复即失败）；真实进程中证书到期后，修复前 `/etc/../data`、`/etc/../../data` 返回 `secret`，修复后均隐藏 |
+| 2（P1） | 写 `state.json` 失败后内存已是新状态，重试相同证书或同步被判为“未变化”而跳过写盘并确认；三个 voter 全部确认序号 2，两个 follower 重启后恢复为序号 1 | 记录上次写盘是否失败；导入、`SyncLicense`、`SyncLedger` 应答与 leader 自身计票前先重写成功，否则不确认（3.3 第 4 条） | 单测 `TestManagerAcksOnlyDurableState`：注入 follower 与 leader 写盘失败，重试期间不计入确认、导入失败，恢复后确认且重启后为新序号；在原逻辑上（只加注入钩子）第二次导入即把未落盘的 follower 计入确认 |
+| 3（P1） | `newest` 相同、`prev` 不同的状态不收敛：比较与确认只看 `newest`，落后 master 以 `-license.file` 加载同一张未来证书后持有过期的 `prev`，过渡期为 `EXPIRED` 而 leader 为 `VALID`，切主后仍不一致 | `prev` 取序号更高的一张（3.2），`Certs.Compare` 据此替换，确认时比较 `prev`，对账合并与采纳 follower 状态同样处理，节点按同一规则采纳 | 单测 `TestManagerPrevConverges`（落后 follower 收到推送后采用更好的 `prev` 并确认，过渡期 `VALID`；持较差 `prev` 的 leader 对账后采用更好的一张；去掉修复即超时失败）、`TestNodeAdoptsBetterPrev` |
+| 4（P2） | 续期后 mount 重取隐藏正文条目时整体替换句柄里的条目，覆盖了证书无效期间在打开的句柄上做、尚未 flush 的 `chmod`/`chown` | 句柄有未提交修改时只取 filer 的正文并清除隐藏标志，其余字段保留（1.6） | 单测 `TestTakeRefetchedEntry`；Linux 虚拟机真实 FUSE：到期后挂载、打开内联文件（读 `EIO`）、`fchmod 0600` 与 `fchown 2000`、续期后同一句柄读到 `secret`；修复前关闭时句柄回到 `0660/uid 0` 并写回 filer，修复后 filer 存为 `0600/uid 2000/gid 2000` |
+
+第 2、3 项只在假 raft 集群单测中复现与验证（真实进程需要按 master 注入磁盘写失败、构造落后 master）。修复后 license（含 `-race`）、server、filer、mount、wdclient、shell、command 测试与 CI 标签构建通过。审核同时指出 master 新地址准入扫描全账本、快照复制与排序持锁，集中重连、拒绝态大目录与元数据回放仍是 S13 的重点。
 
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 

@@ -48,3 +48,46 @@ func TestFileHandleReadFailure(t *testing.T) {
 		t.Fatal("resolved entry still fails")
 	}
 }
+
+func TestTakeRefetchedEntry(t *testing.T) {
+	hidden := func() *filer_pb.Entry {
+		return &filer_pb.Entry{
+			Name:          "a",
+			ContentHidden: true,
+			Attributes:    &filer_pb.FuseAttributes{FileMode: 0644, Uid: 1000, Gid: 1000, FileSize: 5},
+		}
+	}
+	fresh := func() *filer_pb.Entry {
+		return &filer_pb.Entry{
+			Name:       "a",
+			Content:    []byte("hello"),
+			Attributes: &filer_pb.FuseAttributes{FileMode: 0644, Uid: 1000, Gid: 1000, FileSize: 5},
+		}
+	}
+
+	// chmod, chown and setfattr on the handle while the content was hidden,
+	// not flushed yet: they survive, only the content comes from the filer.
+	local := hidden()
+	local.Attributes.FileMode, local.Attributes.Uid = 0600, 2000
+	local.Extended = map[string][]byte{"user.k": []byte("v")}
+	fh := &FileHandle{entry: &LockedEntry{Entry: local}, dirtyMetadata: true}
+	if fh.takeRefetchedEntry(fresh(), nil) {
+		t.Fatal("the filer entry replaced unflushed local changes")
+	}
+	e := fh.entry.GetEntry()
+	if e.Attributes.FileMode != 0600 || e.Attributes.Uid != 2000 || string(e.Extended["user.k"]) != "v" {
+		t.Fatalf("local changes lost: %+v", e)
+	}
+	if string(e.Content) != "hello" || e.ContentHidden {
+		t.Fatalf("content not taken: %+v", e)
+	}
+
+	// Without local changes the filer entry is taken as a whole.
+	fh = &FileHandle{entry: &LockedEntry{Entry: hidden()}}
+	if !fh.takeRefetchedEntry(fresh(), nil) {
+		t.Fatal("clean handle kept the hidden entry")
+	}
+	if e := fh.entry.GetEntry(); string(e.Content) != "hello" || e.ContentHidden {
+		t.Fatalf("entry %+v", e)
+	}
+}

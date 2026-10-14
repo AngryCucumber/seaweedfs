@@ -115,7 +115,8 @@ func (s Certs) CheckImport(c *Certificate, clusterID string, now int64, used Usa
 // Compare decides whether incoming certificates replace the local ones
 // when syncing between masters or from master to a node: a higher Newest
 // sequence replaces both certificates together; an equal sequence must be
-// byte-identical; a lower one is refused.
+// byte-identical, and then incoming replaces the pair only to bring a
+// better Prev (prevBetter); a lower one is refused.
 func (s Certs) Compare(incoming Certs) (replace bool, err error) {
 	switch {
 	case incoming.Newest == nil:
@@ -130,7 +131,26 @@ func (s Certs) Compare(incoming Certs) (replace bool, err error) {
 	case !incoming.Newest.SameBytes(s.Newest):
 		return false, errorf(CodeSequenceConflict, "sequence %d differs between local and incoming", s.Newest.Claims.Sequence)
 	default:
-		return false, nil
+		return prevBetter(incoming.Prev, s.Prev), nil
+	}
+}
+
+// prevBetter reports whether a should replace b as Prev under the same
+// Newest. Masters that applied the same future certificate from different
+// states (e.g. a lagging master started with -license.file) hold different
+// Prev certificates; all converge on the highest sequence, any over none,
+// and equal sequences with different bytes are ordered by their bytes, so
+// any two states agree on which one wins.
+func prevBetter(a, b *Certificate) bool {
+	switch {
+	case a == nil || a.SameBytes(b):
+		return false
+	case b == nil:
+		return true
+	case a.Claims.Sequence != b.Claims.Sequence:
+		return a.Claims.Sequence > b.Claims.Sequence
+	default:
+		return a.raw > b.raw
 	}
 }
 
