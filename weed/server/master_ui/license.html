@@ -48,6 +48,12 @@
                 <td>{{ (index . "filer").Online }} online, {{ (index . "filer").Grace }} in grace / {{ (index . "filer").Limit }}</td>
             </tr>
             {{ end }}
+            {{ if .GraceNodes }}
+            <tr>
+                <th>In grace</th>
+                <td>{{ range .GraceNodes }}{{ .Type }} <code>{{ .Address }}</code> until {{ unixTime .ReleaseAt }}<br>{{ end }}</td>
+            </tr>
+            {{ end }}
             <tr>
                 <th>Repair sequence</th>
                 <td>{{ .RepairSeq }}</td>

@@ -344,7 +344,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | `GET /license/deployment` | 申请 DTO | |
 | `POST /license/validate` | `{"certificate":"<jws>"}` 或 multipart `file` | 每进程 10 次/分钟令牌桶 |
 | `POST /license/import` | 落盘、同步、下发；返回 `{"accepted":true,"effective_now":bool,"state_version":n,"voters_ok":[...],"peers_failed":[...]}`；非 leader 或对账中 503 | 导入串行；相同字节幂等 |
-| `DELETE /license/nodes/{addr}` | 删除宽限中的账本条目 | 不踢在线节点 |
+| `DELETE /license/nodes/{addr}` | 删除宽限中的账本条目 | 不踢在线节点；宽限中的地址见 `GET /license` 的 `grace_nodes`（P5 补，8.5） |
 | gRPC `GetLicense/ImportLicense` | `weed shell license.show / license.import -file / license.validate`；`-disableHttp` 的唯一导入入口 | |
 
 安全口径：**导入安全依赖厂商签名与集群绑定，不依赖访问控制。** `guard.white_list` 为空时放行所有请求，`GetActualRemoteHost` 无条件信任 `X-Forwarded-For`（[guard.go:78](../weed/security/guard.go:78)），不能当作鉴权；接口仍套 `guard.WhiteList` 与 `/vol/grow` 一致，但不列为防护。

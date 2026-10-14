@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -641,12 +642,20 @@ func TestManagerAdmissionAndRelease(t *testing.T) {
 	wantCode(t, a.ReleaseNode("f1:8888"), CodeNodeOnline)
 	wantCode(t, a.ReleaseNode("x:1"), CodeNodeNotFound)
 	a.DisconnectNode(NodeFiler, "f1:8888")
-	if s := a.Status(); s.Nodes[string(NodeFiler)] != (NodeCount{Online: 0, Grace: 1, Limit: 1}) {
+	s := a.Status()
+	if s.Nodes[string(NodeFiler)] != (NodeCount{Online: 0, Grace: 1, Limit: 1}) {
 		t.Fatalf("nodes %+v", s.Nodes)
+	}
+	now := c.now.Load()
+	if want := []GraceNode{{Type: NodeFiler, Address: "f1:8888", LastSeen: now, ReleaseAt: now + LedgerGraceSeconds}}; !reflect.DeepEqual(s.GraceNodes, want) {
+		t.Fatalf("grace nodes %+v, want %+v", s.GraceNodes, want)
 	}
 	wantCode(t, a.AdmitNode(NodeFiler, "f2:8888"), CodeNodeLimitExceeded)
 	if err := a.ReleaseNode("f1:8888"); err != nil {
 		t.Fatal(err)
+	}
+	if g := a.Status().GraceNodes; len(g) != 0 {
+		t.Fatalf("released node still listed: %+v", g)
 	}
 	if err := a.AdmitNode(NodeFiler, "f2:8888"); err != nil {
 		t.Fatal(err)

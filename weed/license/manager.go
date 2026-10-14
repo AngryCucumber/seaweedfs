@@ -1443,6 +1443,15 @@ type NodeCount struct {
 	Limit  int64 `json:"limit"`
 }
 
+// GraceNode is a ledger entry in its grace period: it holds a slot until
+// ReleaseAt, or until DELETE /license/nodes/{addr} releases it.
+type GraceNode struct {
+	Type      NodeType `json:"type"`
+	Address   string   `json:"address"`
+	LastSeen  int64    `json:"last_seen"`
+	ReleaseAt int64    `json:"release_at"`
+}
+
 // Status is GET /license.
 type Status struct {
 	Status        Reason               `json:"status"`
@@ -1457,6 +1466,7 @@ type Status struct {
 	Newest        *CertificateSummary  `json:"newest"`
 	Prev          *CertificateSummary  `json:"prev"`
 	Nodes         map[string]NodeCount `json:"nodes"`
+	GraceNodes    []GraceNode          `json:"grace_nodes"`
 	StateVersion  uint64               `json:"state_version"`
 	Watermark     int64                `json:"watermark"`
 	RepairSeq     int64                `json:"repair_seq"`
@@ -1490,6 +1500,7 @@ func (m *Manager) Status() *Status {
 		Newest:        m.certs.Newest.Summary(),
 		Prev:          m.certs.Prev.Summary(),
 		Nodes:         map[string]NodeCount{},
+		GraceNodes:    []GraceNode{},
 		StateVersion:  m.version.Load(),
 		Watermark:     m.clock.Watermark,
 		RepairSeq:     m.clock.RepairSeq,
@@ -1522,6 +1533,7 @@ func (m *Manager) Status() *Status {
 			c.Online++
 		} else {
 			c.Grace++
+			s.GraceNodes = append(s.GraceNodes, GraceNode{Type: e.Type, Address: e.Address, LastSeen: e.LastSeen, ReleaseAt: e.LastSeen + LedgerGraceSeconds})
 		}
 		s.Nodes[string(e.Type)] = c
 	}
