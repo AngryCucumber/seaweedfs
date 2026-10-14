@@ -15,6 +15,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/license"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/topology"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
@@ -22,6 +23,9 @@ import (
 // licenseJoinWait bounds how long a background master join waits for the
 // leader to finish its license reconcile.
 const licenseJoinWait = 2 * time.Minute
+
+// licenseMetricsInterval is how often the license gauges are refreshed.
+const licenseMetricsInterval = 5 * time.Second
 
 var errRaftNotReady = errors.New("raft server is not ready")
 
@@ -313,4 +317,35 @@ func newLicenseManager(ms *MasterServer) *license.Manager {
 		glog.Fatalf("license: %v", err)
 	}
 	return m
+}
+
+// licenseMetricReasons are the statuses a master reports.
+var licenseMetricReasons = []license.Reason{
+	license.ReasonValid, license.ReasonNoLicense, license.ReasonNotYetValid, license.ReasonExpired,
+	license.ReasonFeatureMissing, license.ReasonClockSuspect, license.ReasonReconciling,
+}
+
+// licenseMetricsLoop exports the license status of this master.
+func (ms *MasterServer) licenseMetricsLoop() {
+	for {
+		ms.updateLicenseMetrics()
+		time.Sleep(licenseMetricsInterval)
+	}
+}
+
+func (ms *MasterServer) updateLicenseMetrics() {
+	s := ms.License.Status()
+	for _, r := range licenseMetricReasons {
+		v := 0.0
+		if r == s.Status {
+			v = 1
+		}
+		stats.LicenseStateGauge.WithLabelValues(string(r)).Set(v)
+	}
+	stats.LicenseExpiresAtGauge.Set(float64(s.ExpiresAt))
+	for t, c := range s.Nodes {
+		stats.LicenseNodesOnlineGauge.WithLabelValues(t).Set(float64(c.Online))
+		stats.LicenseNodesGraceGauge.WithLabelValues(t).Set(float64(c.Grace))
+		stats.LicenseNodesLimitGauge.WithLabelValues(t).Set(float64(c.Limit))
+	}
 }

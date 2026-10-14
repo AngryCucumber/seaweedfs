@@ -138,6 +138,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 
 	ms.License = newLicenseManager(ms)
 	go ms.License.Run(nil)
+	go ms.licenseMetricsLoop()
 
 	ms.guard = security.NewGuard(append(ms.option.WhiteList, whiteList...), signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 

@@ -610,6 +610,70 @@ func TestManagerAdmissionAndRelease(t *testing.T) {
 	}
 }
 
+func TestManagerNodeStreams(t *testing.T) {
+	c := newFakeCluster(t, "a", "b", "c")
+	c.startAll()
+	c.elect("a")
+	a := c.m("a")
+	if _, err := a.Import(certRaw(t, 1, withLimits(3, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	entry := func(m *Manager, addr string) LedgerEntry {
+		for _, e := range m.Ledger().Entries {
+			if e.Address == addr {
+				return e
+			}
+		}
+		t.Fatalf("%s is not in the ledger", addr)
+		return LedgerEntry{}
+	}
+
+	// A reconnect whose old stream closes late keeps the node online.
+	for i := 0; i < 2; i++ {
+		if err := a.AdmitNode(NodeVolumeServer, "v1:8080"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.DisconnectNode(NodeVolumeServer, "v1:8080")
+	if e := entry(a, "v1:8080"); !e.Online {
+		t.Fatalf("one of two streams closed: %+v", e)
+	}
+	a.DisconnectNode(NodeVolumeServer, "v1:8080")
+	grace := entry(a, "v1:8080")
+	if grace.Online || grace.LastSeen != c.now.Load() {
+		t.Fatalf("last stream closed: %+v", grace)
+	}
+	// A stray disconnect does not move the grace deadline.
+	c.now.Add(30)
+	a.DisconnectNode(NodeVolumeServer, "v1:8080")
+	if e := entry(a, "v1:8080"); e != grace {
+		t.Fatalf("grace moved: %+v", e)
+	}
+	err := a.AdmitNode(NodeVolumeServer, "v2:8080")
+	if err == nil || err.Error() != "license: NODE_LIMIT_EXCEEDED volume_server 1/1" {
+		t.Fatalf("message %v", err)
+	}
+
+	// A stream that ends after this master lost leadership leaves the
+	// ledger to the new leader.
+	if err := a.AdmitNode(NodeFiler, "f1:8888"); err != nil {
+		t.Fatal(err)
+	}
+	c.setDown(true, "a")
+	c.elect("b")
+	c.setDown(false, "a")
+	a.DisconnectNode(NodeFiler, "f1:8888")
+	if e := entry(a, "f1:8888"); !e.Online {
+		t.Fatalf("a follower changed its ledger copy: %+v", e)
+	}
+	a.mu.Lock()
+	streams := len(a.conns)
+	a.mu.Unlock()
+	if streams != 0 {
+		t.Fatalf("%d streams left", streams)
+	}
+}
+
 func TestManagerImportChecksLedgerAndMasters(t *testing.T) {
 	c := newFakeCluster(t, "a", "b", "c")
 	c.startAll()

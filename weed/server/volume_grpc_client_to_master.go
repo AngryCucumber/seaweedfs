@@ -131,9 +131,14 @@ func (vs *VolumeServer) doHeartbeat(masterAddress pb.ServerAddress, grpcDialOpti
 				os.Exit(1)
 			}
 			if reason := in.GetLicenseRejectReason(); reason != "" {
-				glog.Errorf("license: master %s refused this volume server: %s", vs.currentMaster, reason)
-				vs.license.Reject()
-			} else if in.License != nil {
+				// The master closes the stream next; the heartbeat loop
+				// retries. The response carries no volume options.
+				if vs.license.Reject() {
+					glog.Errorf("license: master %s refused this volume server: %s; reads are denied until it registers", vs.currentMaster, reason)
+				}
+				continue
+			}
+			if in.License != nil {
 				vs.license.Apply(licenseUpdateFromPb(in.License))
 			}
 			volumeOptsChanged := false

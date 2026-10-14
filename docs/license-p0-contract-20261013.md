@@ -155,6 +155,12 @@ P2 修订：请求体除 `{"certificate":"<jws>"}` 与 multipart `file` 外也�
 
 `NODE_REJECTED` 的解除：volume 收到不带 `license_reject_reason` 的 `LicenseUpdate`；filer 的 KeepConnected 建流成功并收到首帧。
 
+P4 修订：
+
+- 准入地址：volume 用心跳里的 `ip:port`（与拓扑 `DataNode.Url()` 相同），filer 用 `KeepConnectedRequest.client_address`；只有 `ClientType == "filer"` 计数。
+- 拒绝帧只填 `license_reject_reason`，volume 收到后置 `NODE_REJECTED` 并跳过该帧的卷参数比较（不填 `VolumeSizeLimit`、`Preallocate`，避免被当作参数变化）。节点只在状态由未拒绝变为拒绝时打一条 error 日志，之后的重试只有既有的 V(0) 连接失败日志；master 的拒绝日志每分钟至多 1 条，附带这一分钟内被合并的次数。
+- 断开计时：master 按地址记录本 leader 上存活的注册流数，最后一条流结束才把账本条目置为离线并开始宽限；已离线条目再次断开不重置 `last_seen`；不再是 leader 的 master 只减计数、不改本地账本副本（以 leader 的 `SyncLedger` 为准）。这样快速重连时旧流晚于新流关闭，不会把在线节点误置为宽限。
+
 ### 2.5 数据面错误码
 
 | 码 | 出现位置 | 含义 |
@@ -189,6 +195,8 @@ P2 修订：请求体除 `{"certificate":"<jws>"}` 与 multipart `file` 外也�
 | raft 配置索引 | hashicorp `GetConfiguration().Index()`；goraft 无，记 0 |
 
 P3 修订：`internal_read_key` 按第 7 节“key 分发”的规则只在 volume 心跳与 filer 的 KeepConnected 流里下发（P2 实现漏发给 volume，P3 修正）。指标在 P3 只实现 `license_denied_reads_total`，prometheus 名为 `SeaweedFS_license_denied_reads_total`（仓库统一前缀），其余随 P4/P5。
+
+P4 修订：其余 5 个指标在 master 上导出，每 5 秒按本 master 的 `GET /license` 视图刷新：`SeaweedFS_license_state{reason}`（当前状态为 1，其余 6 个 master 状态码为 0）、`SeaweedFS_license_expires_at_seconds`（生效证书的 `expires_at`，无证书为 0）、`SeaweedFS_license_nodes_{online,grace,limit}{type}`（`type` ∈ `master/volume_server/filer`；master 的 `online` 是 raft 成员数，`grace` 恒为 0）。volume 与 filer 只导出 `license_denied_reads_total`：`weed server` 同进程共用一个注册表，节点再导出 `license_state` 会与 master 的值冲突。
 
 ---
 

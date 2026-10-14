@@ -197,6 +197,46 @@ var (
 			Help:      "Counter of data reads denied by the license.",
 		}, []string{"server", "path"})
 
+	LicenseStateGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: "license",
+			Name:      "state",
+			Help:      "License status seen by this master: 1 for the current status, 0 for the others.",
+		}, []string{"reason"})
+
+	LicenseExpiresAtGauge = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: "license",
+			Name:      "expires_at_seconds",
+			Help:      "Expiry of the effective license certificate in unix seconds, 0 without one.",
+		})
+
+	LicenseNodesOnlineGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: "license",
+			Name:      "nodes_online",
+			Help:      "Registered nodes that are online, by node type.",
+		}, []string{"type"})
+
+	LicenseNodesGraceGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: "license",
+			Name:      "nodes_grace",
+			Help:      "Disconnected nodes still holding their slot during the grace period, by node type.",
+		}, []string{"type"})
+
+	LicenseNodesLimitGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: "license",
+			Name:      "nodes_limit",
+			Help:      "Node quota of the license, by node type.",
+		}, []string{"type"})
+
 	VolumeServerHandlerCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: Namespace,
@@ -387,6 +427,11 @@ func init() {
 	Gather.MustRegister(VolumeServerRequestCounter)
 	Gather.MustRegister(VolumeServerHandlerCounter)
 	Gather.MustRegister(LicenseDeniedReadsCounter)
+	Gather.MustRegister(LicenseStateGauge)
+	Gather.MustRegister(LicenseExpiresAtGauge)
+	Gather.MustRegister(LicenseNodesOnlineGauge)
+	Gather.MustRegister(LicenseNodesGraceGauge)
+	Gather.MustRegister(LicenseNodesLimitGauge)
 	Gather.MustRegister(VolumeServerRequestHistogram)
 	Gather.MustRegister(VolumeServerInFlightRequestsGauge)
 	Gather.MustRegister(VolumeServerVacuumingCompactCounter)

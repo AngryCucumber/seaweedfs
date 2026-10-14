@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
+	"github.com/seaweedfs/seaweedfs/weed/license"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
@@ -66,8 +67,13 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 	var dn *topology.DataNode
 	// licenseSent is the license state_version last sent on this stream.
 	var licenseSent uint64
+	// licenseAddr is the address admitted under the node quota.
+	var licenseAddr string
 
 	defer func() {
+		if licenseAddr != "" {
+			ms.License.DisconnectNode(license.NodeVolumeServer, licenseAddr)
+		}
 		if dn != nil {
 			dn.Counter--
 			if dn.Counter > 0 {
@@ -138,11 +144,21 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 			if heartbeat.Ip == "" {
 				continue
 			} // ToDo must be removed after update major version
-			// A new leader admits no node before its license reconcile is
-			// done; the volume server retries.
-			if ms.License.Reconciling() {
-				return status.Error(codes.Unavailable, "license: RECONCILING")
+			// The node quota (plan 3.4): a new leader admits no node before
+			// its license reconcile is done, and a new address needs a free
+			// slot. The volume server retries either way.
+			addr := util.JoinHostPort(heartbeat.Ip, int(heartbeat.Port))
+			if err := ms.License.AdmitNode(license.NodeVolumeServer, addr); err != nil {
+				if license.IsCode(err, license.CodeNodeLimitExceeded) {
+					if sendErr := stream.Send(&master_pb.HeartbeatResponse{
+						LicenseRejectReason: string(license.CodeNodeLimitExceeded),
+					}); sendErr != nil {
+						return sendErr
+					}
+				}
+				return licenseGrpcError(err)
 			}
+			licenseAddr = addr
 			dcName, rackName := ms.Topo.Configuration.Locate(heartbeat.Ip, heartbeat.DataCenter, heartbeat.Rack)
 			dc := ms.Topo.GetOrCreateDataCenter(dcName)
 			rack := dc.GetOrCreateRack(rackName)
@@ -297,6 +313,15 @@ func (ms *MasterServer) KeepConnected(stream master_pb.Seaweed_KeepConnectedServ
 		clientAddress = uuid.New().String()
 	}
 	peerAddress := pb.ServerAddress(clientAddress)
+
+	// Filers register under the node quota (plan 3.4); other clients do
+	// not count.
+	if req.ClientType == cluster.FilerType {
+		if err := ms.License.AdmitNode(license.NodeFiler, clientAddress); err != nil {
+			return licenseGrpcError(err)
+		}
+		defer ms.License.DisconnectNode(license.NodeFiler, clientAddress)
+	}
 
 	// buffer by 1 so we don't end up getting stuck writing to stopChan forever
 	stopChan := make(chan bool, 1)

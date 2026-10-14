@@ -142,12 +142,17 @@ func (n *Node) Apply(u *Update) {
 }
 
 // Reject marks this node as refused by the master's node quota. Reads are
-// denied with NODE_REJECTED until the next Apply.
-func (n *Node) Reject() {
+// denied with NODE_REJECTED until the next Apply. It reports whether the
+// node was not rejected before, so callers log once per rejection.
+func (n *Node) Reject() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.rejected {
+		return false
+	}
 	n.rejected = true
 	n.publishLocked(n.guard.Now())
+	return true
 }
 
 // LogDenied logs a denied read at most once a minute per node; the other

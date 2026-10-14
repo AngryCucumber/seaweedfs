@@ -171,6 +171,15 @@ type Manager struct {
 	lastClockSave  time.Time
 	validateTokens float64
 	validateAt     time.Time
+	// conns counts the live registration streams of each node admitted by
+	// this master. A node goes offline in the ledger when its last stream
+	// ends, so a quick reconnect whose old stream closes late keeps it
+	// online.
+	conns map[ledgerKey]int
+	// rejectLogAt and rejectsSinceLog limit refused registrations in the
+	// log to one line a minute.
+	rejectLogAt     time.Time
+	rejectsSinceLog int
 
 	// reconciled is term+1 of the last completed reconcile, 0 for none.
 	reconciled   atomic.Uint64
@@ -191,6 +200,7 @@ func NewManager(opt ManagerOption) (*Manager, error) {
 		timeNow:        opt.Now,
 		ledger:         NewLedger(nil),
 		acked:          map[string]uint64{},
+		conns:          map[ledgerKey]int{},
 		validateTokens: validatePerMinute,
 	}
 	if m.timeNow == nil {
@@ -1267,8 +1277,10 @@ func (m *Manager) RemoveMaster(ctx context.Context, id string, remove func() err
 	return nil
 }
 
-// AdmitNode registers a volume server or filer under its quota (plan 3.4).
-// It never waits for peers.
+// AdmitNode registers a volume server or filer under its quota (plan 3.4)
+// when its stream opens on the leader. It never waits for peers. Each
+// successful call must be paired with a DisconnectNode when the stream
+// ends.
 func (m *Manager) AdmitNode(t NodeType, addr string) error {
 	if m.Reconciling() {
 		return &Error{Code: CodeReconciling}
@@ -1278,20 +1290,53 @@ func (m *Manager) AdmitNode(t NodeType, addr string) error {
 	defer m.mu.Unlock()
 	if err := m.ledger.Admit(t, addr, now, m.certs.Limits(now)); err != nil {
 		if e, ok := err.(*Error); ok {
-			return m.noLicenseHint(e)
+			err = m.noLicenseHint(e)
 		}
+		m.logRejectLocked(t, addr, err)
 		return err
 	}
+	m.conns[ledgerKey{t, addr}]++
 	m.ledgerDirty = true
 	return nil
 }
 
-// DisconnectNode starts the grace period of a node.
+// logRejectLocked logs a refused registration at most once a minute.
+func (m *Manager) logRejectLocked(t NodeType, addr string, err error) {
+	now := m.timeNow()
+	if now.Sub(m.rejectLogAt) < time.Minute {
+		m.rejectsSinceLog++
+		return
+	}
+	msg := strings.TrimPrefix(err.Error(), "license: ")
+	if m.rejectsSinceLog > 0 {
+		glog.Warningf("license: refused %s %s: %s (%d more refused registrations in the last minute)", t, addr, msg, m.rejectsSinceLog)
+	} else {
+		glog.Warningf("license: refused %s %s: %s", t, addr, msg)
+	}
+	m.rejectLogAt, m.rejectsSinceLog = now, 0
+}
+
+// DisconnectNode ends one stream of a node admitted by AdmitNode. When it
+// was the last one, the node's grace period starts. A master that is no
+// longer leader leaves its ledger copy alone: the leader owns it.
 func (m *Manager) DisconnectNode(t NodeType, addr string) {
+	leader := m.raft.IsLeader()
+	key := ledgerKey{t, addr}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.ledger.Disconnect(t, addr, m.now())
-	m.ledgerDirty = true
+	if n := m.conns[key]; n > 1 {
+		m.conns[key] = n - 1
+		return
+	} else if n == 0 {
+		return
+	}
+	delete(m.conns, key)
+	if !leader {
+		return
+	}
+	if m.ledger.Disconnect(t, addr, m.now()) {
+		m.ledgerDirty = true
+	}
 }
 
 // ReleaseNode drops the offline ledger entries of addr

@@ -20,6 +20,8 @@
 
 **P3 完成（2026-10-14）：** 按流下发、volume/filer 守卫（V1、F1、F2、M1）、filer gRPC 内联正文隐藏与写入合并规则（G1）、volume gRPC 数据 RPC 守卫与 volume 之间的令牌（G2）、节点缓存、内部令牌传递链、订阅/备份/读取命令的隐藏正文处理、mount 错误传播、S3 两处已实现，并在 1 master + 2 volume + 3 filer（含 `-s3 -webdav` 同进程）、`weed server -filer -s3 -webdav` 与 Linux 虚拟机（mount、`-cipher`）上做了真实进程验证；P3 中修正的 P2 缺陷与上游问题、与本文的差异及未覆盖项见 8.2。
 
+**P4 完成（2026-10-14）：** volume 心跳与 filer KeepConnected 接入成员账本准入（锁内原子预占、按地址计流的断开宽限、超额拒绝帧）、节点侧 `NODE_REJECTED` 的日志与解除、master 侧其余 5 个指标；master 的三个加入入口、无证书额度 0 与启动检查已在 P2 完成。经单 master、hashicorp 3 master 强杀切主、`weed server` 单进程与基线版本 3 master + 7 volume + 2 filer 升级的真实进程验证；与本文的差异及未覆盖项见 8.3。
+
 本文是实施计划，不是功能已完成声明。第 9 节的取舍已于 2026-10-13 由用户确认（决策 2、4、9 改选备选），证书声明、原因码、线格式常量与源码挂点以 [P0 契约](license-p0-contract-20261013.md) 为准。
 
 ---
@@ -59,6 +61,7 @@
 - 同进程的 webdav（`weed server -webdav`）解析 manifest 时会经内部通道读到 manifest 块（只含 chunk id 列表）；数据块经 `fetchChunkRange` 读取，不带令牌，仍被拦。
 - **内联正文的剩余边界（v9）：** 系统豁免路径（`/etc/` 全部、`/topics/` 下的 `topic.conf` 与 `*.offset`）的正文经 gRPC 照常可读，能经 filer HTTP 写 `/etc/` 的用户可借此存取小文件；`other/java` 客户端（不在构建内）读到空正文，回写依赖 protobuf-java 保留未知字段；证书到期前已发出的订阅事件不追回。
 - filer 按 `notification.toml` 向外部队列（Kafka、SQS 等）发送的元数据事件在服务端生成，内联正文不隐藏；该出口由运维配置，与内部维护同级（P3 补记）。
+- 超额被拒（`NODE_REJECTED`）的 filer 只拒绝自身的 HTTP/S3 读取与 gRPC 内联正文；它仍接受写入、提供元数据与 `LookupVolume`，经它取得分块位置后直连 volume 读取的客户端（mount、`fs.cat` 等）不受影响，因为 volume 的证书有效。filer 额度约束的是能经 HTTP/S3 对外提供读取的 filer，不阻止超额 filer 充当 mount 的元数据端点（P4 补记）。
 - volume server `-dir` 下的 `.dat/.idx` 文件本身不加密；证书不是数据保密方案。整机时间与状态一起回滚、替换二进制，离线证书不能完全防住。
 - `filer.sync`、`filer.backup`、`filer.meta.backup`、`filer.remote.sync`、`filer.remote.gateway` 是独立进程，没有内部令牌，证书无效时被拦（第 9 节决策 3），遇到隐藏正文的事件停在原偏移，续期后续传（1.5）。S3 `CopyObject` 的源读取经 F1 被拦，并按 5.2 做状态校验。
 - master 的静态 `-peers` 由启动前的本地证书检查约束（v9，3.4）；hashicorp 已有 raft 配置的成员重启只计数不检查。
@@ -387,7 +390,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | `weed/server/master_server.go` | manager 初始化；5 条路由；`OnPeerUpdate` 加入走两阶段（后台等待对账完成）；远程移除经 `RaftRemoveServer` 已覆盖（P2 已完成） | ~30 |
 | `weed/server/raft_hashicorp.go`、`raft_server.go` | `updatePeers` 改为后台执行、等对账完成后加入走两阶段、移除前重提交；新配置引导前 `CheckBootstrap`（P2 已完成） | ~40 |
 | `weed/server/master_grpc_server_raft.go` | `RaftAddServer` 走两阶段；`RaftRemoveServer` 前重提交；不再跨调用持有 `RaftServerAccessLock`（P2 已完成） | ~15 |
-| `weed/server/master_grpc_server.go` | `SendHeartbeat`：账本判新/预占/对账冻结 + 首帧与按流对账 + 响应填容量字段；`KeepConnected`：`addClient` 前预占 + 首帧 + ticker 对账；日志脱敏（P2 已完成对账冻结与日志脱敏；P3 已完成首帧与按流对账；预占 P4） | ~60 |
+| `weed/server/master_grpc_server.go` | `SendHeartbeat`：账本判新/预占/对账冻结 + 首帧与按流对账 + 响应填容量字段；`KeepConnected`：`addClient` 前预占 + 首帧 + ticker 对账；日志脱敏（P2 已完成对账冻结与日志脱敏；P3 已完成首帧与按流对账；P4 已完成准入预占与断开宽限） | ~60 |
 | `weed/server/master_grpc_server_license.go`、`master_license.go`（新） | `GetLicense/ImportLicense/SyncLicense/GetLedger/SyncLedger`；raft 适配、peer RPC、类型转换（P2 已完成） | ~380 |
 | `weed/server/master_server_handlers_license.go`（新） | 5 个 HTTP handler（P2 已完成） | ~170 |
 | `weed/cluster/cluster.go` | `ListAllClusterNodes`（对账时保留在线 filer）（P2 已完成） | ~20 |
@@ -395,7 +398,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | `weed/server/master_ui/license.html`（新）、`master.html`、`masterNewRaft.html`、`templates.go` | 两份模板共用一个 License 区块（P2 已完成） | ~130 |
 | `weed/wdclient/masterclient.go` | `OnLicenseUpdate` 回调；首帧、循环、`PermissionDenied license:` 三处调用（P3 已完成） | ~20 |
 | `weed/server/volume_server.go` | `license *license.Node`；启动读缓存（P3 已完成） | ~6 |
-| `weed/server/volume_grpc_client_to_master.go` | 处理 `in.License`、`in.LicenseRejectReason`（P3 已完成） | ~15 |
+| `weed/server/volume_grpc_client_to_master.go` | 处理 `in.License`、`in.LicenseRejectReason`（P3 已完成；P4 拒绝帧跳过卷参数比较、拒绝日志只打一次） | ~15 |
 | `weed/server/volume_server_handlers_read.go` | V1 守卫 + 拒绝路径令牌校验；`ReadMode=proxy` 转发沿用原方法（P3 已完成，8.2） | ~10 |
 | `weed/server/filer_server.go` | `license *license.Node`；注册回调；启动读缓存；`saveToFilerLimit>0` 告警；`filer.SetInternalReadToken`（P3 已完成） | ~12 |
 | `weed/server/filer_server_handlers_read.go` | F1 守卫 + 清理对象头；`?metadata=true` 隐藏 Content 并打标记（P3 已完成） | ~14 |
@@ -413,7 +416,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | `weed/command/license_init.go`（新） | 离线 `weed license.init`（v9，3.4）（P2 已完成） | ~60 |
 | `weed/s3api/s3api_object_handlers_copy.go` | 源状态校验（P3 已完成） | ~4 |
 | `weed/s3api/s3api_object_handlers.go` | GetObject 403 映射（P3 已完成） | ~5 |
-| `weed/stats/metrics.go` | 指标（P3 只做 `license_denied_reads_total`，其余随 P4/P5） | ~20 |
+| `weed/stats/metrics.go` | 指标（P3 做 `license_denied_reads_total`；P4 补齐 master 侧 `license_state`、`license_expires_at_seconds` 与三个节点数量指标，见 8.3） | ~20 |
 | `weed/command/master.go`、`weed/command/server.go`、`master_follower.go` | `-license.file`、`-master.license.file`、`-mdir` 临时目录告警（P2 已完成） | ~40 |
 | `weed/shell/command_license.go`（新） | `license.show/import/validate`（P2 已完成） | ~140 |
 
@@ -438,7 +441,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | P1 核心包 | `weed/license` 除 `manager.go` 外全部 + 单测（manager 依赖 proto 与 raft，并入 P2） | **已完成（2026-10-13）**：`go test -race ./weed/license/` 通过；签发工具 + OpenSSL 3 签发的互通向量验证通过；`AllowRead` 0 分配，单核约 0.65 ns/op；7.1 测试清单中 voter 多数派、任期、对账写回三项随 manager 在 P2 完成 | 3 天 |
 | P2 master 管理 | proto（先行）、manager、HTTP/gRPC、voter 多数派、任期与配置索引、对账写回、账本 `(term,revision)` 复制与对账、对账期间注册延后、加入两阶段、移除前重提交、`voters_acked`、cluster_id、令牌、水位、页面 | **已完成（2026-10-13）**，证据与差异见 8.1：`go test -race ./weed/license/` 通过（含 19 个 manager 用例）；`server/command/shell/cluster/topology/wdclient/pb` 测试通过；真实进程验证单 master、goraft 与 hashicorp 3 master、3→5 扩容与缩容、切主对账、页面导入、`license.init` 与 `-license.file`、日志无证书与令牌 | 6 天 |
 | P3 下发与拦截 | 按流对账、volume/filer 守卫、M1、G1（含 `filer.proto`、合并规则、客户端改动）、G2、缓存、内部令牌传递链、mount 错误传播、S3 两处 | **已完成（2026-10-14）**，证据与差异见 8.2：S1–S4、S6、S15–S20 真实进程通过（mount 与 `-cipher` 在 Linux 虚拟机上补测；mount 硬链接与截断的上游缺陷已修复）；S5、S7、S8 属 master 侧，P2 已验证；新增 server/filer/mount/wdclient/pb/license 单测通过 | 6.5 天 |
-| P4 节点额度 | 账本、宽限、预占、`NODE_REJECTED`（volume 与 filer）、三个 master 加入入口、无证书额度 0 与 master 启动检查 | S9–S12、S21 | 2.5 天 |
+| P4 节点额度 | 账本、宽限、预占、`NODE_REJECTED`（volume 与 filer）、三个 master 加入入口、无证书额度 0 与 master 启动检查 | **已完成（2026-10-14）**，证据与差异见 8.3：S9–S12 与 S21 的节点部分真实进程通过（单 master、hashicorp 3 master 强杀切主、`weed server`、基线版本升级）；10 分钟宽限实测 603 秒自动释放；新增 license 单测通过（master 加入入口与启动检查的 S21 部分 P2 已验证） | 2.5 天 |
 | P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13 | 2 天 |
 
 合计约 20.5 人天（单人，不含签发工具 1 人天）。v9 增量见 P0 契约 8.1。
@@ -532,7 +535,46 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 5. 指标只实现了 `license_denied_reads_total{server,path}`（prometheus 名带仓库统一前缀，为 `SeaweedFS_license_denied_reads_total`），`license_state`、`license_expires_at_seconds` 与节点数量类指标随 P4/P5。
 6. `filer.Entry.ContentHidden` 在 HTTP JSON 里的字段名是 `ContentHidden`（与该结构其它字段一样为大驼峰）。
 
-**未覆盖：** `volume.check.disk` 只在副本间有差异时才读 needle，本次集群无副本，未触发（`ReadNeedleBlob` 守卫已由探测客户端验证）。`CacheRemoteObjectToLocalCluster` 未接远端存储，只有代码路径。S14（新旧混部）未测。被拒准入（`NODE_REJECTED`）的节点侧处理已实现，master 侧在 P4 接入。
+**未覆盖：** `volume.check.disk` 只在副本间有差异时才读 needle，本次集群无副本，未触发（`ReadNeedleBlob` 守卫已由探测客户端验证）。`CacheRemoteObjectToLocalCluster` 未接远端存储，只有代码路径。S14（新旧混部）未测。被拒准入（`NODE_REJECTED`）的节点侧处理已实现，master 侧在 P4 接入（已接入，见 8.3）。
+
+### 8.3 P4 实施记录（2026-10-14）
+
+**交付：**
+
+- `weed/server/master_grpc_server.go`：`SendHeartbeat` 在 `GetOrCreateDataNode` 之前、`KeepConnected` 在 `addClient` 之前（仅 `ClientType == "filer"`）调用 `License.AdmitNode`，流结束时 `DisconnectNode`；超额时 volume 先收到 `HeartbeatResponse{license_reject_reason:"NODE_LIMIT_EXCEEDED"}` 再收到 `PermissionDenied`，filer 直接收到 `PermissionDenied`。
+- `weed/license/manager.go`、`ledger.go`：按地址记录本 leader 上存活的注册流数，最后一条流结束才开始宽限；已离线条目再次断开不重置 `last_seen`；不再是 leader 的 master 只减计数、不改本地账本副本；拒绝日志每分钟至多 1 条并附合并次数。
+- `weed/license/node.go`、`weed/server/volume_grpc_client_to_master.go`、`weed/server/filer_server.go`：`Reject` 返回是否新进入拒绝态，节点只在首次被拒时打 error 日志；volume 收到拒绝帧后跳过该帧的卷参数比较。
+- `weed/stats/metrics.go`、`weed/server/master_license.go`：master 每 5 秒按 `GET /license` 的视图刷新 5 个指标（契约第 3 节 P4 修订）。
+- `weed/license/manager_test.go`：`TestManagerNodeStreams`。
+
+**验证（真实进程；证书由测试根签发）：**
+
+| 场景 | 环境 | 结果 |
+| --- | --- | --- |
+| S21 无证书准入 | 单 master | 第 1 个 volume 与第 1 个 filer 被拒，消息 `license: NODE_LIMIT_EXCEEDED volume_server 0/0 no license imported`（filer 同）；volume GET 403 `NODE_REJECTED`；filer 卡在等待 master、HTTP 端口不监听；导入后 3.2 秒内两者在下一次重试时注册 |
+| S9 第 4 个 volume | 单 master，`max_volume_servers=3` | 第 4 个被拒 `3/3` 并每 5 秒重试，GET 403 `NODE_REJECTED`；已注册的 v1 停止后在宽限内重启，0.6 秒注册，未被拒 |
+| S9 切主 | hashicorp 3 master + 4 volume | 第 4 个在旧 leader 被拒；kill -9 leader 后 1 秒选出新 leader，原 3 个 9 秒内全部重新注册，第 4 个仍被新 leader 以 `3/3` 拒绝 |
+| S10 释放 | 单 master | 宽限内第 4 个持续被拒；`DELETE /license/nodes/{addr}` 对在线节点 409 `NODE_ONLINE`、对未知地址 404 `NODE_NOT_FOUND`；释放宽限节点后第 4 个 4.6 秒内注册；空出 1 个名额后同时启动 2 个 volume，只有 1 个注册；不调用 `DELETE` 时 filer 停止 603 秒后名额自动释放（宽限 600 秒加重试间隔与 10 秒轮询粒度），被拒的 filer 随即注册，HTTP 与 S3 读恢复 |
+| S10 切主不延长宽限 | hashicorp 3 master | volume 离线 66 秒后强杀 leader：新 leader 与两个 follower 账本中它的 `last_seen` 都不变，仍占名额，第 4 个继续被拒；它在宽限内重启后正常注册 |
+| S11 降额 | 单 master | 账本 3 条（含 1 条宽限）时导入上限 2 返回 409 `LICENSE_NODE_LIMIT_TOO_SMALL`；释放后导入成功 |
+| S12a | 单 master，`max_filers=1` | 第 2 个 filer 冷启动卡在等待 master、端口不监听，日志 `license: master refused this filer: NODE_LIMIT_EXCEEDED filer 1/1` |
+| S12b | 同上 | 对运行中的 f8 `SIGSTOP`，27 秒后 master 经 keepalive 断开其流并进入宽限；释放后名额由冷启动等待中的 f9 占用；`SIGCONT` 后 f8 重连被拒：卷位置缓存仍在，HTTP GET 403 `NODE_REJECTED`，S3 GetObject 403 `AccessDenied`；此前 f8 在宽限内重启（加 `-s3`）未被拒 |
+| S21 `weed server` | 单进程 `-filer -s3` | 无证书时内置 volume GET 403 `NODE_REJECTED`，filer 与 S3 端口不监听；导入后 1.6 秒内全部注册，S3 建桶、写入、读取成功 |
+| S21 存量升级 | 基线版本（不含证书代码）goraft 3 master + 7 volume + 2 filer，写入数据后停机 | `license.init`（1 台生成、另 2 台 `-clusterId`）→ 签发 → 新版本以 `-license.file` 启动：7 个 volume、2 个 filer 全部注册，日志无准入拒绝，两个 filer 读原有数据 200 |
+| 指标 | 单 master | 5 个指标按契约第 3 节 P4 修订导出，数值与 `GET /license` 一致 |
+| 日志 | 全部进程 | master 拒绝日志每分钟 1 条并附合并次数；节点只在首次被拒时打 error；无证书原文 |
+| 单测 | — | `TestManagerNodeStreams`：同一地址两条流只在最后一条结束时进入宽限、重复断开不移动宽限、非 leader 不改账本副本、超额消息格式；`go test ./...`、license 包与 wdclient 授权用例的 `-race`、CI 标签构建通过；wdclient 的上游用例 `TestConcurrentGetLocations` 在 `-race` 下间歇报 `resetVidMap` 的数据竞争，基线版本同样复现，与本改动无关 |
+
+**与计划的差异：**
+
+1. 断开以“本 leader 上该地址的存活注册流数归零”为准，不跟随上游的 `DataNode.Counter` 与 `ClusterNode.counter`（前者在 `RegisterUuids` 失败的路径上增减不对称）；非 leader 只减计数（契约 2.4 P4 修订）。
+2. 拒绝帧不填 `VolumeSizeLimit`、`Preallocate`，volume 跳过该帧的参数比较（契约 2.4 P4 修订）。
+3. 指标只在 master 导出（契约第 3 节 P4 修订）。
+4. 3.4 表 volume 行的“先 `rack.FindDataNode(ip, port)` 与账本查询”改为只查账本：拓扑里在线的 volume 都已在本 leader 准入（账本内且在线），选主后由对账的 `Connected` 回调置为在线，不需要另查拓扑。
+
+**观察（未改）：** 重启后重新加入的 follower 在下一个账本批次之前持有旧副本：批次只要求 voter 多数派确认，不向落后者补发。切主时对账按多数派取最高版本，S10 切主验证中该 follower 也在对账写回后追平，不影响结论。
+
+**未覆盖：** S9 中“让某个 follower 的 KeepConnected 落后数分钟再强杀 leader”未单独构造：follower master 不从 KeepConnected 应用授权或账本（8.1 差异 1），账本只经 `SyncLedger` 复制、切主按多数派对账，该结论由结构保证，并有 P2 单测。goraft 多 master 的切主准入未测（hashicorp 已测，准入代码不区分 raft 实现）。S13 的 200 个 volume 集中重连属 P5。被拒 filer 的 mount 读取边界见 1.3。
 
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 

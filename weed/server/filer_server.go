@@ -159,8 +159,9 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	fs.license = newLicenseNode(option.DefaultStoreDir)
 	fs.filer.MasterClient.OnLicenseUpdate = fs.applyLicenseUpdate
 	fs.filer.MasterClient.OnLicenseReject = func(message string) {
-		glog.Errorf("license: master refused this filer: %s", message)
-		fs.license.Reject()
+		if fs.license.Reject() {
+			glog.Errorf("license: master refused this filer: %s; reads are denied until it registers", strings.TrimPrefix(message, "license: "))
+		}
 	}
 	if option.SaveToFilerLimit > 0 {
 		glog.Warningf("license: -saveToFilerLimit=%d stores small files inline in the filer store; their content is hidden from metadata reads while the license denies reads", option.SaveToFilerLimit)

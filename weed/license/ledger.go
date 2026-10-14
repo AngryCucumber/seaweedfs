@@ -104,11 +104,14 @@ func (l *Ledger) Admit(t NodeType, addr string, now int64, limits Limits) error 
 	return nil
 }
 
-// Disconnect starts a node's grace period.
-func (l *Ledger) Disconnect(t NodeType, addr string, now int64) {
-	if e, ok := l.entries[ledgerKey{t, addr}]; ok {
+// Disconnect starts the grace period of an online node and reports
+// whether it did. An offline node keeps its deadline.
+func (l *Ledger) Disconnect(t NodeType, addr string, now int64) bool {
+	if e, ok := l.entries[ledgerKey{t, addr}]; ok && e.Online {
 		e.Online, e.LastSeen = false, now
+		return true
 	}
+	return false
 }
 
 // ExpireGrace drops offline entries whose grace period has ended and
