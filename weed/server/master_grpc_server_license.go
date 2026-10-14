@@ -11,6 +11,9 @@ import (
 func (ms *MasterServer) GetLicense(ctx context.Context, req *master_pb.GetLicenseRequest) (*master_pb.GetLicenseResponse, error) {
 	resp := &master_pb.GetLicenseResponse{}
 	if req.IncludeState {
+		if err := ms.checkLicensePeer(ctx); err != nil {
+			return nil, err
+		}
 		resp.State = licenseStateToPb(ms.License.State())
 		return resp, nil
 	}
@@ -44,6 +47,9 @@ func (ms *MasterServer) ImportLicense(ctx context.Context, req *master_pb.Import
 }
 
 func (ms *MasterServer) SyncLicense(ctx context.Context, req *master_pb.SyncLicenseRequest) (*master_pb.SyncLicenseResponse, error) {
+	if err := ms.checkLicensePeer(ctx); err != nil {
+		return nil, err
+	}
 	st, err := ms.License.ApplySync(license.LeaderInfo{
 		Address:     req.LeaderAddress,
 		Term:        req.LeaderTerm,
@@ -56,10 +62,16 @@ func (ms *MasterServer) SyncLicense(ctx context.Context, req *master_pb.SyncLice
 }
 
 func (ms *MasterServer) GetLedger(ctx context.Context, req *master_pb.GetLedgerRequest) (*master_pb.GetLedgerResponse, error) {
+	if err := ms.checkLicensePeer(ctx); err != nil {
+		return nil, err
+	}
 	return &master_pb.GetLedgerResponse{Ledger: ledgerToPb(ms.License.Ledger())}, nil
 }
 
 func (ms *MasterServer) SyncLedger(ctx context.Context, req *master_pb.SyncLedgerRequest) (*master_pb.SyncLedgerResponse, error) {
+	if err := ms.checkLicensePeer(ctx); err != nil {
+		return nil, err
+	}
 	err := ms.License.ApplyLedgerSync(license.LeaderInfo{
 		Address: req.LeaderAddress,
 		Term:    req.LeaderTerm,

@@ -22,6 +22,8 @@
 
 **P4 完成（2026-10-14）：** volume 心跳与 filer KeepConnected 接入成员账本准入（锁内原子预占、按地址计流的断开宽限、超额拒绝帧）、节点侧 `NODE_REJECTED` 的日志与解除、master 侧其余 5 个指标；master 的三个加入入口、无证书额度 0 与启动检查已在 P2 完成。经单 master、hashicorp 3 master 强杀切主、`weed server` 单进程与基线版本 3 master + 7 volume + 2 filer 升级的真实进程验证；与本文的差异及未覆盖项见 8.3。
 
+**P4 后加固（2026-10-14）：** master 之间的 4 个 RPC 只接受 master 地址的调用，节点时钟以本地墙钟减 5 分钟为下限，均不依赖 TLS；见 1.3、4.3 与 8.4。
+
 本文是实施计划，不是功能已完成声明。第 9 节的取舍已于 2026-10-13 由用户确认（决策 2、4、9 改选备选），证书声明、原因码、线格式常量与源码挂点以 [P0 契约](license-p0-contract-20261013.md) 为准。
 
 ---
@@ -56,9 +58,9 @@
 
 ### 1.3 明确不封堵、作为已知边界
 
-- 内部令牌（1.4）是集群内共享的静态密钥，持有它就能在证书无效时直读 volume。取得途径：master 主机上的 `<mdir>/license/state.json`；master 之间对账用的 gRPC `GetLicense(include_state=true)` 不鉴权，能连 master 的任何客户端都可直接取得（P3 补记）；`ClientType` 不鉴权，能连 master 且有空闲 filer 名额的客户端可自称 filer 经 `KeepConnected` 拿到；默认部署下令牌以明文出现在 master 下发给 volume 与 filer 的 gRPC 流、filer 读 volume 的 HTTP 请求头 `X-MassDB-Internal-Read`、volume 之间与 filer 之间的 gRPC 元数据中，可被截获。不引入每请求 HMAC。
-- **gRPC mTLS 与 HTTPS 不是证书的部署要求**（2026-10-14 修订，此前写为“部署手册要求开启”）。对被授权方本人，开不开强度相同：集群 CA 与 master 主机都在其手中，上一条的前三个途径照样可用。对没有集群证书的第三方，上游默认 volume 的 GET 不鉴权（`security.toml` 的 `jwt.signing.read` 默认为空），证书有效时本就能直读，截获令牌只是在证书无效时得到同样的读取能力，属于数据保密范畴（见本节“证书不是数据保密方案”）。需要保护集群内传输时，同时开启 gRPC mTLS 与 `[https.volume]`、`[https.client]`：filer 读 volume 的令牌在 HTTP 请求头里，只开 gRPC mTLS 保护不到。运维手册列为可选项。
-- 节点以 master 下发的 `master_now_unix_ms` 为时钟锚点，不与本地墙钟比较（4.3）。能让节点连上伪造的 master、或在明文链路上改写该字段的人，配合一张该集群曾经有效的证书，可让节点把已过期的证书当作有效。与本节“整机时间回滚”同属离线证书防不住的一类，但不需要改动节点机器（2026-10-14 补记）。
+- 内部令牌（1.4）是集群内共享的静态密钥，持有它就能在证书无效时直读 volume。取得途径：master 主机上的 `<mdir>/license/state.json`，或在 master 主机上调用 master 之间的 RPC；`ClientType` 不鉴权，能连 master 且有空闲 filer 名额的客户端可自称 filer 经 `KeepConnected` 拿到；默认部署下令牌以明文出现在 master 下发给 volume 与 filer 的 gRPC 流、filer 读 volume 的 HTTP 请求头 `X-MassDB-Internal-Read`、volume 之间与 filer 之间的 gRPC 元数据中，可被截获。不引入每请求 HMAC。master 之间的 `GetLicense(include_state=true)`、`GetLedger`、`SyncLicense`、`SyncLedger` 原先不鉴权，能连 master 的任何客户端都可直接取得令牌（P3 补记只写了前者，`SyncLicense` 的响应同样带令牌）；2026-10-14 起只接受来源 IP 属于 raft 成员、`-peers` 或 `master.toml` 中 `[master.license] peer_ips` 的调用（8.4）。
+- **gRPC mTLS 与 HTTPS 不是证书的部署要求**（2026-10-14 修订，此前写为“部署手册要求开启”）。对被授权方本人，开不开强度相同：集群 CA 与 master 主机都在其手中，上一条的途径照样可用。对没有集群证书的第三方，上游默认 volume 的 GET 不鉴权（`security.toml` 的 `jwt.signing.read` 默认为空），证书有效时本就能直读，截获令牌只是在证书无效时得到同样的读取能力，属于数据保密范畴（见本节“证书不是数据保密方案”）。需要保护集群内传输时，同时开启 gRPC mTLS 与 `[https.volume]`、`[https.client]`：filer 读 volume 的令牌在 HTTP 请求头里，只开 gRPC mTLS 保护不到。运维手册列为可选项。
+- 节点以 master 下发的 `master_now_unix_ms` 为时钟锚点，但不早于本地墙钟减 5 分钟（4.3，2026-10-14 加固）。让节点连上伪造的 master、或在明文链路上改写该字段，配合一张该集群曾经有效的证书，至多让已过期的证书在节点上多生效 5 分钟；更多则须把节点机器的时钟一起回拨，属于本节“整机时间回滚”。
 - G2 只在建流时检查，证书有效期间已开始的 gRPC 数据流在到期后不中断。
 - 同进程的 webdav（`weed server -webdav`）解析 manifest 时会经内部通道读到 manifest 块（只含 chunk id 列表）；数据块经 `fetchChunkRange` 读取，不带令牌，仍被拦。
 - **内联正文的剩余边界（v9）：** 系统豁免路径（`/etc/` 全部、`/topics/` 下的 `topic.conf` 与 `*.offset`）的正文经 gRPC 照常可读，能经 filer HTTP 写 `/etc/` 的用户可借此存取小文件；`other/java` 客户端（不在构建内）读到空正文，回写依赖 protobuf-java 保留未知字段；证书到期前已发出的订阅事件不追回。
@@ -258,7 +260,7 @@ P2 实现说明：`status_json`、`result_json` 与 HTTP 的 `GET /license`、`P
 
 ### 4.3 节点时间口径
 
-每个 `license.Node` 实例一个 500 ms ticker 维护原子时钟：有 master 锚点时取 `master_now_unix_ms + 自锚定以来的单调流逝`（按毫秒累计后取整秒），无锚点退回本地墙钟；不与本地墙钟取较大值。同一 ticker 按 3.2 推导生效证书并在变化时替换快照。
+每个 `license.Node` 实例一个 500 ms ticker 维护原子时钟：有 master 锚点时取 `master_now_unix_ms + 自锚定以来的单调流逝`（按毫秒累计后取整秒），但不早于本地墙钟减 5 分钟；无锚点退回本地墙钟。master 时间落后本地墙钟不超过 5 分钟时完全跟随 master；超过时改用本地墙钟减 5 分钟，并在进入与退出时各打一条日志（2026-10-14 修订，此前为“不与本地墙钟取较大值”，伪造的 master 时间可让过期证书一直有效，见 1.3）。代价：本地时钟比 master 快 5 分钟以上的节点，到期判定比 master 早“快出部分减 5 分钟”，未来证书也相应提前生效。同一 ticker 按 3.2 推导生效证书并在变化时替换快照。
 
 实现要点：manager 锁内同步等待的 RPC 只有四类低频操作（导入多数派推送、加入两阶段同步、移除前重提交、选主对账），都带截止时间（单 peer 3 秒、整体 10 秒）；普通账本复制按 3.4 在锁外发 RPC；mount 的限频重解析用 single-flight 保证同一句柄同时只有一次重建，重建结果只在当前分块表仍为失败态时写入，不覆盖并发写入已追加的块。
 
@@ -394,6 +396,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | `weed/server/master_grpc_server_raft.go` | `RaftAddServer` 走两阶段；`RaftRemoveServer` 前重提交；不再跨调用持有 `RaftServerAccessLock`（P2 已完成） | ~15 |
 | `weed/server/master_grpc_server.go` | `SendHeartbeat`：账本判新/预占/对账冻结 + 首帧与按流对账 + 响应填容量字段；`KeepConnected`：`addClient` 前预占 + 首帧 + ticker 对账；日志脱敏（P2 已完成对账冻结与日志脱敏；P3 已完成首帧与按流对账；P4 已完成准入预占与断开宽限） | ~60 |
 | `weed/server/master_grpc_server_license.go`、`master_license.go`（新） | `GetLicense/ImportLicense/SyncLicense/GetLedger/SyncLedger`；raft 适配、peer RPC、类型转换（P2 已完成） | ~380 |
+| `weed/server/master_license_peers.go`（新）、`command/scaffold/master.toml` | master 之间 4 个 RPC 的来源 IP 校验与 `[master.license] peer_ips`（P4 后加固，8.4） | ~200 |
 | `weed/server/master_server_handlers_license.go`（新） | 5 个 HTTP handler（P2 已完成） | ~170 |
 | `weed/cluster/cluster.go` | `ListAllClusterNodes`（对账时保留在线 filer）（P2 已完成） | ~20 |
 | `weed/server/master_server_handlers_ui.go` | args 加 `License`（P2 已完成） | ~4 |
@@ -578,6 +581,33 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 
 **未覆盖：** S9 中“让某个 follower 的 KeepConnected 落后数分钟再强杀 leader”未单独构造：follower master 不从 KeepConnected 应用授权或账本（8.1 差异 1），账本只经 `SyncLedger` 复制、切主按多数派对账，该结论由结构保证，并有 P2 单测。goraft 多 master 的切主准入未测（hashicorp 已测，准入代码不区分 raft 实现）。S13 的 200 个 volume 集中重连属 P5。被拒 filer 的 mount 读取边界见 1.3。
 
+### 8.4 P4 后加固（2026-10-14）
+
+**起因：** 复核 gRPC mTLS 是否必须开启时确认：mTLS 不改变证书对被授权方的约束力，改为可选（1.3）；默认明文部署下最省事的两条绕过路径不需要 master 主机权限，一条是对任意 master 发一次 gRPC 调用取得令牌，一条是伪造 master 下发的时间，本节把两者堵上，均不依赖 TLS。
+
+**交付：**
+
+- `weed/server/master_license_peers.go`（新）、`master_grpc_server_license.go`：`GetLicense(include_state=true)`、`GetLedger`、`SyncLicense`、`SyncLedger` 先检查调用方来源 IP，须属于当前 raft 成员（voter 与 nonvoter）、`-peers` 与本 master 的地址，或 `master.toml` 的 `[master.license] peer_ips`（IP 或 CIDR，逗号分隔，非法值启动时退出）；主机名解析结果缓存 10 秒，解析失败沿用上次结果。否则返回 `PermissionDenied`，拒绝日志每分钟至多 1 条并列出 master 主机。不带 `include_state` 的 `GetLicense`（shell 的 `license.show`）不受影响。
+- `weed/license/node.go`：节点时钟取 `max(master 锚点时间, 本地墙钟 − 5 分钟)`（4.3）。
+- `command/scaffold/master.toml`：`[master.license] peer_ips`。
+- 单测：`TestNodeClockLocalFloor`、`TestLicensePeerGuard`、`TestLicenseCallerIP`。
+
+**验证（真实进程：hashicorp 3 master 绑定 `192.168.0.109` + 1 volume；证书由测试根签发）：**
+
+| 场景 | 结果 |
+| --- | --- |
+| 组建与对账 | leader 对账写回后 `voters_acked` 为 3 台，日志无误拒 |
+| 导入 | 导入序号 2：`peers_failed` 为空，两台 follower 应用 |
+| 账本复制 | volume 注册后两台 follower 的账本副本都记为在线 |
+| 强杀 leader | 新 leader 在 term 4 完成对账（向存活 peer 的 `GetLicense`/`GetLedger` 放行），volume 重新注册；旧 leader 重启后追平，3 台确认 |
+| 非 master 地址 | 经 master 的 localhost 监听调用（来源 127.0.0.1）：4 个 RPC 均 `PermissionDenied license: caller 127.0.0.1 is not a master of this cluster`，状态查询正常；经 `192.168.0.109` 调用放行（与 master 同机，属 1.3 所述 master 主机途径） |
+| `peer_ips` | 配置 `127.0.0.1` 的 master 放行回环调用，未配置的 master 仍拒绝；`peer_ips = "not-an-ip"` 启动即报错退出 |
+| 测试 | `go test -race ./weed/license/`；`CGO_ENABLED=0 go test` server、command、wdclient、shell；CI 标签构建 |
+
+**未覆盖：** 节点时钟下限只有单测（真实进程需要伪造 master）。主机名形式的 `-peers` 只以 `localhost` 做了单测，NAT、多网卡与 Kubernetes 非 headless 服务地址未测，这类部署须在 `peer_ips` 中补地址，否则选主对账拿不到多数派、注册一直延后，升级说明须写明。goraft 多 master 未测（校验不区分 raft 实现）。
+
+**环境记录：** 本机 macOS 上 `weed/server` 等包的测试二进制在依赖 `github.com/shoenig/go-m1cpu` 的 cgo 初始化时崩溃，与改动无关，以 `CGO_ENABLED=0` 运行。
+
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 
 | # | 场景 | 期望 |
@@ -653,4 +683,4 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 - **日志脱敏、拒绝限速、指标**（`license_state`、`license_expires_at_seconds`、`license_denied_reads_total`、`license_nodes_online/grace/limit{type}`）。
 - **部署要求**：master 先升级；`<mdir>/license/` 随 mdir 备份；volume 第一个 `-dir` 与 filer `-defaultStoreDir` 持久化；`-saveToFilerLimit=0` 为建议而非保证。
 - **性能新增工作的完整清单**（4.6）与整进程指标、补充负载（S13）。
-- **运维手册**：导出申请 → 签发 → 导入 → 续期 → 降额与宽限释放 → 存量集群升级（`license.init` → `-license.file`）→ 状态目录恢复 →（可选）开启 gRPC mTLS 与 HTTPS 保护集群内传输 → 故障排查。
+- **运维手册**：导出申请 → 签发 → 导入 → 续期 → 降额与宽限释放 → 存量集群升级（`license.init` → `-license.file`）→ 状态目录恢复 →（可选）开启 gRPC mTLS 与 HTTPS 保护集群内传输 → 故障排查（含 master 经 NAT 或其它网卡互连时配置 `[master.license] peer_ips`，见 8.4）。

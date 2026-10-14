@@ -81,6 +81,8 @@ type MasterServer struct {
 	Cluster *cluster.Cluster
 
 	License *license.Manager
+	// licensePeers admits the master-to-master license RPCs.
+	licensePeers *licensePeerGuard
 }
 
 func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.ServerAddress) *MasterServer {
@@ -136,6 +138,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 	ms.vg = topology.NewDefaultVolumeGrowth()
 	glog.V(0).Infoln("Volume Size Limit is", ms.option.VolumeSizeLimitMB, "MB")
 
+	ms.licensePeers = newLicensePeerGuard(option.Master, peers, v.GetString("master.license.peer_ips"))
 	ms.License = newLicenseManager(ms)
 	go ms.License.Run(nil)
 	go ms.licenseMetricsLoop()

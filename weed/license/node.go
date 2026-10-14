@@ -282,16 +282,24 @@ func writeFileAtomic(path string, data []byte) error {
 	return nil
 }
 
+// maxAnchorLag bounds how far the master clock may run behind the local
+// wall clock. A forged or rolled back master time could otherwise keep an
+// expired certificate in effect (plan 4.3).
+const maxAnchorLag = 5 * time.Minute
+
 // nodeClock follows the master's clock: master_now_unix_ms plus monotonic
-// time elapsed since it arrived, in whole seconds. Before the first anchor
-// it uses the local wall clock. Milliseconds keep expiry detection within
-// the tick interval plus network delay.
+// time elapsed since it arrived, in whole seconds, but never earlier than
+// the local wall clock minus maxAnchorLag. Before the first anchor it uses
+// the local wall clock. Milliseconds keep expiry detection within the tick
+// interval plus network delay.
 type nodeClock struct {
 	mu       sync.Mutex
 	timeNow  func() time.Time
 	anchored bool
 	anchorMs int64
 	anchorAt time.Time
+	// lagging is set while the local floor overrides the master time.
+	lagging bool
 }
 
 func (c *nodeClock) anchor(masterNowUnixMs int64) {
@@ -309,5 +317,20 @@ func (c *nodeClock) tick() int64 {
 	if !c.anchored {
 		return now.Unix()
 	}
-	return (c.anchorMs + now.Sub(c.anchorAt).Milliseconds()) / 1000
+	masterMs := c.anchorMs + now.Sub(c.anchorAt).Milliseconds()
+	floorMs := now.Add(-maxAnchorLag).UnixMilli()
+	lagging := masterMs < floorMs
+	if lagging != c.lagging {
+		c.lagging = lagging
+		if lagging {
+			glog.Warningf("license: master time %s is more than %v behind the local clock %s; using the local clock minus %v",
+				time.UnixMilli(masterMs).UTC().Format(time.RFC3339), maxAnchorLag, now.UTC().Format(time.RFC3339), maxAnchorLag)
+		} else {
+			glog.Infof("license: master time is within %v of the local clock again", maxAnchorLag)
+		}
+	}
+	if lagging {
+		return floorMs / 1000
+	}
+	return masterMs / 1000
 }

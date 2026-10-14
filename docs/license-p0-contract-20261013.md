@@ -183,7 +183,7 @@ P4 修订：
 | 状态文件 | master `<mdir>/license/state.json`；volume 第一个 `-dir` 下 `license-cache.json`；filer `-defaultStoreDir` 下 `license-cache.json`；均为写临时文件 + `fsync` + `rename` |
 | 无证书时的准入 | volume 0、filer 0；master 只允许 `-peers` ≤ 1 的新集群引导，动态加入 0（5.1） |
 | 宽限 | 10 分钟 |
-| 节点时钟 | 500 ms ticker；锚点为 `LicenseUpdate.master_now_unix_ms`（P1 修订为毫秒）加锚定后的单调流逝 |
+| 节点时钟 | 500 ms ticker；锚点为 `LicenseUpdate.master_now_unix_ms`（P1 修订为毫秒）加锚定后的单调流逝，不早于本地墙钟减 5 分钟（2026-10-14 修订，计划 4.3） |
 | 账本批次 | ≤ 5 秒合并一次，在途至多一个，超时 5 秒 |
 | 锁内 RPC 截止 | 单 peer 3 秒、整体 10 秒 |
 | 时钟可疑阈值 | 墙钟 < 水位 − 5 秒；水位每 60 秒落盘 |
@@ -372,7 +372,7 @@ P3 修订：
 - webdav 读入口对隐藏条目返回 `ErrContentHidden`（上游 webdav 不读 `Entry.Content`，内联文件本就返回全零，这一上游缺陷未改）。
 - mount：来自 meta cache 的隐藏条目在新句柄上首次读取立即重取一次，之后 ≥ 5 秒一次；mount 写入丢弃内联正文（上游行为）后清除隐藏标志。
 - 8.2 的 S20 中“mount 硬链接后正文完整”“mount 截断到 0 得到空文件”原受上游缺陷限制（基线版本的 mount 对内联文件做硬链接即返回 `EIO` 并清空原正文，`truncate -s 0` 对内联文件不生效），P3 已修复并验证。写入合并规则补充：带 `content_hidden` 新建的名字不存在已有条目但带 `hard_link_id` 时，以共享的硬链接数据作为已有条目；隐藏正文的文件截断到非 0 长度返回 `CONTENT_HIDDEN`。
-- 边界补充：master 的 gRPC `GetLicense(include_state=true)`（master 之间对账用）不鉴权，能连 master 的任何客户端都可取得 `internal_read_key`；filer 按 `notification.toml` 发往外部队列的事件不隐藏内联正文。前者与 5.2 第 6 条同属计划 1.3 列出的令牌取得途径；gRPC mTLS 只对没有集群证书的第三方有效，不作为部署要求（2026-10-14 修订）。
+- 边界补充：master 的 gRPC `GetLicense(include_state=true)`（master 之间对账用）不鉴权，能连 master 的任何客户端都可取得 `internal_read_key`；filer 按 `notification.toml` 发往外部队列的事件不隐藏内联正文。2026-10-14 修订：前者已加固，master 之间的 `GetLicense(include_state=true)`、`GetLedger`、`SyncLicense`、`SyncLedger` 只接受来源 IP 属于 raft 成员、`-peers` 或 `[master.license] peer_ips` 的调用，其余返回 `PermissionDenied`（计划 1.3、8.4）；gRPC mTLS 不作为部署要求。
 
 ---
 

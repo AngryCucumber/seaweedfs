@@ -26,6 +26,14 @@ type = "raft"     # Choose [raft|snowflake] type for storing the file id sequenc
 sequencer_snowflake_id = 0     # any number between 1~1023
 
 
+[master.license]
+# Masters accept the master-to-master license RPCs only from the addresses
+# of raft members and -peers. List extra IPs or CIDRs here, comma separated,
+# when a master reaches the others from a different address (NAT, another
+# network interface).
+peer_ips = ""
+
+
 # configurations for tiered cloud storage
 # old volumes are transparently moved to cloud for cost efficiency
 [storage.backend]

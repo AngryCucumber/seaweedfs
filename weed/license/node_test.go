@@ -217,6 +217,33 @@ func TestNodeClockUsesMilliseconds(t *testing.T) {
 	}
 }
 
+func TestNodeClockLocalFloor(t *testing.T) {
+	local := int64(t2026 + 1000)
+	n, ft := newTestNode(t, "", local)
+	c := certWith(t, 1, t2026, t2026+800, FeatureDataRead)
+	// A master four minutes behind the local clock is still followed.
+	n.Apply(&Update{ClusterID: testDeployment, MasterNowUnixMs: (local - 240) * 1000, NewestCertificate: c.Raw()})
+	if got := n.Guard().Now(); got != local-240 || n.clock.lagging {
+		t.Fatalf("master time within the bound: now %d, want %d", got, local-240)
+	}
+	// Further back, the clock stops at the local wall clock minus five
+	// minutes, so a forged master time cannot hold an expired certificate.
+	n.Apply(&Update{ClusterID: testDeployment, MasterNowUnixMs: (t2026 + 100) * 1000})
+	if got := n.Guard().Now(); got != local-300 || !n.clock.lagging || !allow(n) {
+		t.Fatalf("master time far behind: now %d, want %d", got, local-300)
+	}
+	ft.add(101 * time.Second)
+	n.Tick()
+	if denyReason(n) != ReasonExpired {
+		t.Fatalf("certificate must expire on the local floor: %s", denyReason(n))
+	}
+	// A master time back within the bound is followed again.
+	n.Apply(&Update{ClusterID: testDeployment, MasterNowUnixMs: (local + 101) * 1000})
+	if got := n.Guard().Now(); got != local+101 || n.clock.lagging {
+		t.Fatalf("master time back within the bound: now %d, want %d", got, local+101)
+	}
+}
+
 func TestNodeLogDeniedRateLimit(t *testing.T) {
 	n := NewNode(testTrust(t), "")
 	n.guard.clock.Store(1000)
