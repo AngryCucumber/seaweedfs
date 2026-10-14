@@ -56,7 +56,9 @@
 
 ### 1.3 明确不封堵、作为已知边界
 
-- 内部令牌（1.4）是集群内共享的静态密钥，在 gRPC 明文内网中可被截获后用于直读 volume；`ClientType` 不鉴权，能连 master 且有空闲 filer 名额的客户端可自称 filer 经 `KeepConnected` 拿到令牌；master 之间对账用的 gRPC `GetLicense(include_state=true)` 同样不鉴权，能连 master 的任何客户端都可直接取得 `internal_read_key`（P3 补记）。开启 `security.toml` 的 gRPC mTLS 后这些都不成立，部署手册要求开启。不引入每请求 HMAC。
+- 内部令牌（1.4）是集群内共享的静态密钥，持有它就能在证书无效时直读 volume。取得途径：master 主机上的 `<mdir>/license/state.json`；master 之间对账用的 gRPC `GetLicense(include_state=true)` 不鉴权，能连 master 的任何客户端都可直接取得（P3 补记）；`ClientType` 不鉴权，能连 master 且有空闲 filer 名额的客户端可自称 filer 经 `KeepConnected` 拿到；默认部署下令牌以明文出现在 master 下发给 volume 与 filer 的 gRPC 流、filer 读 volume 的 HTTP 请求头 `X-MassDB-Internal-Read`、volume 之间与 filer 之间的 gRPC 元数据中，可被截获。不引入每请求 HMAC。
+- **gRPC mTLS 与 HTTPS 不是证书的部署要求**（2026-10-14 修订，此前写为“部署手册要求开启”）。对被授权方本人，开不开强度相同：集群 CA 与 master 主机都在其手中，上一条的前三个途径照样可用。对没有集群证书的第三方，上游默认 volume 的 GET 不鉴权（`security.toml` 的 `jwt.signing.read` 默认为空），证书有效时本就能直读，截获令牌只是在证书无效时得到同样的读取能力，属于数据保密范畴（见本节“证书不是数据保密方案”）。需要保护集群内传输时，同时开启 gRPC mTLS 与 `[https.volume]`、`[https.client]`：filer 读 volume 的令牌在 HTTP 请求头里，只开 gRPC mTLS 保护不到。运维手册列为可选项。
+- 节点以 master 下发的 `master_now_unix_ms` 为时钟锚点，不与本地墙钟比较（4.3）。能让节点连上伪造的 master、或在明文链路上改写该字段的人，配合一张该集群曾经有效的证书，可让节点把已过期的证书当作有效。与本节“整机时间回滚”同属离线证书防不住的一类，但不需要改动节点机器（2026-10-14 补记）。
 - G2 只在建流时检查，证书有效期间已开始的 gRPC 数据流在到期后不中断。
 - 同进程的 webdav（`weed server -webdav`）解析 manifest 时会经内部通道读到 manifest 块（只含 chunk id 列表）；数据块经 `fetchChunkRange` 读取，不带令牌，仍被拦。
 - **内联正文的剩余边界（v9）：** 系统豁免路径（`/etc/` 全部、`/topics/` 下的 `topic.conf` 与 `*.offset`）的正文经 gRPC 照常可读，能经 filer HTTP 写 `/etc/` 的用户可借此存取小文件；`other/java` 客户端（不在构建内）读到空正文，回写依赖 protobuf-java 保留未知字段；证书到期前已发出的订阅事件不追回。
@@ -651,4 +653,4 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 - **日志脱敏、拒绝限速、指标**（`license_state`、`license_expires_at_seconds`、`license_denied_reads_total`、`license_nodes_online/grace/limit{type}`）。
 - **部署要求**：master 先升级；`<mdir>/license/` 随 mdir 备份；volume 第一个 `-dir` 与 filer `-defaultStoreDir` 持久化；`-saveToFilerLimit=0` 为建议而非保证。
 - **性能新增工作的完整清单**（4.6）与整进程指标、补充负载（S13）。
-- **运维手册**：导出申请 → 签发 → 导入 → 续期 → 降额与宽限释放 → 存量集群升级（`license.init` → `-license.file`）→ 状态目录恢复 → 开启 gRPC mTLS → 故障排查。
+- **运维手册**：导出申请 → 签发 → 导入 → 续期 → 降额与宽限释放 → 存量集群升级（`license.init` → `-license.file`）→ 状态目录恢复 →（可选）开启 gRPC mTLS 与 HTTPS 保护集群内传输 → 故障排查。

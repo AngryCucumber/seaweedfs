@@ -300,7 +300,7 @@ P2 修订：每个 master 在 raft 启动前把 `-license.file` 按 1.5 第 1–
 3. volume→volume 的 3 个出站调用点用 `metadata.AppendToOutgoingContext` 附加令牌（本地 key 未初始化时不附加）：`volume_grpc_copy.go:207`（`doCopyFileWithThrottler`，覆盖 `VolumeCopy` 与 `VolumeEcShardsCopy`）、`operation/tail_volume.go:35`（经 `TailVolumeFromSource` 增加令牌参数）、`storage/store_ec.go:308`。令牌只加在这 3 处的 RPC ctx 上，不放进共享连接缓存，`weed server` 同进程的 shell 拿不到。
 4. `store_ec.go:308` 的附加是 **H1 的必要条件**：EC 卷的 HTTP DELETE、`BatchDelete`、`VolumeNeedleStatus` 都会经 `ReadEcShardNeedle` 读远端分片，不附加令牌会让证书无效时 EC 卷删除失败。
 5. 不拦的维护面：shell 的 move/balance/copy/fix.replication/ec.*/tier.* 都只发编排 RPC，字节在 volume 之间流动；`ReadNeedleMeta`、`VolumeNeedleStatus`、`ReadVolumeFileStatus` 只返回元数据；`VolumeTierMoveDatToRemote` 把数据写到运维配置的云端，等同运维持有磁盘（1.3 磁盘文件边界）。
-6. 剩余边界：任何能对 master 打开 `KeepConnected` 并自称 `ClientType="filer"`、且有空闲 filer 名额的 gRPC 客户端能拿到 `internal_read_key`（`ClientType` 不鉴权）；未启用 gRPC mTLS 时令牌明文传输。部署要求开启 `security.toml` 的 gRPC mTLS 才能让这两项不成立。
+6. 剩余边界：任何能对 master 打开 `KeepConnected` 并自称 `ClientType="filer"`、且有空闲 filer 名额的 gRPC 客户端能拿到 `internal_read_key`（`ClientType` 不鉴权）；未启用 gRPC mTLS 与 HTTPS 时令牌明文传输。gRPC mTLS 与 HTTPS 不作为部署要求，理由与开启方式见计划 1.3（2026-10-14 修订）。
 7. 盘点中发现的上游路径穿越漏洞（与证书无关）已在当前分支先行修复，见第 7 节；G2 的扩展名白名单与之共用 `isCopyFileExtAllowed`。
 
 P3 修订：
@@ -372,7 +372,7 @@ P3 修订：
 - webdav 读入口对隐藏条目返回 `ErrContentHidden`（上游 webdav 不读 `Entry.Content`，内联文件本就返回全零，这一上游缺陷未改）。
 - mount：来自 meta cache 的隐藏条目在新句柄上首次读取立即重取一次，之后 ≥ 5 秒一次；mount 写入丢弃内联正文（上游行为）后清除隐藏标志。
 - 8.2 的 S20 中“mount 硬链接后正文完整”“mount 截断到 0 得到空文件”原受上游缺陷限制（基线版本的 mount 对内联文件做硬链接即返回 `EIO` 并清空原正文，`truncate -s 0` 对内联文件不生效），P3 已修复并验证。写入合并规则补充：带 `content_hidden` 新建的名字不存在已有条目但带 `hard_link_id` 时，以共享的硬链接数据作为已有条目；隐藏正文的文件截断到非 0 长度返回 `CONTENT_HIDDEN`。
-- 边界补充：master 的 gRPC `GetLicense(include_state=true)`（master 之间对账用）不鉴权，能连 master 的任何客户端都可取得 `internal_read_key`；filer 按 `notification.toml` 发往外部队列的事件不隐藏内联正文。前者与 5.2 第 6 条同样只能靠 gRPC mTLS 消除。
+- 边界补充：master 的 gRPC `GetLicense(include_state=true)`（master 之间对账用）不鉴权，能连 master 的任何客户端都可取得 `internal_read_key`；filer 按 `notification.toml` 发往外部队列的事件不隐藏内联正文。前者与 5.2 第 6 条同属计划 1.3 列出的令牌取得途径；gRPC mTLS 只对没有集群证书的第三方有效，不作为部署要求（2026-10-14 修订）。
 
 ---
 
