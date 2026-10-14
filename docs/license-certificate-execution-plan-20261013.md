@@ -454,7 +454,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | P2 master 管理 | proto（先行）、manager、HTTP/gRPC、voter 多数派、任期与配置索引、对账写回、账本 `(term,revision)` 复制与对账、对账期间注册延后、加入两阶段、移除前重提交、`voters_acked`、cluster_id、令牌、水位、页面 | **已完成（2026-10-13）**，证据与差异见 8.1：`go test -race ./weed/license/` 通过（含 19 个 manager 用例）；`server/command/shell/cluster/topology/wdclient/pb` 测试通过；真实进程验证单 master、goraft 与 hashicorp 3 master、3→5 扩容与缩容、切主对账、页面导入、`license.init` 与 `-license.file`、日志无证书与令牌 | 6 天 |
 | P3 下发与拦截 | 按流对账、volume/filer 守卫、M1、G1（含 `filer.proto`、合并规则、客户端改动）、G2、缓存、内部令牌传递链、mount 错误传播、S3 两处 | **已完成（2026-10-14）**，证据与差异见 8.2：S1–S4、S6、S15–S20 真实进程通过（mount 与 `-cipher` 在 Linux 虚拟机上补测；mount 硬链接与截断的上游缺陷已修复）；S5、S7、S8 属 master 侧，P2 已验证；新增 server/filer/mount/wdclient/pb/license 单测通过 | 6.5 天 |
 | P4 节点额度 | 账本、宽限、预占、`NODE_REJECTED`（volume 与 filer）、三个 master 加入入口、无证书额度 0 与 master 启动检查 | **已完成（2026-10-14）**，证据与差异见 8.3：S9–S12 与 S21 的节点部分真实进程通过（单 master、hashicorp 3 master 强杀切主、`weed server`、基线版本升级）；10 分钟宽限实测 603 秒自动释放；新增 license 单测通过（master 加入入口与启动检查的 S21 部分 P2 已验证） | 2.5 天 |
-| P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13。**进行中**：全量检查、S14、`weed server` 一体化与 docker-compose 已完成（2026-10-14），见 8.5；其间发现并修复 goraft 全集群重启后对账卡死 | 2 天 |
+| P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13。**进行中**：全量检查、S14、`weed server` 一体化、docker-compose 与[运维手册](license-operations-manual-20261014.md)已完成（2026-10-14），见 8.5；其间发现并修复 goraft 全集群重启后对账卡死。剩 S13 | 2 天 |
 
 合计约 20.5 人天（单人，不含签发工具；签发工具为独立项目，另计，见 7.3）。v9 增量见 P0 契约 8.1。
 
@@ -547,7 +547,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 5. 指标只实现了 `license_denied_reads_total{server,path}`（prometheus 名带仓库统一前缀，为 `SeaweedFS_license_denied_reads_total`），`license_state`、`license_expires_at_seconds` 与节点数量类指标随 P4/P5。
 6. `filer.Entry.ContentHidden` 在 HTTP JSON 里的字段名是 `ContentHidden`（与该结构其它字段一样为大驼峰）。
 
-**未覆盖：** `volume.check.disk` 只在副本间有差异时才读 needle，本次集群无副本，未触发（`ReadNeedleBlob` 守卫已由探测客户端验证）。`CacheRemoteObjectToLocalCluster` 未接远端存储，只有代码路径。S14（新旧混部）未测。被拒准入（`NODE_REJECTED`）的节点侧处理已实现，master 侧在 P4 接入（已接入，见 8.3）。
+**未覆盖：** `volume.check.disk` 只在副本间有差异时才读 needle，本次集群无副本，未触发（`ReadNeedleBlob` 守卫已由探测客户端验证）。`CacheRemoteObjectToLocalCluster` 未接远端存储，只有代码路径。S14（新旧混部）未测（P5 已测，见 8.5）。被拒准入（`NODE_REJECTED`）的节点侧处理已实现，master 侧在 P4 接入（已接入，见 8.3）。
 
 ### 8.3 P4 实施记录（2026-10-14）
 
@@ -586,7 +586,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 
 **观察（未改）：** 重启后重新加入的 follower 在下一个账本批次之前持有旧副本：批次只要求 voter 多数派确认，不向落后者补发。切主时对账按多数派取最高版本，S10 切主验证中该 follower 也在对账写回后追平，不影响结论。
 
-**未覆盖：** S9 中“让某个 follower 的 KeepConnected 落后数分钟再强杀 leader”未单独构造：follower master 不从 KeepConnected 应用授权或账本（8.1 差异 1），账本只经 `SyncLedger` 复制、切主按多数派对账，该结论由结构保证，并有 P2 单测。goraft 多 master 的切主准入未测（hashicorp 已测，准入代码不区分 raft 实现）。S13 的 200 个 volume 集中重连属 P5。被拒 filer 的 mount 读取边界见 1.3。
+**未覆盖：** S9 中“让某个 follower 的 KeepConnected 落后数分钟再强杀 leader”未单独构造：follower master 不从 KeepConnected 应用授权或账本（8.1 差异 1），账本只经 `SyncLedger` 复制、切主按多数派对账，该结论由结构保证，并有 P2 单测。goraft 多 master 的切主准入未测（hashicorp 已测，准入代码不区分 raft 实现；P5 docker-compose 已测，见 8.5）。S13 的 200 个 volume 集中重连属 P5。被拒 filer 的 mount 读取边界见 1.3。
 
 ### 8.4 P4 后加固（2026-10-14）
 
@@ -611,7 +611,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | `peer_ips` | 配置 `127.0.0.1` 的 master 放行回环调用，未配置的 master 仍拒绝；`peer_ips = "not-an-ip"` 启动即报错退出 |
 | 测试 | `go test -race ./weed/license/`；`CGO_ENABLED=0 go test` server、command、wdclient、shell；CI 标签构建 |
 
-**未覆盖：** 节点时钟下限只有单测（真实进程需要伪造 master）。主机名形式的 `-peers` 只以 `localhost` 做了单测，NAT、多网卡与 Kubernetes 非 headless 服务地址未测，这类部署须在 `peer_ips` 中补地址，否则选主对账拿不到多数派、注册一直延后，升级说明须写明。goraft 多 master 未测（校验不区分 raft 实现）。
+**未覆盖：** 节点时钟下限只有单测（真实进程需要伪造 master）。主机名形式的 `-peers` 只以 `localhost` 做了单测（P5 docker-compose 中 3 个 master 经容器主机名互连已验证，见 8.5），NAT、多网卡与 Kubernetes 非 headless 服务地址未测，这类部署须在 `peer_ips` 中补地址，否则选主对账拿不到多数派、注册一直延后，升级说明须写明。goraft 多 master 未测（校验不区分 raft 实现；P5 docker-compose 已验证，见 8.5）。
 
 **环境记录：** 本机 macOS 上 `weed/server` 等包的测试二进制在依赖 `github.com/shoenig/go-m1cpu` 的 cgo 初始化时崩溃，与改动无关，以 `CGO_ENABLED=0` 运行。
 
@@ -654,6 +654,8 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | 到期与续期 | 到期后 S3 GetObject 403 `AccessDenied`（原因头 `EXPIRED`），filer、volume GET 403，S3 Put、filer POST 与 HEAD 不受影响；在 leader 导入序号 2：`peers_failed` 为空，2 秒内读取恢复 |
 
 部署注意：上游独立 `weed s3` 默认只绑定 localhost，容器里须加 `-ip.bind=0.0.0.0`（上游 `seaweedfs-compose.yml` 同样如此）。
+
+**运维手册（2026-10-14）：** [license-operations-manual-20261014.md](license-operations-manual-20261014.md)，覆盖第 10 节所列流程，命令、接口、错误码与指标按代码核对。编写中发现一处可用性缺口：`GET /license` 只给出三类节点的数量，不列出宽限中的地址，`DELETE /license/nodes/{addr}` 需要运维自己找地址；master 之间的 `GetLedger` 自 8.4 起只对 master 开放。已补：`GET /license`（及 `license.show`）新增 `grace_nodes`，每项为 `type`、`address`、`last_seen`、`release_at`（`last_seen` + 10 分钟），master 页面 License 区块增加 “In grace” 行；各 master 按本地账本副本给出。单测扩展 `TestManagerAdmissionAndRelease`；真实进程中 volume 停止后 HTTP、shell 与页面都列出 `127.0.0.1:8680`，按该地址 `DELETE` 后列表清空。
 
 **`weed server` 一体化（2026-10-14，本机，`server -filer -s3 -webdav`，非默认端口）：**
 
@@ -740,4 +742,4 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 - **日志脱敏、拒绝限速、指标**（`license_state`、`license_expires_at_seconds`、`license_denied_reads_total`、`license_nodes_online/grace/limit{type}`）。
 - **部署要求**：master 先升级；`<mdir>/license/` 随 mdir 备份；volume 第一个 `-dir` 与 filer `-defaultStoreDir` 持久化；`-saveToFilerLimit=0` 为建议而非保证。
 - **性能新增工作的完整清单**（4.6）与整进程指标、补充负载（S13）。
-- **运维手册**：导出申请 → 签发 → 导入 → 续期 → 降额与宽限释放 → 存量集群升级（`license.init` → `-license.file`）→ 状态目录恢复 →（可选）开启 gRPC mTLS 与 HTTPS 保护集群内传输 → 故障排查（含 master 经 NAT 或其它网卡互连时配置 `[master.license] peer_ips`，见 8.4）。
+- **运维手册**（已完成，见 [license-operations-manual-20261014.md](license-operations-manual-20261014.md)）：导出申请 → 签发 → 导入 → 续期 → 降额与宽限释放 → 存量集群升级（`license.init` → `-license.file`）→ 状态目录恢复 →（可选）开启 gRPC mTLS 与 HTTPS 保护集群内传输 → 故障排查（含 master 经 NAT 或其它网卡互连时配置 `[master.license] peer_ips`，见 8.4）。
