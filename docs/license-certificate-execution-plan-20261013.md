@@ -454,7 +454,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | P2 master 管理 | proto（先行）、manager、HTTP/gRPC、voter 多数派、任期与配置索引、对账写回、账本 `(term,revision)` 复制与对账、对账期间注册延后、加入两阶段、移除前重提交、`voters_acked`、cluster_id、令牌、水位、页面 | **已完成（2026-10-13）**，证据与差异见 8.1：`go test -race ./weed/license/` 通过（含 19 个 manager 用例）；`server/command/shell/cluster/topology/wdclient/pb` 测试通过；真实进程验证单 master、goraft 与 hashicorp 3 master、3→5 扩容与缩容、切主对账、页面导入、`license.init` 与 `-license.file`、日志无证书与令牌 | 6 天 |
 | P3 下发与拦截 | 按流对账、volume/filer 守卫、M1、G1（含 `filer.proto`、合并规则、客户端改动）、G2、缓存、内部令牌传递链、mount 错误传播、S3 两处 | **已完成（2026-10-14）**，证据与差异见 8.2：S1–S4、S6、S15–S20 真实进程通过（mount 与 `-cipher` 在 Linux 虚拟机上补测；mount 硬链接与截断的上游缺陷已修复）；S5、S7、S8 属 master 侧，P2 已验证；新增 server/filer/mount/wdclient/pb/license 单测通过 | 6.5 天 |
 | P4 节点额度 | 账本、宽限、预占、`NODE_REJECTED`（volume 与 filer）、三个 master 加入入口、无证书额度 0 与 master 启动检查 | **已完成（2026-10-14）**，证据与差异见 8.3：S9–S12 与 S21 的节点部分真实进程通过（单 master、hashicorp 3 master 强杀切主、`weed server`、基线版本升级）；10 分钟宽限实测 603 秒自动释放；新增 license 单测通过（master 加入入口与启动检查的 S21 部分 P2 已验证） | 2.5 天 |
-| P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13。**进行中**：全量检查与 S14 已完成（2026-10-14），见 8.5 | 2 天 |
+| P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13。**进行中**：全量检查、S14、`weed server` 一体化与 docker-compose 已完成（2026-10-14），见 8.5；其间发现并修复 goraft 全集群重启后对账卡死 | 2 天 |
 
 合计约 20.5 人天（单人，不含签发工具；签发工具为独立项目，另计，见 7.3）。v9 增量见 P0 契约 8.1。
 
@@ -639,6 +639,31 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 **结论：** 与计划一致，必须同批升级：旧 volume、旧 filer 照常提供读取，而旧 filer 在证书无效时还会读不到新 volume 上的块（含内部维护读取），混部比全旧或全新都差。master 回退不会撤销已缓存的授权，放行持续到缓存证书到期（4.4）；无缓存的新节点为 `NOT_READY`。运维手册的升级步骤按“master 先升级，再同批升级全部 volume 与 filer”写。
 
 **未覆盖：** 新旧 master 混在同一 raft 组未测（部署要求 master 先整体升级）；S14 只在单 master 上做。
+
+**docker-compose（2026-10-14，本机 Docker Desktop，镜像为 HEAD 的 linux/arm64 静态二进制加测试根，基于 `alpine:3.22`）：** 新增 [local-license-compose.yml](../docker/compose/local-license-compose.yml)：3 个 goraft master（`-license.file` 只读挂载）、3 个 volume、filer、s3，全部状态在命名卷上；第 4 个 volume 在 `extra` profile。文件头写了首次部署步骤（`license.init` → 签发 → `up`）。
+
+| 场景 | 结果 |
+| --- | --- |
+| 缺证书文件 | master 以 `license: -license.file: open /license/cert.jws: no such file or directory` 退出（255） |
+| 首次部署 | `docker compose run --rm masterN license.init` 三台得到同一 `deployment_id`；签发后 `up`：3 台 `voters_acked`，3 个 volume、1 个 filer 注册，follower 账本一致；master 之间按容器主机名调用，来源校验无误拒（主机名解析路径首次在真实环境验证） |
+| 读写 | S3 建桶、Put、Get，filer POST/GET，volume 直读均正常 |
+| 来源校验 | 在 volume1 容器内以探针调用 master 之间的 4 个 RPC：均 `PermissionDenied license: caller 172.21.0.6 is not a master of this cluster` |
+| 额度 | volume4 被拒 `NODE_LIMIT_EXCEEDED`，本地 GET 403 `NODE_REJECTED` |
+| goraft 强杀 leader | 约 15 秒选出新 leader 并对账（goraft 选举超时较长），读取不中断；新 leader 以 `3/3` 拒绝 volume4（原 3 个 volume 的宽限名额保留），原 3 个 volume 约 25 秒内重新注册；旧 leader 重启后 3 台确认。补上 8.3 未覆盖的 goraft 切主准入 |
+| 全集群重启（`down` 后 `up`，保留卷） | **发现缺陷**：新 leader 在 term 0 当选，写回的账本版本 `(0, 1)` 低于 follower 磁盘上的 `(1, 4)` 被拒，对账一直重试，所有 volume 与 filer 注册被延后，集群不可用。修复见 3.4“raft 任期回退”与单测 `TestManagerLedgerSurvivesTermReset`（去掉修复即以 `RECONCILING` 失败）。修复后镜像在卡死状态上直接恢复，再做一次全集群重启：term 0 对账完成，约 30 秒内全部节点注册，S3 与 filer 可读。以最终代码从全新部署复验：强杀 leader 后 29 秒、连续两次全集群重启后各 23 秒，恢复到 3 个 volume 与 filer 全部注册且 S3 可读（含 goraft 选主时间）；`state.json` 与缓存文件权限 0600、目录 0700 |
+| 到期与续期 | 到期后 S3 GetObject 403 `AccessDenied`（原因头 `EXPIRED`），filer、volume GET 403，S3 Put、filer POST 与 HEAD 不受影响；在 leader 导入序号 2：`peers_failed` 为空，2 秒内读取恢复 |
+
+部署注意：上游独立 `weed s3` 默认只绑定 localhost，容器里须加 `-ip.bind=0.0.0.0`（上游 `seaweedfs-compose.yml` 同样如此）。
+
+**`weed server` 一体化（2026-10-14，本机，`server -filer -s3 -webdav`，非默认端口）：**
+
+| 场景 | 结果 |
+| --- | --- |
+| 无证书启动 | 单 master 正常引导（goraft 选主约 18 秒，上游行为）后 `NO_LICENSE`；内置 volume GET 403 `NODE_REJECTED`，filer、S3、webdav 端口不监听 |
+| 导入（4 分钟证书） | 2 秒内 filer、S3、webdav 上线；S3 读写、filer 12 MB 分块文件（`maxMB=4`）与 webdav 下载的 MD5 一致 |
+| 到期 | S3 GetObject 403 `AccessDenied`（`EXPIRED`），filer GET 403，webdav 下载中断（200 后 0 字节，curl 退出码 18）；S3 与 filer 写入正常 |
+| 续期 | 导入序号 2，4 秒内 S3 与 webdav 恢复 |
+| 进程重启 | 从 `state.json` 恢复 `VALID`（序号 2），约 20 秒（主要是 goraft 选主）后 S3、filer、webdav 可读，数据一致 |
 
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 
