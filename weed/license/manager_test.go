@@ -3,9 +3,11 @@ package license
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +31,8 @@ type fakeCluster struct {
 	dirs     map[string]string
 	// onSync runs before every SyncLicense delivery.
 	onSync func(peer string)
+	// onLedgerSync runs before every SyncLedger delivery.
+	onLedgerSync func(peer string)
 }
 
 func newFakeCluster(t *testing.T, voters ...string) *fakeCluster {
@@ -199,6 +203,9 @@ func (p *fakePeers) SyncLicense(ctx context.Context, peer string, from LeaderInf
 }
 
 func (p *fakePeers) SyncLedger(ctx context.Context, peer string, from LeaderInfo, l LedgerSnapshot) error {
+	if p.c.onLedgerSync != nil {
+		p.c.onLedgerSync(peer)
+	}
 	m, err := p.target(peer)
 	if err != nil {
 		return err
@@ -767,6 +774,72 @@ func TestManagerPrevConverges(t *testing.T) {
 	if prevSeq("a") != 3 || a.Status().Status != ReasonValid {
 		t.Fatalf("a prev %d, status %s after reconcile", prevSeq("a"), a.Status().Status)
 	}
+}
+
+// TestManagerAdmissionNotBlockedBySlowPeer is the S13 case of 200 volume
+// servers registering at once while one voter is unreachable and another
+// answers SyncLedger after 2 seconds: ledger RPCs run outside the manager
+// lock, so registrations do not wait for the batch in flight.
+func TestManagerAdmissionNotBlockedBySlowPeer(t *testing.T) {
+	c := newFakeCluster(t, "a", "b", "c")
+	c.startAll()
+	term := c.elect("a")
+	a := c.m("a")
+	if _, err := a.Import(certRaw(t, 1, withLimits(3, 300, 10))); err != nil {
+		t.Fatal(err)
+	}
+	c.setDown(true, "b")
+	c.onLedgerSync = func(peer string) {
+		if peer == "c" {
+			time.Sleep(2 * time.Second)
+		}
+	}
+	if err := a.AdmitNode(NodeVolumeServer, "10.0.1.1:8080"); err != nil {
+		t.Fatal(err)
+	}
+	c.now.Add(int64(retryInterval / time.Second))
+	a.replicateLedger(term)
+	inFlight := func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.ledgerSending
+	}
+	if !inFlight() {
+		t.Fatal("no ledger batch in flight")
+	}
+
+	const n = 200
+	lat := make([]time.Duration, n)
+	errs := make([]error, n)
+	gate := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-gate
+			start := time.Now()
+			errs[i] = a.AdmitNode(NodeVolumeServer, fmt.Sprintf("10.0.0.%d:%d", i/250, 8080+i%250))
+			lat[i] = time.Since(start)
+		}(i)
+	}
+	close(gate)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("node %d: %v", i, err)
+		}
+	}
+	if !inFlight() {
+		t.Fatal("the slow batch finished before the registrations; the test proves nothing")
+	}
+	sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
+	p99 := lat[n*99/100-1]
+	t.Logf("registration latency p50 %v p99 %v max %v while a batch waits 2s for a voter", lat[n/2], p99, lat[n-1])
+	if p99 > 200*time.Millisecond {
+		t.Fatalf("p99 %v: registrations waited for the slow voter", p99)
+	}
+	waitFor(t, "the slow batch to finish", func() bool { return !inFlight() })
 }
 
 func TestManagerAdmissionAndRelease(t *testing.T) {
