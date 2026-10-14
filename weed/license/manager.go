@@ -154,6 +154,10 @@ type Manager struct {
 	clock     ClockState
 	ledger    *Ledger
 	ledgerVer LedgerVersion
+	// ledgerEpoch is the term part of the ledger versions this master
+	// writes as leader; epochFor is the raft term+1 it was chosen for, 0 for
+	// none (see ledgerEpochFor).
+	ledgerEpoch, epochFor uint64
 	// rev changes with the cluster id, certificates or key.
 	rev uint64
 	// acked maps a peer to the rev it confirmed during ackedTerm (leader only).
@@ -335,11 +339,28 @@ func (m *Manager) stateLocked() State {
 // with different content: unsent changes get a fresh version, which stays
 // pending until a batch commits it to a voter majority.
 func (m *Manager) ledgerForPushLocked(term uint64) LedgerSnapshot {
-	if m.ledgerDirty || m.ledgerVer.Term != term {
-		m.ledgerVer = nextLedgerVersion(m.ledgerVer, term)
+	epoch := term
+	if m.epochFor == term+1 {
+		epoch = m.ledgerEpoch
+	}
+	if m.ledgerDirty || m.ledgerVer.Term != epoch {
+		m.ledgerVer = nextLedgerVersion(m.ledgerVer, epoch)
 		m.ledgerDirty, m.ledgerPending = false, true
 	}
 	return LedgerSnapshot{LedgerVersion: m.ledgerVer, Entries: m.ledger.Entries()}
+}
+
+// ledgerEpochFor returns the term part of the ledger versions a leader of
+// raft term writes after its reconcile saw seen as the highest version. It
+// is the raft term unless that went backwards: goraft deletes its log on
+// every start, so after all masters restart the terms count from 0 again
+// while state.json keeps the old ledger versions. The epoch then continues
+// above the highest seen, so the new leader's versions still win.
+func ledgerEpochFor(seen LedgerVersion, term uint64) uint64 {
+	if seen.Term >= term {
+		return seen.Term + 1
+	}
+	return term
 }
 
 func nextLedgerVersion(cur LedgerVersion, term uint64) LedgerVersion {
@@ -541,7 +562,13 @@ func (m *Manager) reconcileLocked(ctx context.Context, term uint64) error {
 		m.clock = best.clock
 	}
 	m.ledger = recovered
-	m.ledgerVer = nextLedgerVersion(maxVersion(m.ledgerVer, bestLedger.LedgerVersion), term)
+	seen := maxVersion(m.ledgerVer, bestLedger.LedgerVersion)
+	// A retry in the same term keeps its epoch unless it now sees a
+	// version above it.
+	if m.epochFor != term+1 || seen.Term > m.ledgerEpoch {
+		m.ledgerEpoch, m.epochFor = ledgerEpochFor(seen, term), term+1
+	}
+	m.ledgerVer = nextLedgerVersion(seen, m.ledgerEpoch)
 	m.ledgerDirty, m.ledgerPending = false, true
 	st, rev := m.stateLocked(), m.rev
 	led := LedgerSnapshot{LedgerVersion: m.ledgerVer, Entries: m.ledger.Entries()}

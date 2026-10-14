@@ -556,6 +556,69 @@ func TestManagerLedgerReplicationAndTakeOver(t *testing.T) {
 	}
 }
 
+func TestManagerLedgerSurvivesTermReset(t *testing.T) {
+	c := newFakeCluster(t, "a", "b", "c")
+	c.startAll()
+	first := c.elect("a")
+	if _, err := c.m("a").Import(certRaw(t, 1, withLimits(3, 2, 1))); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.m("a").AdmitNode(NodeVolumeServer, "v1:8080"); err != nil {
+		t.Fatal(err)
+	}
+	batchDone := func(id string) func() bool {
+		return func() bool {
+			m := c.m(id)
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			return !m.ledgerSending && !m.ledgerPending
+		}
+	}
+	c.m("a").replicateLedger(first)
+	waitFor(t, "ledger batch", batchDone("a"))
+	c.elect("b")
+	before := c.m("b").Ledger().LedgerVersion
+
+	// goraft deletes its log on start: after all masters restart, terms
+	// count from the beginning again while state.json keeps the ledger.
+	c.mu.Lock()
+	c.term = 0
+	c.mu.Unlock()
+	c.startAll()
+	term := c.elect("c")
+	if term > before.Term {
+		t.Fatalf("test needs a raft term below the ledger term %d, got %d", before.Term, term)
+	}
+	if _, err := c.m("c").leaderTerm(); err != nil {
+		t.Fatal("reconcile after a term reset:", err)
+	}
+	l := c.m("c").Ledger()
+	if !before.Less(l.LedgerVersion) || len(l.Entries) != 1 || l.Entries[0].Address != "v1:8080" {
+		t.Fatalf("ledger %+v after %+v", l, before)
+	}
+	for _, id := range []string{"a", "b"} {
+		if got := c.m(id).Ledger().LedgerVersion; got != l.LedgerVersion {
+			t.Fatalf("%s holds %+v, want %+v", id, got, l.LedgerVersion)
+		}
+	}
+
+	// Batches in this term keep the epoch and move the revision.
+	c.m("c").AdmitNode(NodeVolumeServer, "v2:8080")
+	c.now.Add(int64(retryInterval / time.Second))
+	c.m("c").replicateLedger(term)
+	waitFor(t, "ledger batch", batchDone("c"))
+	next := c.m("a").Ledger().LedgerVersion
+	if next.Term != l.Term || next.Revision != l.Revision+1 {
+		t.Fatalf("batch version %+v after %+v", next, l.LedgerVersion)
+	}
+
+	// The next leader, still below the old terms, writes above it again.
+	c.elect("a")
+	if got := c.m("a").Ledger().LedgerVersion; !next.Less(got) || c.m("b").Ledger().LedgerVersion != got {
+		t.Fatalf("next leader %+v after %+v", got, next)
+	}
+}
+
 func TestManagerAdmissionAndRelease(t *testing.T) {
 	c := newFakeCluster(t, "a")
 	a := c.start("a", nil)
