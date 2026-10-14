@@ -454,7 +454,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | P2 master 管理 | proto（先行）、manager、HTTP/gRPC、voter 多数派、任期与配置索引、对账写回、账本 `(term,revision)` 复制与对账、对账期间注册延后、加入两阶段、移除前重提交、`voters_acked`、cluster_id、令牌、水位、页面 | **已完成（2026-10-13）**，证据与差异见 8.1：`go test -race ./weed/license/` 通过（含 19 个 manager 用例）；`server/command/shell/cluster/topology/wdclient/pb` 测试通过；真实进程验证单 master、goraft 与 hashicorp 3 master、3→5 扩容与缩容、切主对账、页面导入、`license.init` 与 `-license.file`、日志无证书与令牌 | 6 天 |
 | P3 下发与拦截 | 按流对账、volume/filer 守卫、M1、G1（含 `filer.proto`、合并规则、客户端改动）、G2、缓存、内部令牌传递链、mount 错误传播、S3 两处 | **已完成（2026-10-14）**，证据与差异见 8.2：S1–S4、S6、S15–S20 真实进程通过（mount 与 `-cipher` 在 Linux 虚拟机上补测；mount 硬链接与截断的上游缺陷已修复）；S5、S7、S8 属 master 侧，P2 已验证；新增 server/filer/mount/wdclient/pb/license 单测通过 | 6.5 天 |
 | P4 节点额度 | 账本、宽限、预占、`NODE_REJECTED`（volume 与 filer）、三个 master 加入入口、无证书额度 0 与 master 启动检查 | **已完成（2026-10-14）**，证据与差异见 8.3：S9–S12 与 S21 的节点部分真实进程通过（单 master、hashicorp 3 master 强杀切主、`weed server`、基线版本升级）；10 分钟宽限实测 603 秒自动释放；新增 license 单测通过（master 加入入口与启动检查的 S21 部分 P2 已验证） | 2.5 天 |
-| P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13 | 2 天 |
+| P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13。**进行中**：全量检查与 S14 已完成（2026-10-14），见 8.5 | 2 天 |
 
 合计约 20.5 人天（单人，不含签发工具；签发工具为独立项目，另计，见 7.3）。v9 增量见 P0 契约 8.1。
 
@@ -614,6 +614,31 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 **未覆盖：** 节点时钟下限只有单测（真实进程需要伪造 master）。主机名形式的 `-peers` 只以 `localhost` 做了单测，NAT、多网卡与 Kubernetes 非 headless 服务地址未测，这类部署须在 `peer_ips` 中补地址，否则选主对账拿不到多数派、注册一直延后，升级说明须写明。goraft 多 master 未测（校验不区分 raft 实现）。
 
 **环境记录：** 本机 macOS 上 `weed/server` 等包的测试二进制在依赖 `github.com/shoenig/go-m1cpu` 的 cgo 初始化时崩溃，与改动无关，以 `CGO_ENABLED=0` 运行。
+
+### 8.5 P5 实施记录（进行中）
+
+**全量检查（2026-10-14，HEAD `816a90c0b`；基线 `fdbe524f3`，不含证书代码）：**
+
+| 项 | 方式 | 结果 |
+| --- | --- | --- |
+| `go test`（Linux，CI 命令） | Parallels 虚拟机（Fedora 42 aarch64）装 Go 1.26.4，源码为 HEAD 加 `go mod vendor`；`go test -count=1 -p 4 -tags "elastic gocdk sqlite ydb tikv rclone" ./...`，cgo 开启（gcc 15），`-mod=vendor`、`GOPROXY=off`，在只有回环的独立网络命名空间（`unshare -n`）内以 `nice -n 19` 运行，避免测试中写死的 `localhost:9333` 等连到虚拟机上在线的 massdb-oss | 47 个包通过，90 个包无测试文件，无失败，退出码 0；虚拟机上在线服务的端口与进程不受影响 |
+| `go test`（本机 macOS） | 同上标签，`CGO_ENABLED=0`（8.4 环境记录） | 46 个包通过，无失败；`weed`、`command`、`filer/tikv` 编译失败：`tikv` 标签引入的 `gosigar` 在 darwin 上需要 cgo。`command` 去掉 `tikv` 标签后通过，另两个包无测试文件 |
+| `go vet` | `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go vet -tags <CI 标签> ./...`，HEAD 与基线各跑一次 | 两边各 31 条，去掉行号后完全一致（上游既有：unkeyed fields、unreachable code、copylocks 等），证书改动无新增 |
+| 构建 | `CGO_ENABLED=0 go build`（本机）；`GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags <CI 标签>` | 均通过 |
+| Benchmark | `go test -run '^$' -bench . -benchmem ./weed/license/` | `BenchmarkGuardAllowRead`：单核 0.59 ns/op（`-cpu 1`），18 核并行 0.053 ns/op，均 0 分配，与 P1 一致 |
+
+**S14 新旧版本混部（2026-10-14，单 master；旧版为基线 `fdbe524f3` 构建）：**
+
+| 组合 | 结果 |
+| --- | --- |
+| 旧 master + 新 volume、新 filer，无缓存 | volume POST 201，GET 403 `NOT_READY`；filer POST 201，HEAD 与 `?metadata=true` 200，GET 403 `NOT_READY`；节点不写缓存文件 |
+| 新 master（5 分钟证书）+ 新 volume、新 filer + 旧 volume、旧 filer | 导入前旧 volume 收到 `PermissionDenied license: NODE_LIMIT_EXCEEDED` 并按既有循环重试；导入后 4 个节点都注册，旧节点同样占名额（volume 2/3、filer 2/2）；旧 `weed shell` 的 `volume.list`、`fs.ls` 正常 |
+| 同上，证书到期后 | master `EXPIRED`；新 volume、新 filer GET 403 `EXPIRED`（新 filer 读旧 volume 上的文件也 403，由 F1 拦）；**旧 volume GET 200，旧 filer 读旧 volume 上的文件 200**，不拦截；旧 filer 读新 volume 上的块返回 500（`read chunk ... 403 Forbidden`，旧 filer 没有内部令牌，manifest 解析等维护读取同样失败）；新旧 filer 写入均 201 |
+| 新节点已有缓存，master 回退到旧版 | 旧 master 不下发授权帧，新 volume 与新 filer 按缓存证书继续放行（GET 200），写入 201；换回新 master 后节点重新注册，状态恢复 |
+
+**结论：** 与计划一致，必须同批升级：旧 volume、旧 filer 照常提供读取，而旧 filer 在证书无效时还会读不到新 volume 上的块（含内部维护读取），混部比全旧或全新都差。master 回退不会撤销已缓存的授权，放行持续到缓存证书到期（4.4）；无缓存的新节点为 `NOT_READY`。运维手册的升级步骤按“master 先升级，再同批升级全部 volume 与 filer”写。
+
+**未覆盖：** 新旧 master 混在同一 raft 组未测（部署要求 master 先整体升级）；S14 只在单 master 上做。
 
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 
