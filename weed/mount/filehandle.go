@@ -48,8 +48,12 @@ type FileHandle struct {
 	cachedRemote       atomic.Pointer[filer_pb.Entry]
 	remoteDownloadLock sync.Mutex
 	// lastWriteTsNs is the timestamp of the last write on this handle
-	// (writeTsNs); used under the handle's exclusive lock.
+	// (writeTsNs); used under the handle's exclusive lock. chunkTsNs is at
+	// least the newest timestamp of the chunks the entry has had, raised
+	// whenever chunks come in (noteChunks); it only grows, so a write
+	// needs no look at the chunks, which uploads append concurrently.
 	lastWriteTsNs int64
+	chunkTsNs     atomic.Int64
 
 	// for debugging
 	mirrorFile *os.File
@@ -100,6 +104,7 @@ func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
 		if resolveManifestErr != nil {
 			glog.Warningf("failed to resolve manifest chunks in %s: %v", entry.Name, resolveManifestErr)
 		}
+		fh.noteChunks(entry.Chunks, fh.entryChunkGroup)
 		// Reads fail instead of returning zeros until the chunks resolve
 		// or the content is no longer hidden (plan 1.6).
 		fh.setEntryReadFailure(entry, resolveManifestErr)
@@ -129,21 +134,34 @@ func (fh *FileHandle) writeTsNs() int64 {
 	if fh.lastWriteTsNs >= tsNs {
 		tsNs = fh.lastWriteTsNs + 1
 	}
-	for _, chunk := range fh.entry.GetEntry().GetChunks() {
-		if chunk.ModifiedTsNs >= tsNs {
-			tsNs = chunk.ModifiedTsNs + 1
-		}
-	}
-	if fh.entryChunkGroup != nil {
-		if latest := fh.entryChunkGroup.LatestModifiedTsNs(); latest >= tsNs {
-			tsNs = latest + 1
-		}
+	if chunkTsNs := fh.chunkTsNs.Load(); chunkTsNs >= tsNs {
+		tsNs = chunkTsNs + 1
 	}
 	fh.lastWriteTsNs = tsNs
 	return tsNs
 }
 
+// noteChunks raises chunkTsNs to the newest timestamp of chunks and of
+// group, the chunk group built from them with manifests resolved. Called
+// wherever chunks come into the entry.
+func (fh *FileHandle) noteChunks(chunks []*filer_pb.FileChunk, group *filer.ChunkGroup) {
+	var tsNs int64
+	for _, chunk := range chunks {
+		tsNs = max(tsNs, chunk.ModifiedTsNs)
+	}
+	if group != nil {
+		tsNs = max(tsNs, group.LatestModifiedTsNs())
+	}
+	for {
+		current := fh.chunkTsNs.Load()
+		if tsNs <= current || fh.chunkTsNs.CompareAndSwap(current, tsNs) {
+			return
+		}
+	}
+}
+
 func (fh *FileHandle) AddChunks(chunks []*filer_pb.FileChunk) {
+	fh.noteChunks(chunks, nil)
 	fh.entry.AppendChunks(chunks)
 }
 

@@ -188,6 +188,7 @@ func (fh *FileHandle) takeCachedEntry(cached *filer_pb.Entry, group *filer.Chunk
 		fh.entry.SetEntry(cached)
 	}
 	fh.entryChunkGroup = group
+	fh.noteChunks(cached.Chunks, group)
 }
 
 // takeCachedContent puts the cached content of a remote object into e: inline

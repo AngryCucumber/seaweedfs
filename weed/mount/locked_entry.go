@@ -31,6 +31,14 @@ func (le *LockedEntry) UpdateEntry(fn func(entry *filer_pb.Entry)) *filer_pb.Ent
 	return le.Entry
 }
 
+// IsInRemoteOnly reports whether the content is only in remote storage,
+// read under the lock uploads append chunks with.
+func (le *LockedEntry) IsInRemoteOnly() bool {
+	le.RLock()
+	defer le.RUnlock()
+	return le.Entry.IsInRemoteOnly()
+}
+
 func (le *LockedEntry) GetChunks() []*filer_pb.FileChunk {
 	le.RLock()
 	defer le.RUnlock()

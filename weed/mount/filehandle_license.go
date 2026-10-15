@@ -228,6 +228,7 @@ func (fh *FileHandle) takeRefetchedEntry(f *readFailure, fresh *filer_pb.Entry, 
 		}
 	}
 	fh.entryChunkGroup = group
+	fh.noteChunks(fresh.Chunks, group)
 	fh.hiddenCut.Store(0)
 	return replaced, nil
 }

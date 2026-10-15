@@ -216,7 +216,7 @@ func TestLocalEntryFromFiler(t *testing.T) {
 }
 
 // testWFS is a mount with handles kept in memory; nothing reaches a filer.
-func testWFS(t *testing.T) *WFS {
+func testWFS(t testing.TB) *WFS {
 	mapper, err := meta_cache.NewUidGidMapper("", "")
 	if err != nil {
 		t.Fatal(err)
@@ -737,6 +737,59 @@ func TestWriteNewerThanFilerChunks(t *testing.T) {
 	}
 	if fh.lastWriteTsNs <= second {
 		t.Fatalf("copy at %d after the write at %d", fh.lastWriteTsNs, second)
+	}
+}
+
+// Chunks of finished uploads are appended to the entry under its own lock
+// while writes run: a write does not read the chunks, and is later than
+// the appended ones.
+func TestWriteAfterUploadedChunks(t *testing.T) {
+	wfs := testWFS(t)
+	fh := wfs.testOpen("/d/a", &filer_pb.Entry{Name: "a", Attributes: &filer_pb.FuseAttributes{FileMode: 0644}})
+	ahead := time.Now().Add(5 * time.Second).UnixNano()
+	const uploads = 1000
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < uploads; i++ {
+			chunk := &filer_pb.FileChunk{FileId: fmt.Sprintf("3,%x637037d6", i+1), Offset: int64(i) * 4096, Size: 4096, ModifiedTsNs: ahead + int64(i)}
+			fh.AddChunks([]*filer_pb.FileChunk{chunk})
+			fh.entryChunkGroup.AddChunk(chunk)
+		}
+	}()
+	for i := 0; i < uploads; i++ {
+		lock := wfs.fhLockTable.AcquireLock("Write", fh.fh, util.ExclusiveLock)
+		fh.writeTsNs()
+		if err := fh.cacheRemoteBeforeChange(); err != nil {
+			t.Error(err)
+		}
+		wfs.fhLockTable.ReleaseLock(fh.fh, lock)
+	}
+	wg.Wait()
+	if _, code := wfs.Write(nil, &fuse.WriteIn{Fh: uint64(fh.fh), Size: 5}, []byte("newer")); code != fuse.OK {
+		t.Fatalf("write: %v", code)
+	}
+	if fh.lastWriteTsNs <= ahead+uploads-1 {
+		t.Fatalf("write at %d, uploaded chunks up to %d", fh.lastWriteTsNs, ahead+uploads-1)
+	}
+}
+
+// The write timestamp does not depend on the number of chunks.
+func BenchmarkWriteTsNs(b *testing.B) {
+	for _, n := range []int{500, 50000} {
+		b.Run(fmt.Sprintf("chunks_%d", n), func(b *testing.B) {
+			wfs := testWFS(b)
+			entry := &filer_pb.Entry{Name: "a", Attributes: &filer_pb.FuseAttributes{FileMode: 0644}}
+			for i := 0; i < n; i++ {
+				entry.Chunks = append(entry.Chunks, &filer_pb.FileChunk{FileId: fmt.Sprintf("3,%x637037d6", i+1), Offset: int64(i) * 4096, Size: 4096, ModifiedTsNs: int64(i)})
+			}
+			fh := wfs.testOpen("/d/a", entry)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				fh.writeTsNs()
+			}
+		})
 	}
 }
 
