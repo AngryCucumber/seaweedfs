@@ -122,7 +122,7 @@ v4 处理：只在只读 HTTP 接口（M1）隐藏，gRPC 面列为边界。部�
 
 独立 `weed mount` 首次打开含 manifest 的文件时，要经 volume GET 解析 manifest，它没有内部令牌，证书无效时被拒。现有代码在 [filehandle.go:78](../weed/mount/filehandle.go:78) 对解析失败只打 `Warningf`，分块表为空；随后 [filechunk_group.go:59](../weed/filer/filechunk_group.go:59) 把缺失区间当作稀疏文件补零并返回成功，应用会拿到伪造的全零正文而不是错误。
 
-续期后对隐藏正文条目的重取（P3 实现，`refetchHiddenEntry`）**保留句柄上尚未 flush 的本地修改（2026-10-14 修订，8.6；2026-10-15 补充截断与 id 映射，8.8；同日再修订，8.9）**：取回的正文按句柄上的文件大小截断（未提交的截断），并从句柄在隐藏期间截到过的最小非 0 长度起补零（先截短再扩长时，被截掉的字节不能回来）；隐藏期间截短后又扩长、使截到的最小长度小于当前大小时，flush 返回 `EIO`（`CONTENT_HIDDEN`）而不发送，因为大小回到原值时 filer 会按纯元数据更新补回全部旧字节（其余大小 filer 本就拒绝）；`copy_file_range` 与写入一样丢弃内联正文并清除隐藏标志；整体替换时先把 filer 的 uid/gid 映射为本地 id（与 meta cache 读出时相同），meta cache 仍存 filer 的 id；证书无效期间在打开的句柄上做的 `chmod`、`chown`、`utimes`、`setfattr` 只记在句柄里，等 flush 才写回 filer；重取时若句柄有未提交修改，只取 filer 的正文、清除隐藏标志，其余字段保持本地，meta cache 等 flush 后更新；没有未提交修改时才整体替换。
+续期后对隐藏正文条目的重取（P3 实现，`refetchHiddenEntry`）**保留句柄上尚未 flush 的本地修改（2026-10-14 修订，8.6；2026-10-15 补充截断与 id 映射，8.8；同日再修订，8.9、8.10）**：重取在锁外等待 filer 应答，期间截断到 0 或句柄装入新条目都会替换句柄的读失败状态；应答回来时若句柄已不是发起时的状态，结果整个丢弃，既不装入正文，也不恢复读错误；取回的正文按句柄上的文件大小截断（未提交的截断），并从句柄在隐藏期间截到过的最小非 0 长度起补零（先截短再扩长时，被截掉的字节不能回来）；隐藏期间截短后又扩长、使截到的最小长度小于当前大小时，flush 返回 `EIO`（`CONTENT_HIDDEN`）而不发送，因为大小回到原值时 filer 会按纯元数据更新补回全部旧字节（其余大小 filer 本就拒绝）；`copy_file_range` 与写入一样丢弃内联正文并清除隐藏标志；整体替换时先把 filer 的 uid/gid 映射为本地 id（与 meta cache 读出时相同），meta cache 仍存 filer 的 id；证书无效期间在打开的句柄上做的 `chmod`、`chown`、`utimes`、`setfattr` 只记在句柄里，等 flush 才写回 filer；重取时若句柄有未提交修改，只取 filer 的正文、清除隐藏标志，其余字段保持本地，meta cache 等 flush 后更新；没有未提交修改时才整体替换。
 
 处理：`FileHandle` 记录 `resolveManifestErr` 与 `lastResolveAttempt`；读取入口（`filehandle_read.go`）在该错误非空时：若距上次尝试 ≥ 5 秒，用同一 entry 重新调用 `NewChunkGroup`，成功则清错并正常读，失败则更新时间戳并返回 `EIO`；5 秒内直接 `EIO`，不发网络请求。只在失败状态重试，正常读取不新增任何调用。这样续期或网络恢复后，原句柄与按 inode 复用的句柄（[filehandle_map.go:44](../weed/mount/filehandle_map.go:44) 只在 entry 指针变化时重解析）都会在目标 volume 新证书生效后、下一次满足重试间隔的读取时触发重解析并恢复，不需要关闭全部旧句柄；端到端时间见 S1b。写入不受该错误影响（写路径不依赖已解析的分块表）。v9 起同一入口还处理 `ContentHidden` 条目（1.5）：返回 `EIO`，失败态下 ≥ 5 秒用 `LookupDirectoryEntry` 重取，未隐藏则替换句柄条目并写回 meta cache；两类重试共用 single-flight 与节流。mount 改动合计约 40 行。同样的补零逻辑在 filer 进程内不触发：filer 的 manifest 解析带内部令牌（1.4）。S1b 验收。
 
@@ -176,7 +176,7 @@ v3 的 `(active, pending)` 加“到点激活”转换被审核证明无法定�
 1. **只有 leader 接受导入。** 导入 handler 自检 `ms.Topo.IsLeader()`，否则 503；不依赖 `proxyToLeader`（找不到 leader 时它会直接调本地 handler，[master_server.go:222](../weed/server/master_server.go:222)）。
 2. **voter 多数派。** voter 集合取自当前 raft 配置：hashicorp 用 `GetConfiguration().Configuration().Servers` 中 `Suffrage == Voter` 的成员（现有 [RaftServer.Peers()](../weed/server/raft_server.go:173) 不区分，manager 内另取；`RaftAddServer` 支持 nonvoter，[master_grpc_server_raft.go:51](../weed/server/master_grpc_server_raft.go:51)）；goraft 全部成员是 voter。多数派 = `floor(voters/2)+1`，leader 自身计入。nonvoter 也推送，不计入多数派。
 3. **`SyncLicense` 携带 `leader_address` 与 `leader_term`。** follower 只接受 `leader_address == Topo.Leader()` **且 `leader_term == 本地 raft 当前任期`**（hashicorp `CurrentTerm()`，goraft `Term()`）的请求；不用“最高已收到的 Sync 任期”，避免同一地址 term1 当选、落选、term3 再当选时 term1 的迟到请求被接受。
-4. leader 先写本地 `state.json`，再同步推送；voter 成功数（含自身）达到多数派返回 200；否则 503 `PARTIAL_COMMIT` 列出失败 peer，leader 本地保留已落盘状态。**相同字节的证书重试导入视为幂等**，只重新推送；同 `sequence` 不同内容 409。**只有状态已写入磁盘的成员才计入确认（2026-10-14 修订，8.6；2026-10-15 再修订，8.8）：** 写 `state.json` 失败时内存已是新状态，重试相同证书会被判为“未变化”而跳过写盘；第一次请求还在写盘时到达的重复请求同样会被判为“未变化”。因此每个 master 记录磁盘上状态对应的版本（授权修订号、账本版本、时钟修复序号），导入、`SyncLicense`、`SyncLedger` 应答与 leader 自身计票前都要求磁盘版本追上内存版本；没追上就等正在进行的写盘结束后再写一次，成功才确认，否则不确认（leader 自身计入 `peers_failed`）。
+4. leader 先写本地 `state.json`，再同步推送；voter 成功数（含自身）达到多数派返回 200；否则 503 `PARTIAL_COMMIT` 列出失败 peer，leader 本地保留已落盘状态。**相同字节的证书重试导入视为幂等**，只重新推送；同 `sequence` 不同内容 409。**只有状态已写入磁盘的成员才计入确认（2026-10-14 修订，8.6；2026-10-15 再修订，8.8）：** 写 `state.json` 失败时内存已是新状态，重试相同证书会被判为“未变化”而跳过写盘；第一次请求还在写盘时到达的重复请求同样会被判为“未变化”。因此每个 master 记录磁盘上状态对应的版本（授权修订号、账本版本、时钟修复序号），导入、`SyncLicense`、`SyncLedger` 应答与 leader 自身计票前都要求磁盘版本追上内存版本；没追上就等正在进行的写盘结束后再写一次，成功才确认，否则不确认（leader 自身计入 `peers_failed`）。“写盘成功”包括 rename 后同步所在目录（2026-10-15 修订，8.10）：打开或同步目录失败按写盘失败处理；Windows 不同步目录，文件系统不支持目录同步（`EINVAL`、`ENOTSUP`）时也跳过。
 5. **选主对账并写回：** 成为 leader 后向所有 peer 调 `GetLicense`，需收到 voter 多数派（含自身）的响应；按 3.2 规则选出最高状态；**然后把选中的状态同步推送到 voter 多数派并得到确认，才退出 `RECONCILING`**。对账中 `GET /license` 为 `RECONCILING`，导入与成员变更返回 503；**不向节点下发任何拒读原因**，节点保留现有授权快照并按本地时钟评估，授权层的读写行为不变（可用性仍受 master 不可用期间既有行为影响，例如 filer 拿不到新的 volume 位置）；未达多数派每 5 秒重试，不在请求路径。审核中的反例（A 的 `PARTIAL_COMMIT` 少数派状态 11 被新 leader B 选中并下发，A/B 随后不可用，C/D/E 只能恢复到 10）在 v4 里 B 必须先把 11 写到 C/D/E 中至少两台才退出对账，之后任何多数派都能看到 11。
 6. follower 启动或重连 leader 时经 KeepConnected 首帧和按流对账拿到当前状态（4.2），按 3.2 替换。**P2 实现：** 改为 leader 每 5 秒向尚未确认当前授权修订的成员重推 `SyncLicense`（带任期校验），follower master 不从 KeepConnected 应用授权状态；KeepConnected 的 `LicenseUpdate` 只给 volume/filer（P3）。
 7. **加入 voter 的两阶段流程（hashicorp）。** `SyncLicense` 要求接收方本地 raft 已认识当前 leader 且任期相同（第 3 条），全新节点在进入配置前拿不到这些状态，所以不能“先同步再加入”。顺序改为：(a) 三个加入入口先 `CheckMasterJoin()` 预占额度，然后以 **nonvoter** 加入（`AddNonvoter`）；(b) 等它的 raft 追平（`LastIndex` 接近 leader）并通过 KeepConnected 建流；(c) leader 在 manager 锁内向它 `SyncLicense` + `SyncLedger` 并等待确认，锁内同时排斥导入，因此“预同步完成到提升之间”不会漏掉新证书；(d) 确认后 `AddVoter` 提升。任一步失败保持 nonvoter 并告警，不计入 voter 多数派。`OnPeerUpdate` 与 `updatePeers` 的 `AddVoter` 改为走同一流程。
@@ -460,7 +460,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | P2 master 管理 | proto（先行）、manager、HTTP/gRPC、voter 多数派、任期与配置索引、对账写回、账本 `(term,revision)` 复制与对账、对账期间注册延后、加入两阶段、移除前重提交、`voters_acked`、cluster_id、令牌、水位、页面 | **已完成（2026-10-13）**，证据与差异见 8.1：`go test -race ./weed/license/` 通过（含 19 个 manager 用例）；`server/command/shell/cluster/topology/wdclient/pb` 测试通过；真实进程验证单 master、goraft 与 hashicorp 3 master、3→5 扩容与缩容、切主对账、页面导入、`license.init` 与 `-license.file`、日志无证书与令牌 | 6 天 |
 | P3 下发与拦截 | 按流对账、volume/filer 守卫、M1、G1（含 `filer.proto`、合并规则、客户端改动）、G2、缓存、内部令牌传递链、mount 错误传播、S3 两处 | **已完成（2026-10-14）**，证据与差异见 8.2：S1–S4、S6、S15–S20 真实进程通过（mount 与 `-cipher` 在 Linux 虚拟机上补测；mount 硬链接与截断的上游缺陷已修复）；S5、S7、S8 属 master 侧，P2 已验证；新增 server/filer/mount/wdclient/pb/license 单测通过 | 6.5 天 |
 | P4 节点额度 | 账本、宽限、预占、`NODE_REJECTED`（volume 与 filer）、三个 master 加入入口、无证书额度 0 与 master 启动检查 | **已完成（2026-10-14）**，证据与差异见 8.3：S9–S12 与 S21 的节点部分真实进程通过（单 master、hashicorp 3 master 强杀切主、`weed server`、基线版本升级）；10 分钟宽限实测 603 秒自动释放；新增 license 单测通过（master 加入入口与启动检查的 S21 部分 P2 已验证） | 2.5 天 |
-| P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13。**进行中**：**已完成（2026-10-14）**：全量检查、S14、`weed server` 一体化、docker-compose 与[运维手册](license-operations-manual-20261014.md)见 8.5（其间发现并修复 goraft 全集群重启后对账卡死），外部审核修复见 8.6、8.8 与 8.9，S13 见 8.7 | 2 天 |
+| P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13。**进行中**：**已完成（2026-10-14）**：全量检查、S14、`weed server` 一体化、docker-compose 与[运维手册](license-operations-manual-20261014.md)见 8.5（其间发现并修复 goraft 全集群重启后对账卡死），外部审核修复见 8.6、8.8、8.9 与 8.10，S13 见 8.7 | 2 天 |
 
 合计约 20.5 人天（单人，不含签发工具；签发工具为独立项目，另计，见 7.3）。v9 增量见 P0 契约 8.1。
 
@@ -775,6 +775,21 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 - mount 在句柄装入条目与截断隐藏正文时多一次原子操作，flush 时多一次条目读锁与字段判断。
 
 因此未重跑 S13。拒读态大目录 JSON 的分配与 CPU 增量见 8.7，仍属已知代价。
+
+### 8.10 外部第四轮审核修复（2026-10-15）
+
+第四轮审核基于 `77027e59a` 加 8.9 的修复（当时尚未提交）。8.9 的 3 项原复现用例均已通过；本轮新提出 2 项（1 项 P1、1 项 P2），先复现、再修复：
+
+| # | 问题 | 修复 | 验证 |
+| --- | --- | --- | --- |
+| 1（P1） | mount 重取隐藏正文时在锁外等待 filer 应答，期间 `SetAttr` 可以截断到 0、清除隐藏状态。8.9 的修复只覆盖串行情况，应答回来后仍照常处理：取回 `hello` 时，截断到 0 再扩到 5 字节的文件又变回 `hello`；应答仍为隐藏时，又设回已被截断清除的读错误，之后完整写入 `world` 成功，读取却返回 `EIO` | 重取以发起时的读失败状态作为句柄状态的标记：截断到 0（`clearHiddenContent`）与装入新条目（`SetEntry`）都会替换它。应答回来时，在条目锁内核对标记未变且条目仍为隐藏，才装入正文；结果用比较并交换写回，标记已变就丢弃。重解析 manifest 的重试同样处理（1.6） | 单测 `TestRefetchDroppedAfterTruncate`：替换 filer 查询，在应答前截断到 0 再扩到 5，分别返回正文与隐藏；读到 5 个零字节、无读错误，写入 `world` 后读到 `world`。两种应答在修复前的逻辑上分别读到 `hello` 和 `EIO`。`TestTakeRefetchedEntry` 增加标记已变的用例。Linux 虚拟机重跑 8.9 的真实 FUSE 场景，结果不变 |
+| 2（P2） | `writeFileAtomic` 忽略打开父目录与目录 `Sync` 的错误。master 的 `state.json` 也用它，目录同步失败时上层仍推进磁盘版本并计入确认，掉电后 rename 可能丢失 | 打开或同步目录失败时返回错误，上层按写盘失败处理（3.3 第 4 条）；Windows 不同步目录，`EINVAL`、`ENOTSUP` 视为文件系统不支持而跳过。volume/filer 的 `license-cache.json` 用同一函数，失败只记 warning（缓存语义不变） | 单测 `TestManagerImportNeedsDirectorySync`：状态目录设为 0300（可创建、可 rename、不可打开），导入返回 `sync directory` 错误，恢复权限后同一证书导入成功；修复前导入成功。root 运行时跳过（root 能打开该目录），本机与 Linux 虚拟机（以 nobody 运行）均通过。linux/darwin/windows/freebsd 编译通过 |
+
+修复后通过的检查：
+- 本机：license 测试（含 `-race`）、server、filer、command、mount（含 `page_writer`；mount 新单测另跑 3 次 `-race`）、shell、s3api、wdclient、pb 测试，以及 CI 标签的 Linux 构建。`go vet ./license/ ./mount/` 只报上游已有的一条。
+- Linux 虚拟机：license、mount（含 `page_writer`）、server、filer 测试通过，测试临时目录放在磁盘上。`-race` 在虚拟机上链接失败（race 运行时缺 `clock_gettime` 符号），属工具链环境问题，未在虚拟机上跑。
+
+性能：正常读取路径未改动；重取结果多一次比较并交换。master 每次写 `state.json` 多一次目录同步（`fsync`），只在导入、同步、账本批次等确认路径上，不在读路径。未重跑 S13，也未做断电验收。
 
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 

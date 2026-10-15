@@ -1254,6 +1254,32 @@ func TestManagerRemoveMasterRecommits(t *testing.T) {
 	}
 }
 
+func TestManagerImportNeedsDirectorySync(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root opens unreadable directories")
+	}
+	c := newFakeCluster(t, "a")
+	a := c.start("a", nil)
+	c.elect("a")
+	dir := filepath.Join(c.dirs["a"], StateDirName)
+	// The new state.json can be created and renamed into place, but the
+	// directory cannot be opened to sync the rename.
+	if err := os.Chmod(dir, 0300); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0700)
+	cert := certRaw(t, 1, nil)
+	if _, err := a.Import(cert); err == nil || !strings.Contains(err.Error(), "sync directory") {
+		t.Fatalf("import without a durable rename: %v", err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Import(cert); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestManagerRemoveMasterWaitsForLeaderDisk(t *testing.T) {
 	c := newFakeCluster(t, "a", "b", "c")
 	c.startAll()

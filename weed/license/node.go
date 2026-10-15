@@ -2,11 +2,14 @@ package license
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -252,7 +255,9 @@ func (n *Node) loadCache() error {
 }
 
 // writeFileAtomic replaces path with data so readers see the old or the
-// new content, never a partial file.
+// new content, never a partial file. It returns only once the new content
+// and its directory entry are on disk, so callers may count the write as
+// durable.
 func writeFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".license-*")
@@ -275,11 +280,31 @@ func writeFileAtomic(path string, data []byte) error {
 	if err = os.Rename(tmp.Name(), path); err != nil {
 		return err
 	}
-	if d, err := os.Open(dir); err == nil {
-		d.Sync()
-		d.Close()
+	if err = syncDir(dir); err != nil {
+		return fmt.Errorf("sync directory %s: %w", dir, err)
 	}
 	return nil
+}
+
+// syncDir flushes the entries of dir to disk. Windows cannot sync a
+// directory, and file systems that do not support it report EINVAL or
+// ENOTSUP; there a rename is as durable as the file system makes it.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if closeErr := d.Close(); err == nil {
+		err = closeErr
+	}
+	if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
+		return nil
+	}
+	return err
 }
 
 // maxAnchorLag bounds how far the master clock may run behind the local

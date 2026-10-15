@@ -14,6 +14,9 @@ import (
 // read failure state of a file handle (plan 1.6).
 const readRetryInterval = 5 * time.Second
 
+// lookupEntry fetches an entry from the filer; tests replace it.
+var lookupEntry = filer_pb.GetEntry
+
 // readFailure makes reads of a file handle fail with EIO instead of
 // returning zeros: its manifest chunks could not be resolved, typically
 // because the volume servers deny reads without a valid license, or the
@@ -95,6 +98,11 @@ func (fh *FileHandle) hiddenFlushError() error {
 // readRetryInterval: it resolves the manifest chunks again, or fetches an
 // entry whose content was hidden from the filer again. Only one attempt
 // runs at a time; readers that find one running keep failing.
+//
+// The failure f the attempt started from also marks the handle state it
+// belongs to: a truncation to 0 (clearHiddenContent) or a new entry
+// (SetEntry) replaces it while the attempt runs, and the attempt's result
+// is then dropped instead of bringing back old content or a cleared error.
 func (fh *FileHandle) maybeRetryRead() {
 	f := fh.readFailure.Load()
 	if f == nil || time.Since(f.at) < readRetryInterval {
@@ -110,20 +118,24 @@ func (fh *FileHandle) maybeRetryRead() {
 
 	var err error
 	if f.err == filer_pb.ErrContentHidden {
-		err = fh.refetchHiddenEntry()
+		err = fh.refetchHiddenEntry(f)
 	} else {
-		err = fh.resolveChunksAgain()
+		err = fh.resolveChunksAgain(f)
 	}
 	if err != nil {
 		glog.V(1).Infof("retry reading %s: %v", fh.FullPath(), err)
 	}
-	fh.setReadFailure(err)
+	var next *readFailure
+	if err != nil {
+		next = &readFailure{err: err, at: time.Now()}
+	}
+	fh.readFailure.CompareAndSwap(f, next)
 }
 
 // resolveChunksAgain rebuilds the chunk group from the current entry.
 // Chunks appended by writes while it ran are added to the new group, so
 // none is lost.
-func (fh *FileHandle) resolveChunksAgain() error {
+func (fh *FileHandle) resolveChunksAgain(f *readFailure) error {
 	chunks := fh.entry.GetChunks()
 	group, err := filer.NewChunkGroup(fh.wfs.LookupFn(), fh.wfs.chunkCache, chunks)
 	if err != nil {
@@ -131,6 +143,9 @@ func (fh *FileHandle) resolveChunksAgain() error {
 	}
 	fh.entryLock.Lock()
 	defer fh.entryLock.Unlock()
+	if fh.readFailure.Load() != f {
+		return nil // a new entry came with its own chunk group
+	}
 	current := fh.entry.GetChunks()
 	if len(current) < len(chunks) {
 		return fmt.Errorf("chunks changed while resolving")
@@ -145,9 +160,9 @@ func (fh *FileHandle) resolveChunksAgain() error {
 // refetchHiddenEntry looks the entry up again. Once the filer no longer
 // hides its content, the handle takes it (takeRefetchedEntry), and the
 // meta cache takes the new entry unless the handle keeps local changes.
-func (fh *FileHandle) refetchHiddenEntry() error {
+func (fh *FileHandle) refetchHiddenEntry(f *readFailure) error {
 	fullPath := fh.FullPath()
-	fresh, err := filer_pb.GetEntry(fh.wfs, fullPath)
+	fresh, err := lookupEntry(fh.wfs, fullPath)
 	if err != nil {
 		return err
 	}
@@ -167,7 +182,7 @@ func (fh *FileHandle) refetchHiddenEntry() error {
 	}
 	dir, _ := fullPath.DirAndName()
 	cached := fh.wfs.localEntryFromFiler(dir, fresh)
-	if !fh.takeRefetchedEntry(fresh, group) {
+	if !fh.takeRefetchedEntry(f, fresh, group) {
 		return nil
 	}
 	if err := fh.wfs.metaCache.UpdateEntry(context.Background(), cached); err != nil {
@@ -191,10 +206,14 @@ func (wfs *WFS) localEntryFromFiler(dir string, entry *filer_pb.Entry) *filer.En
 // xattr changes made on this handle while the content was hidden are not
 // flushed yet; they stay, and only the content is taken from the filer, as
 // truncations on the handle left it (keptContent). It reports whether the
-// filer entry replaced the local one.
-func (fh *FileHandle) takeRefetchedEntry(fresh *filer_pb.Entry, group *filer.ChunkGroup) bool {
+// filer entry replaced the local one. Nothing is taken once the failure f
+// the lookup started from was replaced (maybeRetryRead).
+func (fh *FileHandle) takeRefetchedEntry(f *readFailure, fresh *filer_pb.Entry, group *filer.ChunkGroup) bool {
 	fh.entryLock.Lock()
 	defer fh.entryLock.Unlock()
+	if fh.readFailure.Load() != f || !fh.entry.GetEntry().GetContentHidden() {
+		return false
+	}
 	fh.entryChunkGroup = group
 	cut := fh.hiddenCut.Swap(0)
 	if fh.dirtyMetadata {

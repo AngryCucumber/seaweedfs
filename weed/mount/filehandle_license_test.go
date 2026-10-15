@@ -75,7 +75,7 @@ func TestTakeRefetchedEntry(t *testing.T) {
 	local.Attributes.FileMode, local.Attributes.Uid = 0600, 2000
 	local.Extended = map[string][]byte{"user.k": []byte("v")}
 	fh := &FileHandle{entry: &LockedEntry{Entry: local}, dirtyMetadata: true}
-	if fh.takeRefetchedEntry(fresh(), nil) {
+	if fh.takeRefetchedEntry(hide(fh), fresh(), nil) {
 		t.Fatal("the filer entry replaced unflushed local changes")
 	}
 	e := fh.entry.GetEntry()
@@ -90,19 +90,35 @@ func TestTakeRefetchedEntry(t *testing.T) {
 	local = hidden()
 	local.Attributes.FileSize = 3
 	fh = &FileHandle{entry: &LockedEntry{Entry: local}, dirtyMetadata: true}
-	fh.takeRefetchedEntry(fresh(), nil)
+	fh.takeRefetchedEntry(hide(fh), fresh(), nil)
 	if e := fh.entry.GetEntry(); string(e.Content) != "hel" || e.Attributes.FileSize != 3 {
 		t.Fatalf("truncated entry: size %d, content %q", e.Attributes.FileSize, e.Content)
 	}
 
 	// Without local changes the filer entry is taken as a whole.
 	fh = &FileHandle{entry: &LockedEntry{Entry: hidden()}}
-	if !fh.takeRefetchedEntry(fresh(), nil) {
+	if !fh.takeRefetchedEntry(hide(fh), fresh(), nil) {
 		t.Fatal("clean handle kept the hidden entry")
 	}
 	if e := fh.entry.GetEntry(); string(e.Content) != "hello" || e.ContentHidden {
 		t.Fatalf("entry %+v", e)
 	}
+
+	// The failure the lookup started from was replaced meanwhile.
+	fh = &FileHandle{entry: &LockedEntry{Entry: hidden()}}
+	f := hide(fh)
+	hide(fh)
+	if fh.takeRefetchedEntry(f, fresh(), nil) || !fh.entry.GetEntry().ContentHidden {
+		t.Fatal("took an out of date lookup")
+	}
+}
+
+// hide marks fh as failing reads on hidden content and returns the failure
+// a refetch starts from.
+func hide(fh *FileHandle) *readFailure {
+	f := &readFailure{err: filer_pb.ErrContentHidden}
+	fh.readFailure.Store(f)
+	return f
 }
 
 func TestLocalEntryFromFiler(t *testing.T) {
@@ -123,8 +139,12 @@ func TestLocalEntryFromFiler(t *testing.T) {
 
 // testWFS is a mount with handles kept in memory; nothing reaches a filer.
 func testWFS(t *testing.T) *WFS {
+	mapper, err := meta_cache.NewUidGidMapper("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &WFS{
-		option:      &Option{ChunkSizeLimit: 1 << 20, ConcurrentWriters: 4, uniqueCacheDirForWrite: t.TempDir()},
+		option:      &Option{ChunkSizeLimit: 1 << 20, ConcurrentWriters: 4, uniqueCacheDirForWrite: t.TempDir(), UidGidMapper: mapper},
 		inodeToPath: NewInodeToPath("/", 0),
 		fhMap:       NewFileHandleToInode(),
 		fhLockTable: util.NewLockTable[FileHandleId](),
@@ -169,14 +189,15 @@ func TestCopyFileRangeClearsHiddenContent(t *testing.T) {
 	}
 }
 
-func TestTruncateHiddenContent(t *testing.T) {
-	setSize := func(wfs *WFS, fh *FileHandle, size uint64) {
-		t.Helper()
-		in := &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: fuse.InHeader{NodeId: fh.inode}, Valid: fuse.FATTR_SIZE | fuse.FATTR_FH, Fh: uint64(fh.fh), Size: size}}
-		if code := wfs.SetAttr(nil, in, &fuse.AttrOut{}); code != fuse.OK {
-			t.Fatalf("truncate to %d: %v", size, code)
-		}
+func setSize(t *testing.T, wfs *WFS, fh *FileHandle, size uint64) {
+	t.Helper()
+	in := &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: fuse.InHeader{NodeId: fh.inode}, Valid: fuse.FATTR_SIZE | fuse.FATTR_FH, Fh: uint64(fh.fh), Size: size}}
+	if code := wfs.SetAttr(nil, in, &fuse.AttrOut{}); code != fuse.OK {
+		t.Fatalf("truncate to %d: %v", size, code)
 	}
+}
+
+func TestTruncateHiddenContent(t *testing.T) {
 	fresh := func() *filer_pb.Entry {
 		return &filer_pb.Entry{Name: "a", Content: []byte("hello"), Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 5}}
 	}
@@ -186,16 +207,16 @@ func TestTruncateHiddenContent(t *testing.T) {
 	// comes back has zeros past the cut.
 	wfs := testWFS(t)
 	fh := wfs.testOpen("/d/a", hiddenEntry("a", 5))
-	setSize(wfs, fh, 3)
-	setSize(wfs, fh, 4)
-	setSize(wfs, fh, 5)
+	setSize(t, wfs, fh, 3)
+	setSize(t, wfs, fh, 4)
+	setSize(t, wfs, fh, 5)
 	if err := fh.hiddenFlushError(); !errors.Is(err, filer_pb.ErrContentHidden) {
 		t.Fatalf("flush error %v", err)
 	}
 	if code := wfs.doFlush(fh, 0, 0); code != fuse.EIO {
 		t.Fatalf("flush: %v", code)
 	}
-	fh.takeRefetchedEntry(fresh(), nil)
+	fh.takeRefetchedEntry(fh.readFailure.Load(), fresh(), nil)
 	fh.setReadFailure(nil) // as maybeRetryRead does after the refetch
 	if e := fh.entry.GetEntry(); string(e.Content) != "hel\x00\x00" || e.Attributes.FileSize != 5 || e.ContentHidden {
 		t.Fatalf("content %q, size %d, hidden %v", e.Content, e.Attributes.FileSize, e.ContentHidden)
@@ -210,12 +231,12 @@ func TestTruncateHiddenContent(t *testing.T) {
 	// Grown first and cut back to the stored size: nothing was dropped.
 	wfs = testWFS(t)
 	fh = wfs.testOpen("/d/a", hiddenEntry("a", 5))
-	setSize(wfs, fh, 7)
-	setSize(wfs, fh, 5)
+	setSize(t, wfs, fh, 7)
+	setSize(t, wfs, fh, 5)
 	if err := fh.hiddenFlushError(); err != nil {
 		t.Fatalf("flush error %v", err)
 	}
-	fh.takeRefetchedEntry(fresh(), nil)
+	fh.takeRefetchedEntry(fh.readFailure.Load(), fresh(), nil)
 	if e := fh.entry.GetEntry(); string(e.Content) != "hello" {
 		t.Fatalf("content %q", e.Content)
 	}
@@ -223,10 +244,52 @@ func TestTruncateHiddenContent(t *testing.T) {
 	// Cut to 0 drops all hidden content, so growing again is plain zeros.
 	wfs = testWFS(t)
 	fh = wfs.testOpen("/d/a", hiddenEntry("a", 5))
-	setSize(wfs, fh, 2)
-	setSize(wfs, fh, 0)
-	setSize(wfs, fh, 5)
+	setSize(t, wfs, fh, 2)
+	setSize(t, wfs, fh, 0)
+	setSize(t, wfs, fh, 5)
 	if e := fh.entry.GetEntry(); e.ContentHidden || fh.hiddenCut.Load() != 0 || fh.hiddenFlushError() != nil {
 		t.Fatalf("hidden %v, cut %d", e.ContentHidden, fh.hiddenCut.Load())
+	}
+}
+
+// A lookup still running when the handle is truncated to 0 and grown
+// again must not bring back the old content or the cleared read error.
+func TestRefetchDroppedAfterTruncate(t *testing.T) {
+	defer func() { lookupEntry = filer_pb.GetEntry }()
+	for _, filerHides := range []bool{false, true} {
+		wfs := testWFS(t)
+		fh := wfs.testOpen("/d/a", hiddenEntry("a", 5))
+		started, release := make(chan struct{}), make(chan struct{})
+		lookupEntry = func(filer_pb.FilerClient, util.FullPath) (*filer_pb.Entry, error) {
+			close(started)
+			<-release
+			if filerHides {
+				return hiddenEntry("a", 5), nil
+			}
+			return &filer_pb.Entry{Name: "a", Content: []byte("hello"), Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 5}}, nil
+		}
+		done := make(chan struct{})
+		go func() {
+			fh.maybeRetryRead()
+			close(done)
+		}()
+		<-started
+		setSize(t, wfs, fh, 0)
+		setSize(t, wfs, fh, 5)
+		close(release)
+		<-done
+
+		if err := fh.readError(); err != nil {
+			t.Fatalf("filer hides %v: read error %v", filerHides, err)
+		}
+		if got := readHandle(t, fh, 8); got != "\x00\x00\x00\x00\x00" {
+			t.Fatalf("filer hides %v: read %q after truncating to 0", filerHides, got)
+		}
+		if _, code := wfs.Write(nil, &fuse.WriteIn{Fh: uint64(fh.fh), Size: 5}, []byte("world")); code != fuse.OK {
+			t.Fatalf("write: %v", code)
+		}
+		if got := readHandle(t, fh, 8); got != "world" {
+			t.Fatalf("filer hides %v: read %q after writing", filerHides, got)
+		}
 	}
 }
