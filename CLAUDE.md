@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A fork of SeaweedFS 3.84 (Go module `github.com/seaweedfs/seaweedfs`, Go 1.23) being turned into **MassDB OSS**. Upstream code is largely untouched; fork-specific work so far is the MassDB branding on the master/volume/filer UI pages and a hashed-key Cassandra filer store. The active project is an **authorization certificate (license) system**; its design lives in `docs/license-certificate-execution-plan-*.md` (Chinese, long, versioned). Read the latest version before touching anything license-related: it fixes which HTTP read paths get guarded (volume and filer `GET` content only), what must stay open (writes, metadata, gRPC, internal filer reads via an internal token), and the master-side raft/membership rules. The doc is a plan, not a record of finished work.
+A fork of SeaweedFS 3.84 (Go module `github.com/seaweedfs/seaweedfs`, Go 1.23) being turned into **MassDB OSS**. Upstream code is largely untouched; fork-specific work is the MassDB branding on the master/volume/filer UI pages, a hashed-key Cassandra filer store, and an **authorization certificate (license) system** (implemented, phases P0–P5 done on branch `3.84-license`; see "License system" below).
+
+License documents are in Chinese under `docs/`: `license-p0-contract-*.md` is the frozen contract (claims, reason codes, wire constants, hook points) and wins on conflict; `license-certificate-execution-plan-*.md` holds the design plus the implementation and test records of each phase (sections 8.1–8.7, including deviations and what was not covered); `license-operations-manual-*.md` is the operator manual. Read the contract and the relevant plan sections before changing license code, and record behaviour changes there (dated revisions, as the existing ones are).
 
 Commit messages use the `[type](scope) summary` style, e.g. `[feat](ui) ...`, `[docs](license) ...`.
 
@@ -29,6 +31,8 @@ Single package or test:
 ```bash
 cd weed && go test ./filer/... -run TestName -v
 ```
+
+On macOS, test binaries of packages that pull in gopsutil (`server`, `command`, `shell`, `s3api`, ...) crash at init in `go-m1cpu`'s cgo code, so run them with `CGO_ENABLED=0`; the `tikv` tag then fails to build on darwin (`gosigar` needs cgo), so the exact CI command only works on Linux. `go vet` reports about 30 upstream findings; compare against the base before treating one as new.
 
 Some tests need external services and are skipped or gated (e.g. `filer/cassandra/cassandra_integration_test.go`). Build tags gate optional stores: `elastic`, `gocdk`, `sqlite`, `ydb`, `tikv`, `rclone`, `rocksdb` (needs cgo + librocksdb; see `docker/Dockerfile.rocksdb_*`). `5BytesOffset` switches needle offsets to 5 bytes for volumes over 8 GiB (`weed/util/constants_{4,5}bytes.go`); release binaries built with it carry a `_large_disk` suffix, and a volume's `.vif` file records which offset size wrote it, so the two builds are not interchangeable on the same data.
 
@@ -71,3 +75,15 @@ Logging is `weed/glog` with verbosity levels (`glog.V(n)`); `-v` on the command 
 - Branding lives in the embedded templates `server/{master_ui,volume_server_ui,filer_ui}/*.html` and `weed/static/` (served through `embed.FS` in `weed.go`).
 - The `unmaintained/`, `other/`, `k8s/`, and `snap/` directories are upstream extras and not part of the build.
 - The Cassandra store supports hashed metadata keys with legacy-row compatibility; schema in `filer/cassandra/schema.cql` and `cassandra_schema.go`, documented in `filer/cassandra/README.md`.
+
+## License system
+
+A vendor-signed certificate (compact Ed25519 JWS, protocol v1 shared with MassDB SQL) limits reading data and the number of masters, volume servers and filers. Without a valid certificate, reads of file content are refused (volume and filer HTTP `GET`, S3 `GetObject`, webdav, `weed mount` reads, seven volume gRPC data RPCs, inline content in filer gRPC and metadata outputs); writes, deletes and metadata stay open. Without any certificate only a single master can start and volume servers and filers cannot register.
+
+- `weed/license/`: certificate parsing and trust store (`jws.go`, `trust.go`), the `(newest, prev)` state (`state.go`), the master-side `Manager` (`manager.go`: import, voter-majority commit, election reconcile, member ledger with grace period), the volume/filer `Node` and its lock-free read `Guard`. `licensetest/` builds nodes in a given state for other packages' tests.
+- Master: `server/master_license*.go` (raft adapter, peer RPCs, address check on master-to-master RPCs), `master_grpc_server_license.go`, `master_server_handlers_license.go` (`/license`, `/license/deployment`, `/license/validate`, `/license/import`, `DELETE /license/nodes/{addr}`), admission in `SendHeartbeat`/`KeepConnected` (`master_grpc_server.go`). State is `<mdir>/license/state.json`. CLI: `weed license.init`, `weed master -license.file`, `weed server -master.license.file`, shell `license.show/import/validate`; `master.toml` `[master.license] peer_ips`.
+- Volume and filer: `server/license_node.go` (guards, outgoing internal token), `server/filer_license.go` (hiding inline content, write merge rules, `KvGet` limits), `filer/internal_token.go`, `mount/filehandle_license.go`. Each node caches certificates in `license-cache.json` (volume's first `-dir`, filer's `-defaultStoreDir`).
+- The production trust manifest in `trust.go` is still empty, so a plain build accepts no certificate. Test builds inject a key with `-ldflags "-X github.com/seaweedfs/seaweedfs/weed/license.testTrustManifest=<base64url manifest>"`. The production issuer is a separate project (plan 7.3); the massdb-sql issuer only produces the interop vectors in `license/testdata`.
+- `docker/compose/local-license-compose.yml` is a licensed cluster with the first-deployment steps in its header.
+
+Rules that past bugs came from: the internal read token is only attached in the filer's maintenance reads (`fetchWholeChunk`, `ChunkStreamReader`, `StreamContent`) and between filers/volumes, never on user reads; directory exemptions are decided on the cleaned path; a master confirms state only after `state.json` was written; certificate pairs compare `prev` too; goraft starts every term count from 0 after all masters restart, so ledger versions use the leader's epoch, not the raw raft term.
