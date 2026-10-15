@@ -176,18 +176,14 @@ func (fh *FileHandle) refetchHiddenEntry(f *readFailure) error {
 	if fresh.ContentHidden {
 		return filer_pb.ErrContentHidden
 	}
-	chunks := fresh.Chunks
-	if fh.dirtyMetadata {
-		chunks = fh.entry.GetChunks()
-	}
-	group, err := filer.NewChunkGroup(fh.wfs.LookupFn(), fh.wfs.chunkCache, chunks)
+	group, err := filer.NewChunkGroup(fh.wfs.LookupFn(), fh.wfs.chunkCache, fresh.Chunks)
 	if err != nil {
 		return err
 	}
 	dir, _ := fullPath.DirAndName()
 	cached := fh.wfs.localEntryFromFiler(dir, fresh)
-	if !fh.takeRefetchedEntry(f, fresh, group) {
-		return nil
+	if replaced, err := fh.takeRefetchedEntry(f, fresh, group); err != nil || !replaced {
+		return err
 	}
 	if err := fh.wfs.metaCache.UpdateEntry(context.Background(), cached); err != nil {
 		glog.V(1).Infof("update meta cache %s: %v", fullPath, err)
@@ -206,34 +202,56 @@ func (wfs *WFS) localEntryFromFiler(dir string, entry *filer_pb.Entry) *filer.En
 }
 
 // takeRefetchedEntry installs an entry whose content the filer no longer
-// hides, already mapped to local ids. chmod, chown, utimes, truncate or
-// xattr changes made on this handle while the content was hidden are not
-// flushed yet; they stay, and only the content is taken from the filer, as
-// truncations on the handle left it (keptContent). It reports whether the
+// hides, already mapped to local ids, and the chunk group of its chunks.
+// chmod, chown, utimes, truncate or xattr changes made on this handle while
+// the content was hidden are not flushed yet; they stay, and only the
+// content is taken from the filer (takeContent). It reports whether the
 // filer entry replaced the local one. Nothing is taken once the failure f
 // the lookup started from was replaced (maybeRetryRead).
-func (fh *FileHandle) takeRefetchedEntry(f *readFailure, fresh *filer_pb.Entry, group *filer.ChunkGroup) bool {
+func (fh *FileHandle) takeRefetchedEntry(f *readFailure, fresh *filer_pb.Entry, group *filer.ChunkGroup) (bool, error) {
 	fh.entryLock.Lock()
 	defer fh.entryLock.Unlock()
 	if fh.readFailure.Load() != f || !fh.entry.GetEntry().GetContentHidden() {
-		return false
+		return false, nil
+	}
+	replaced := !fh.dirtyMetadata
+	if replaced {
+		fresh.Attributes.FileSize = filer.FileSize(fresh)
+		fh.entry.SetEntry(fresh)
+	} else {
+		var err error
+		fh.entry.UpdateEntry(func(e *filer_pb.Entry) {
+			err = fh.takeContent(e, fresh)
+		})
+		if err != nil {
+			return false, err
+		}
 	}
 	fh.entryChunkGroup = group
-	cut := fh.hiddenCut.Swap(0)
-	if fh.dirtyMetadata {
-		fh.entry.UpdateEntry(func(e *filer_pb.Entry) {
-			size := uint64(len(fresh.Content))
-			if e.Attributes != nil {
-				size = e.Attributes.FileSize
-			}
-			e.Content = keptContent(fresh.Content, size, cut)
-			e.ContentHidden = false
-		})
-		return false
+	fh.hiddenCut.Store(0)
+	return replaced, nil
+}
+
+// takeContent puts the content of fresh into the local entry e and keeps
+// the rest of e. Without a size change on this handle the filer's inline
+// bytes, chunks, size and md5 are taken together, whatever another client
+// wrote meanwhile. After a truncation or extension only inline bytes can be
+// cut to the local size (keptContent); chunks that the filer holds now
+// cannot be, so the content stays hidden and a flush is refused by the
+// filer (CONTENT_HIDDEN) instead of dropping them.
+func (fh *FileHandle) takeContent(e, fresh *filer_pb.Entry) error {
+	cut := fh.hiddenCut.Load()
+	if cut == 0 && e.Attributes.FileSize == fh.hiddenSize.Load() {
+		e.Content, e.Chunks = fresh.Content, fresh.Chunks
+		e.Attributes.FileSize = filer.FileSize(fresh)
+		e.Attributes.Md5 = fresh.GetAttributes().GetMd5()
+	} else if len(fresh.Chunks) > 0 {
+		return fmt.Errorf("size changed on this handle while the content, now in chunks, was hidden: %w", filer_pb.ErrContentHidden)
+	} else {
+		e.Content, e.Chunks = keptContent(fresh.Content, e.Attributes.FileSize, cut), nil
 	}
-	fresh.Attributes.FileSize = filer.FileSize(fresh)
-	fh.entry.SetEntry(fresh)
-	return true
+	e.ContentHidden = false
+	return nil
 }
 
 // keptContent returns the content taken back from the filer as truncations

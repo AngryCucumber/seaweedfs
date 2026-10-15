@@ -68,14 +68,28 @@ func TestTakeRefetchedEntry(t *testing.T) {
 			Attributes: &filer_pb.FuseAttributes{FileMode: 0644, Uid: 1000, Gid: 1000, FileSize: 5},
 		}
 	}
+	// handle holds a hidden entry of 5 bytes, as SetEntry leaves it.
+	handle := func(local *filer_pb.Entry, dirty bool) *FileHandle {
+		fh := &FileHandle{entry: &LockedEntry{Entry: local}, dirtyMetadata: dirty}
+		fh.hiddenSize.Store(5)
+		return fh
+	}
+	take := func(fh *FileHandle, fresh *filer_pb.Entry) bool {
+		t.Helper()
+		replaced, err := fh.takeRefetchedEntry(hide(fh), fresh, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return replaced
+	}
 
 	// chmod, chown and setfattr on the handle while the content was hidden,
 	// not flushed yet: they survive, only the content comes from the filer.
 	local := hidden()
 	local.Attributes.FileMode, local.Attributes.Uid = 0600, 2000
 	local.Extended = map[string][]byte{"user.k": []byte("v")}
-	fh := &FileHandle{entry: &LockedEntry{Entry: local}, dirtyMetadata: true}
-	if fh.takeRefetchedEntry(hide(fh), fresh(), nil) {
+	fh := handle(local, true)
+	if take(fh, fresh()) {
 		t.Fatal("the filer entry replaced unflushed local changes")
 	}
 	e := fh.entry.GetEntry()
@@ -86,18 +100,51 @@ func TestTakeRefetchedEntry(t *testing.T) {
 		t.Fatalf("content not taken: %+v", e)
 	}
 
+	// Another client rewrote the file meanwhile, in chunks or as longer
+	// inline content: the content, chunks, size and md5 are all taken.
+	chunked := &filer_pb.Entry{Name: "a", Chunks: []*filer_pb.FileChunk{{FileId: "3,01", Size: 2000}},
+		Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 2000, Md5: []byte("md5")}}
+	local = hidden()
+	local.Attributes.FileMode = 0600
+	fh = handle(local, true)
+	take(fh, chunked)
+	if e := fh.entry.GetEntry(); len(e.Chunks) != 1 || e.Content != nil || e.Attributes.FileSize != 2000 ||
+		string(e.Attributes.Md5) != "md5" || e.Attributes.FileMode != 0600 || e.ContentHidden {
+		t.Fatalf("chunked rewrite: %+v", e)
+	}
+	longer := fresh()
+	longer.Content, longer.Attributes.FileSize = []byte("world!"), 6
+	fh = handle(hidden(), true)
+	take(fh, longer)
+	if e := fh.entry.GetEntry(); string(e.Content) != "world!" || e.Attributes.FileSize != 6 {
+		t.Fatalf("longer inline rewrite: size %d, content %q", e.Attributes.FileSize, e.Content)
+	}
+
 	// A truncation from 5 to 3 bytes not flushed yet keeps its size.
 	local = hidden()
 	local.Attributes.FileSize = 3
-	fh = &FileHandle{entry: &LockedEntry{Entry: local}, dirtyMetadata: true}
-	fh.takeRefetchedEntry(hide(fh), fresh(), nil)
+	fh = handle(local, true)
+	fh.hiddenCut.Store(3)
+	take(fh, fresh())
 	if e := fh.entry.GetEntry(); string(e.Content) != "hel" || e.Attributes.FileSize != 3 {
 		t.Fatalf("truncated entry: size %d, content %q", e.Attributes.FileSize, e.Content)
 	}
 
+	// Chunks cannot be cut to a local size change: the content stays hidden.
+	local = hidden()
+	local.Attributes.FileSize = 3
+	fh = handle(local, true)
+	fh.hiddenCut.Store(3)
+	if _, err := fh.takeRefetchedEntry(hide(fh), chunked, nil); !errors.Is(err, filer_pb.ErrContentHidden) {
+		t.Fatalf("merged chunks into a truncated handle: %v", err)
+	}
+	if e := fh.entry.GetEntry(); !e.ContentHidden || len(e.Chunks) != 0 || e.Attributes.FileSize != 3 {
+		t.Fatalf("entry changed: %+v", e)
+	}
+
 	// Without local changes the filer entry is taken as a whole.
-	fh = &FileHandle{entry: &LockedEntry{Entry: hidden()}}
-	if !fh.takeRefetchedEntry(hide(fh), fresh(), nil) {
+	fh = handle(hidden(), false)
+	if !take(fh, fresh()) {
 		t.Fatal("clean handle kept the hidden entry")
 	}
 	if e := fh.entry.GetEntry(); string(e.Content) != "hello" || e.ContentHidden {
@@ -105,10 +152,10 @@ func TestTakeRefetchedEntry(t *testing.T) {
 	}
 
 	// The failure the lookup started from was replaced meanwhile.
-	fh = &FileHandle{entry: &LockedEntry{Entry: hidden()}}
+	fh = handle(hidden(), false)
 	f := hide(fh)
 	hide(fh)
-	if fh.takeRefetchedEntry(f, fresh(), nil) || !fh.entry.GetEntry().ContentHidden {
+	if replaced, err := fh.takeRefetchedEntry(f, fresh(), nil); replaced || err != nil || !fh.entry.GetEntry().ContentHidden {
 		t.Fatal("took an out of date lookup")
 	}
 }
@@ -219,7 +266,9 @@ func TestTruncateHiddenContent(t *testing.T) {
 	if code := wfs.doFlush(fh, 0, 0); code != fuse.EIO {
 		t.Fatalf("flush: %v", code)
 	}
-	fh.takeRefetchedEntry(fh.readFailure.Load(), fresh(), nil)
+	if _, err := fh.takeRefetchedEntry(fh.readFailure.Load(), fresh(), nil); err != nil {
+		t.Fatal(err)
+	}
 	fh.setReadFailure(nil) // as maybeRetryRead does after the refetch
 	if e := fh.entry.GetEntry(); string(e.Content) != "hel\x00\x00" || e.Attributes.FileSize != 5 || e.ContentHidden {
 		t.Fatalf("content %q, size %d, hidden %v", e.Content, e.Attributes.FileSize, e.ContentHidden)
@@ -239,7 +288,9 @@ func TestTruncateHiddenContent(t *testing.T) {
 	if err := fh.hiddenFlushError(); err != nil {
 		t.Fatalf("flush error %v", err)
 	}
-	fh.takeRefetchedEntry(fh.readFailure.Load(), fresh(), nil)
+	if _, err := fh.takeRefetchedEntry(fh.readFailure.Load(), fresh(), nil); err != nil {
+		t.Fatal(err)
+	}
 	if e := fh.entry.GetEntry(); string(e.Content) != "hello" {
 		t.Fatalf("content %q", e.Content)
 	}
@@ -357,5 +408,33 @@ func TestRefetchKeepsHiddenAfterLookupError(t *testing.T) {
 	}
 	if got, err := read(fh); err != nil || got != "world" {
 		t.Fatalf("read after truncate and write: %q, %v", got, err)
+	}
+}
+
+// A chmod not flushed yet must not keep the chunk-less hidden entry when
+// another client rewrote the file in chunks: reads would return zeros and a
+// flush would drop the chunks.
+func TestRefetchTakesChunksWithLocalChmod(t *testing.T) {
+	defer func() { lookupEntry = filer_pb.GetEntry }()
+	lookupEntry = func(filer_pb.FilerClient, util.FullPath) (*filer_pb.Entry, error) {
+		return &filer_pb.Entry{Name: "a", Chunks: []*filer_pb.FileChunk{{FileId: "3,01", Size: 2000, ModifiedTsNs: 1}},
+			Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 2000}}, nil
+	}
+	wfs := testWFS(t)
+	fh := wfs.testOpen("/d/a", hiddenEntry("a", 5))
+	in := &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: fuse.InHeader{NodeId: fh.inode}, Valid: fuse.FATTR_MODE | fuse.FATTR_FH, Fh: uint64(fh.fh), Mode: 0600}}
+	if code := wfs.SetAttr(nil, in, &fuse.AttrOut{}); code != fuse.OK {
+		t.Fatalf("chmod: %v", code)
+	}
+	fh.maybeRetryRead()
+	if err := fh.readError(); err != nil {
+		t.Fatalf("read error %v", err)
+	}
+	e := fh.entry.GetEntry()
+	if len(e.Chunks) != 1 || e.Attributes.FileSize != 2000 || e.Attributes.FileMode&0777 != 0600 || e.ContentHidden {
+		t.Fatalf("entry %+v", e)
+	}
+	if found, _ := fh.entryChunkGroup.SearchChunks(0, 2000, SEEK_DATA); !found {
+		t.Fatal("the chunk group does not hold the filer's chunks")
 	}
 }

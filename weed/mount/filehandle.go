@@ -36,8 +36,10 @@ type FileHandle struct {
 	readFailure   atomic.Pointer[readFailure]
 	readRetryLock sync.Mutex
 	// hiddenCut is the smallest size a truncation on this handle left a
-	// file with hidden inline content at, 0 if there was none.
-	hiddenCut atomic.Uint64
+	// file with hidden inline content at, 0 if there was none; hiddenSize
+	// is the size the entry had when it was set with hidden content.
+	hiddenCut  atomic.Uint64
+	hiddenSize atomic.Uint64
 
 	// for debugging
 	mirrorFile *os.File
@@ -92,6 +94,9 @@ func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
 		// or the content is no longer hidden (plan 1.6).
 		fh.setEntryReadFailure(entry, resolveManifestErr)
 		fh.hiddenCut.Store(0)
+		if entry.ContentHidden {
+			fh.hiddenSize.Store(fileSize)
+		}
 	} else {
 		glog.Fatalf("setting file handle entry to nil")
 	}
