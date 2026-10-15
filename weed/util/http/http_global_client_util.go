@@ -352,6 +352,15 @@ func ReadUrlAsStreamWithHeader(fileUrl, jwt string, header http.Header, cipherKe
 		reader = r.Body
 	}
 
+	var data io.Reader = reader
+	if isFullChunk && size > 0 {
+		// A chunk truncated in place (weed mount) keeps its needle with a
+		// smaller Size, so the needle can hold more than size bytes; only
+		// the first size bytes belong to the chunk. A size of 0 reads the
+		// whole needle.
+		data = io.LimitReader(reader, int64(size))
+	}
+
 	var (
 		m int
 	)
@@ -359,7 +368,7 @@ func ReadUrlAsStreamWithHeader(fileUrl, jwt string, header http.Header, cipherKe
 	defer mem.Free(buf)
 
 	for {
-		m, err = reader.Read(buf)
+		m, err = data.Read(buf)
 		if m > 0 {
 			fn(buf[:m])
 		}
@@ -392,6 +401,11 @@ func readEncryptedUrl(fileUrl, jwt string, header http.Header, cipherKey []byte,
 		return false, fmt.Errorf("read decrypted %s size %d [%d, %d)", fileUrl, len(decryptedData), offset, int(offset)+size)
 	}
 	if isFullChunk {
+		// Only the first size bytes of a chunk truncated in place, as in
+		// ReadUrlAsStreamWithHeader.
+		if size > 0 && size < len(decryptedData) {
+			decryptedData = decryptedData[:size]
+		}
 		fn(decryptedData)
 	} else {
 		fn(decryptedData[int(offset) : int(offset)+size])
