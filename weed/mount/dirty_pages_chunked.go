@@ -7,7 +7,6 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/mount/page_writer"
-	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
 type ChunkedDirtyPages struct {
@@ -77,8 +76,7 @@ func (pages *ChunkedDirtyPages) saveChunkedFileIntervalToStorage(reader io.Reade
 		pages.lastErr = err
 		return
 	}
-	pages.fh.AddChunks([]*filer_pb.FileChunk{chunk})
-	pages.fh.entryChunkGroup.AddChunk(chunk)
+	pages.fh.addUploadedChunk(chunk)
 	glog.V(3).Infof("%v saveToStorage %s [%d,%d)", fileFullPath, chunk.FileId, offset, offset+size)
 
 }

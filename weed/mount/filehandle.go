@@ -165,6 +165,18 @@ func (fh *FileHandle) AddChunks(chunks []*filer_pb.FileChunk) {
 	fh.entry.AppendChunks(chunks)
 }
 
+// addUploadedChunk adds the chunk of a finished upload to the entry and to
+// the chunk group reads use, under the lock the group is replaced with
+// (resolveChunksAgain, takeRefetchedEntry, takeCachedEntry): the chunk
+// lands in the group in use after this, or in the chunks the replacement
+// builds its group from.
+func (fh *FileHandle) addUploadedChunk(chunk *filer_pb.FileChunk) {
+	fh.entryLock.RLock()
+	defer fh.entryLock.RUnlock()
+	fh.AddChunks([]*filer_pb.FileChunk{chunk})
+	fh.entryChunkGroup.AddChunk(chunk)
+}
+
 func (fh *FileHandle) ReleaseHandle() {
 
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("ReleaseHandle", fh.fh, util.ExclusiveLock)

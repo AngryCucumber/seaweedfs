@@ -820,6 +820,56 @@ func TestWriteAfterManifestResolved(t *testing.T) {
 	}
 }
 
+// An upload finishing while a retry resolves the manifest puts its chunk
+// into the chunk group the retry installs.
+func TestUploadDuringManifestRetry(t *testing.T) {
+	util_http.InitGlobalHttpClient()
+	chunks := []*filer_pb.FileChunk{{FileId: "3,01637037d6", Size: 5, ModifiedTsNs: 1}}
+	filer_pb.BeforeEntrySerialization(chunks)
+	manifest, err := proto.Marshal(&filer_pb.FileChunkManifest{Chunks: chunks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var licensed atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !licensed.Load() {
+			http.Error(w, "NO_LICENSE", http.StatusForbidden)
+			return
+		}
+		time.Sleep(50 * time.Millisecond) // the upload finishes meanwhile
+		w.Write(manifest)
+	}))
+	t.Cleanup(server.Close)
+	wfs := testWFS(t)
+	wfs.option.VolumeServerAccess = "filerProxy"
+	wfs.option.FilerAddresses = []pb.ServerAddress{pb.ServerAddress(strings.TrimPrefix(server.URL, "http://"))}
+	wfs.chunkCache = chunk_cache.NewTieredChunkCache(16, t.TempDir(), 64, 1024)
+	wfs.chunkCache.SetChunk("3,01637037d6", []byte("world"))
+	wfs.chunkCache.SetChunk("3,02637037d6", []byte("newer"))
+	fh := wfs.testOpen("/d/a", &filer_pb.Entry{Name: "a", Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 10},
+		Chunks: []*filer_pb.FileChunk{{FileId: "3,0f637037d6", Size: 5, IsChunkManifest: true}}})
+	f := fh.readFailure.Load()
+	if f == nil {
+		t.Fatal("manifest resolved without a certificate")
+	}
+	licensed.Store(true)
+	fh.readFailure.Store(&readFailure{err: f.err, at: time.Now().Add(-readRetryInterval)})
+	uploaded := make(chan struct{})
+	go func() {
+		defer close(uploaded)
+		time.Sleep(25 * time.Millisecond)
+		fh.addUploadedChunk(&filer_pb.FileChunk{FileId: "3,02637037d6", Offset: 5, Size: 5, ModifiedTsNs: time.Now().UnixNano()})
+	}()
+	if got := readHandle(t, fh, 5); got != "world" || fh.readError() != nil {
+		t.Fatalf("read %q, error %v after the retry", got, fh.readError())
+	}
+	<-uploaded
+	buf := make([]byte, 5)
+	if n, err := readDataByFileHandle(buf, fh, 5); err != nil || string(buf[:n]) != "newer" {
+		t.Fatalf("read of the uploaded chunk: %q %v", buf[:n], err)
+	}
+}
+
 // The write timestamp does not depend on the number of chunks.
 func BenchmarkWriteTsNs(b *testing.B) {
 	for _, n := range []int{500, 50000} {
