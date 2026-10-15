@@ -1254,6 +1254,54 @@ func TestManagerRemoveMasterRecommits(t *testing.T) {
 	}
 }
 
+func TestManagerRemoveMasterWaitsForLeaderDisk(t *testing.T) {
+	c := newFakeCluster(t, "a", "b", "c")
+	c.startAll()
+	c.elect("a")
+	a := c.m("a")
+	if _, err := a.Import(certRaw(t, 1, withLimits(3, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(c.dirs["a"], StateDirName, StateFileName)
+	var failing atomic.Bool
+	saved := writeState
+	writeState = func(path string, s *stateFile) error {
+		if path == statePath && failing.Load() {
+			return errors.New("injected write failure")
+		}
+		return saved(path, s)
+	}
+	defer func() { writeState = saved }()
+	ctx := context.Background()
+	removed := 0
+	remove := func(id string) func() error {
+		return func() error { removed++; return a.raft.RemoveServer(id) }
+	}
+
+	// The ledger with v1 reaches b and c but not a's disk. Removing b would
+	// leave it on c only, and removing c next on nobody's disk.
+	failing.Store(true)
+	if err := a.AdmitNode(NodeVolumeServer, "v1:8080"); err != nil {
+		t.Fatal(err)
+	}
+	err := a.RemoveMaster(ctx, "b", remove("b"))
+	wantCode(t, err, CodePartialCommit)
+	if removed != 0 || !strings.Contains(err.Error(), "failed: a") {
+		t.Fatalf("removed=%d: %v", removed, err)
+	}
+
+	failing.Store(false)
+	for _, id := range []string{"b", "c"} {
+		if err := a.RemoveMaster(ctx, id, remove(id)); err != nil {
+			t.Fatalf("remove %s: %v", id, err)
+		}
+	}
+	a = c.start("a", nil)
+	if e := a.Ledger().Entries; len(e) != 1 || e[0].Address != "v1:8080" {
+		t.Fatalf("a restarted with ledger %+v", e)
+	}
+}
+
 func TestManagerClockSuspectAndRepair(t *testing.T) {
 	c := newFakeCluster(t, "a", "b", "c")
 	c.startAll()

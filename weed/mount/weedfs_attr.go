@@ -97,6 +97,8 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 			} else {
 				entry.ContentHidden = false
 			}
+		} else if fh != nil && entry.ContentHidden && size < entry.Attributes.FileSize {
+			fh.truncateHidden(size)
 		}
 		entry.Attributes.Mtime = time.Now().Unix()
 		entry.Attributes.FileSize = size

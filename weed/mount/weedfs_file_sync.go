@@ -116,6 +116,11 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32) fuse.Status {
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
+	if err := fh.hiddenFlushError(); err != nil {
+		glog.Errorf("%v fh %d flush: %v", fileFullPath, fh.fh, err)
+		return fuse.EIO
+	}
+
 	err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 
 		entry := fh.GetEntry()

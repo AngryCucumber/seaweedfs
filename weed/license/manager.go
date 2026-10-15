@@ -1338,7 +1338,13 @@ func (m *Manager) RemoveMaster(ctx context.Context, id string, remove func() err
 	ctx, cancel := context.WithTimeout(ctx, lockedOpTimeout)
 	defer cancel()
 	res := m.push(ctx, LeaderInfo{Address: m.self, Term: term, ConfigIndex: mem.Index}, without(remaining, m.self), &st, &led)
-	res.ok[m.self] = true
+	// The leader counts only once state.json holds what it confirms, as
+	// in commit: the voters that did write it may be the ones removed.
+	if err := m.ensureDurable(); err != nil {
+		res.failed[m.self] = "write state: " + err.Error()
+	} else {
+		res.ok[m.self] = true
+	}
 	if !majority(remaining, res.ok) {
 		var failed []string
 		for p := range res.failed {

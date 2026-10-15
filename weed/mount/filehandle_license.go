@@ -59,9 +59,36 @@ func (fh *FileHandle) clearHiddenContent(entry *filer_pb.Entry) {
 		return
 	}
 	entry.ContentHidden = false
+	fh.hiddenCut.Store(0)
 	if f := fh.readFailure.Load(); f != nil && f.err == filer_pb.ErrContentHidden {
 		fh.readFailure.CompareAndSwap(f, nil)
 	}
+}
+
+// truncateHidden records a truncation to a size above 0 of a file whose
+// inline content is hidden. The bytes past the smallest such size are gone
+// even if the file grows again before the content comes back, and only the
+// handle knows it: the filer fills a hidden entry of unchanged size back in
+// with all of its stored bytes.
+func (fh *FileHandle) truncateHidden(size uint64) {
+	if cut := fh.hiddenCut.Load(); cut == 0 || size < cut {
+		fh.hiddenCut.Store(size)
+	}
+}
+
+// hiddenFlushError refuses to flush an entry whose hidden content was
+// truncated on this handle and grew again, as the filer would bring the
+// dropped bytes back. Other size changes of hidden content the filer
+// refuses itself (CONTENT_HIDDEN).
+func (fh *FileHandle) hiddenFlushError() error {
+	entry := fh.GetEntry().GetEntry()
+	if entry == nil || !entry.ContentHidden {
+		return nil
+	}
+	if cut, size := fh.hiddenCut.Load(), entry.Attributes.GetFileSize(); cut != 0 && cut < size {
+		return fmt.Errorf("truncated to %d bytes, now %d: %w", cut, size, filer_pb.ErrContentHidden)
+	}
+	return nil
 }
 
 // maybeRetryRead tries to leave the read failure state at most once per
@@ -162,21 +189,21 @@ func (wfs *WFS) localEntryFromFiler(dir string, entry *filer_pb.Entry) *filer.En
 // takeRefetchedEntry installs an entry whose content the filer no longer
 // hides, already mapped to local ids. chmod, chown, utimes, truncate or
 // xattr changes made on this handle while the content was hidden are not
-// flushed yet; they stay, and only the content is taken from the filer, cut
-// to the local size. It reports whether the filer entry replaced the local
-// one.
+// flushed yet; they stay, and only the content is taken from the filer, as
+// truncations on the handle left it (keptContent). It reports whether the
+// filer entry replaced the local one.
 func (fh *FileHandle) takeRefetchedEntry(fresh *filer_pb.Entry, group *filer.ChunkGroup) bool {
 	fh.entryLock.Lock()
 	defer fh.entryLock.Unlock()
 	fh.entryChunkGroup = group
+	cut := fh.hiddenCut.Swap(0)
 	if fh.dirtyMetadata {
 		fh.entry.UpdateEntry(func(e *filer_pb.Entry) {
-			content := fresh.Content
-			// A truncation not flushed yet keeps its size.
-			if e.Attributes != nil && e.Attributes.FileSize < uint64(len(content)) {
-				content = content[:e.Attributes.FileSize]
+			size := uint64(len(fresh.Content))
+			if e.Attributes != nil {
+				size = e.Attributes.FileSize
 			}
-			e.Content = content
+			e.Content = keptContent(fresh.Content, size, cut)
 			e.ContentHidden = false
 		})
 		return false
@@ -184,4 +211,19 @@ func (fh *FileHandle) takeRefetchedEntry(fresh *filer_pb.Entry, group *filer.Chu
 	fresh.Attributes.FileSize = filer.FileSize(fresh)
 	fh.entry.SetEntry(fresh)
 	return true
+}
+
+// keptContent returns the content taken back from the filer as truncations
+// not flushed yet left it: cut to the local size, and zero from the
+// smallest size the handle truncated it to (truncateHidden).
+func keptContent(content []byte, size, cut uint64) []byte {
+	if size < uint64(len(content)) {
+		content = content[:size]
+	}
+	if cut == 0 || cut >= uint64(len(content)) {
+		return content
+	}
+	kept := make([]byte, len(content))
+	copy(kept, content[:cut])
+	return kept
 }
