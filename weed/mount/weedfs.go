@@ -108,35 +108,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 			wfs.inodeToPath.MarkChildrenCached(path)
 		}, func(path util.FullPath) bool {
 			return wfs.inodeToPath.IsChildrenCached(path)
-		}, func(filePath util.FullPath, entry *filer_pb.Entry) {
-			// Find inode if it is not a deleted path
-			if inode, inodeFound := wfs.inodeToPath.GetInode(filePath); inodeFound {
-				// Find open file handle
-				if fh, fhFound := wfs.fhMap.FindFileHandle(inode); fhFound {
-					fhActiveLock := fh.wfs.fhLockTable.AcquireLock("invalidateFunc", fh.fh, util.ExclusiveLock)
-					defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
-
-					// An update event passes the old entry; the meta cache
-					// already holds the new one. The handle's own download of
-					// a remote object brings nothing new.
-					newEntry, status := wfs.maybeLoadEntry(filePath)
-					if status == fuse.OK && fh.ownCacheEvent(newEntry) {
-						return
-					}
-
-					// Recreate dirty pages
-					fh.dirtyPages.Destroy()
-					fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
-
-					// Update handle entry
-					if status == fuse.OK {
-						if fh.GetEntry().GetEntry() != newEntry {
-							fh.SetEntry(newEntry)
-						}
-					}
-				}
-			}
-		})
+		}, wfs.invalidateHandle)
 	grace.OnInterrupt(func() {
 		wfs.metaCache.Shutdown()
 		os.RemoveAll(option.getUniqueCacheDirForWrite())
@@ -164,6 +136,40 @@ func (wfs *WFS) StartBackgroundTasks() error {
 
 func (wfs *WFS) String() string {
 	return "seaweedfs"
+}
+
+// invalidateHandle handles a metadata event for filePath (meta_cache): an
+// open handle of the file takes the entry the meta cache now holds and
+// drops what it has not written yet. It runs under the handle's exclusive
+// lock, after a read, write or attribute change in progress.
+func (wfs *WFS) invalidateHandle(filePath util.FullPath, entry *filer_pb.Entry) {
+	// Find inode if it is not a deleted path
+	if inode, inodeFound := wfs.inodeToPath.GetInode(filePath); inodeFound {
+		// Find open file handle
+		if fh, fhFound := wfs.fhMap.FindFileHandle(inode); fhFound {
+			fhActiveLock := fh.wfs.fhLockTable.AcquireLock("invalidateFunc", fh.fh, util.ExclusiveLock)
+			defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+
+			// An update event passes the old entry; the meta cache
+			// already holds the new one. The handle's own download of
+			// a remote object brings nothing new.
+			newEntry, status := wfs.maybeLoadEntry(filePath)
+			if status == fuse.OK && fh.ownCacheEvent(newEntry) {
+				return
+			}
+
+			// Recreate dirty pages
+			fh.dirtyPages.Destroy()
+			fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
+
+			// Update handle entry
+			if status == fuse.OK {
+				if fh.GetEntry().GetEntry() != newEntry {
+					fh.SetEntry(newEntry)
+				}
+			}
+		}
+	}
 }
 
 func (wfs *WFS) Init(server *fuse.Server) {

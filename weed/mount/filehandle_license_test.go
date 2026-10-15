@@ -1,18 +1,31 @@
 package mount
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 func TestFileHandleReadFailure(t *testing.T) {
@@ -208,15 +221,17 @@ func testWFS(t *testing.T) *WFS {
 	if err != nil {
 		t.Fatal(err)
 	}
-	metaCache := meta_cache.NewMetaCache(t.TempDir(), mapper, "/", func(util.FullPath) {}, func(util.FullPath) bool { return true }, func(util.FullPath, *filer_pb.Entry) {})
-	t.Cleanup(metaCache.Shutdown)
-	return &WFS{
-		metaCache:   metaCache,
+	wfs := &WFS{
 		option:      &Option{ChunkSizeLimit: 1 << 20, ConcurrentWriters: 4, uniqueCacheDirForWrite: t.TempDir(), UidGidMapper: mapper},
 		inodeToPath: NewInodeToPath("/", 0),
 		fhMap:       NewFileHandleToInode(),
 		fhLockTable: util.NewLockTable[FileHandleId](),
 	}
+	// Metadata events reach handles as in a mount (invalidateHandle), but
+	// only when a test delivers one.
+	wfs.metaCache = meta_cache.NewMetaCache(t.TempDir(), mapper, "/", func(util.FullPath) {}, func(util.FullPath) bool { return true }, wfs.invalidateHandle)
+	t.Cleanup(wfs.metaCache.Shutdown)
+	return wfs
 }
 
 func (wfs *WFS) testOpen(path string, entry *filer_pb.Entry) *FileHandle {
@@ -587,5 +602,228 @@ func TestDownloadRemoteEntry(t *testing.T) {
 	_, fh = open()
 	if _, err := readDataByFileHandle(make([]byte, 8), fh, 0); err == nil || fh.entry.GetEntry() == nil {
 		t.Fatalf("read without a cached entry: %v", err)
+	}
+}
+
+// remoteOnlyEntry is a file whose content is only in remote storage;
+// cachedRemoteEntry is the same file after the filer cached it in the
+// cluster, its chunk stamped with tsNs by the filer's clock.
+func remoteOnlyEntry() *filer_pb.Entry {
+	return &filer_pb.Entry{Name: "a", RemoteEntry: &filer_pb.RemoteEntry{StorageName: "s3", RemoteSize: 5},
+		Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 5}}
+}
+
+func cachedRemoteEntry(tsNs int64) *filer_pb.Entry {
+	e := remoteOnlyEntry()
+	e.Chunks = []*filer_pb.FileChunk{{FileId: "3,01637037d6", Size: 5, ModifiedTsNs: tsNs}}
+	e.RemoteEntry.LastLocalSyncTsNs = 1
+	return e
+}
+
+// flushFiler is a filer stub for flushes: it assigns file ids and records
+// the entry it is given.
+type flushFiler struct {
+	filer_pb.UnimplementedSeaweedFilerServer
+	volumeURL string
+	mu        sync.Mutex
+	fileKey   uint64
+	saved     *filer_pb.Entry
+}
+
+func (s *flushFiler) AssignVolume(context.Context, *filer_pb.AssignVolumeRequest) (*filer_pb.AssignVolumeResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fileKey++
+	return &filer_pb.AssignVolumeResponse{FileId: fmt.Sprintf("3,%02x637037d6", s.fileKey), Location: &filer_pb.Location{Url: s.volumeURL}}, nil
+}
+
+func (s *flushFiler) CreateEntry(_ context.Context, r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saved = proto.Clone(r.Entry).(*filer_pb.Entry)
+	return &filer_pb.CreateEntryResponse{}, nil
+}
+
+func (s *flushFiler) entry() *filer_pb.Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saved
+}
+
+// testFlushWFS is a mount whose flushes reach flushFiler; uploads go to an
+// HTTP stub that reports 5 bytes stored.
+func testFlushWFS(t *testing.T) (*WFS, *flushFiler) {
+	t.Helper()
+	util_http.InitGlobalHttpClient()
+	upload := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"name":"a","size":5}`)
+	}))
+	t.Cleanup(upload.Close)
+	// File ids start at 3,02...: 3,01... is the chunk of cachedRemoteEntry.
+	stub := &flushFiler{volumeURL: strings.TrimPrefix(upload.URL, "http://"), fileKey: 1}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer()
+	filer_pb.RegisterSeaweedFilerServer(server, stub)
+	go server.Serve(listener)
+	t.Cleanup(server.Stop)
+	mapper, err := meta_cache.NewUidGidMapper("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, httpPort, _ := net.SplitHostPort(stub.volumeURL)
+	port, _ := strconv.Atoi(httpPort)
+	wfs := NewSeaweedFileSystem(&Option{
+		FilerAddresses:     []pb.ServerAddress{pb.NewServerAddress("127.0.0.1", port, listener.Addr().(*net.TCPAddr).Port)},
+		GrpcDialOption:     grpc.WithTransportCredentials(insecure.NewCredentials()),
+		FilerMountRootPath: "/", CacheDirForRead: t.TempDir(), CacheDirForWrite: t.TempDir(), CacheSizeMBForRead: 64,
+		ChunkSizeLimit: 1 << 20, ConcurrentWriters: 4, UidGidMapper: mapper,
+	})
+	t.Cleanup(wfs.metaCache.Shutdown)
+	wfs.inodeToPath.Lookup("/d", time.Now().Unix(), true, false, 0, true)
+	wfs.inodeToPath.MarkChildrenCached("/d")
+	return wfs, stub
+}
+
+// A write is newer than every chunk of the entry even when the filer's
+// clock, which stamped the chunks it cached, is ahead of the mount's:
+// overlapping chunks are resolved by timestamp when the handle flushes.
+// Later writes stay newer than earlier ones.
+func TestWriteNewerThanFilerChunks(t *testing.T) {
+	saved := cacheRemoteObject
+	defer func() { cacheRemoteObject = saved }()
+	ahead := time.Now().Add(5 * time.Second).UnixNano()
+	cacheRemoteObject = func(*WFS, *filer_pb.CacheRemoteObjectToLocalClusterRequest) (*filer_pb.CacheRemoteObjectToLocalClusterResponse, error) {
+		return &filer_pb.CacheRemoteObjectToLocalClusterResponse{Entry: cachedRemoteEntry(ahead)}, nil
+	}
+	wfs, stub := testFlushWFS(t)
+	fh := wfs.testOpen("/d/a", remoteOnlyEntry())
+	write := func(data string) {
+		if _, code := wfs.Write(nil, &fuse.WriteIn{Fh: uint64(fh.fh), Size: uint32(len(data))}, []byte(data)); code != fuse.OK {
+			t.Fatalf("write %q: %v", data, code)
+		}
+	}
+
+	write("newer")
+	first := fh.lastWriteTsNs
+	if first <= ahead || len(fh.entry.GetEntry().Chunks) != 1 {
+		t.Fatalf("write at %d over a chunk cached at %d, entry %+v", first, ahead, fh.entry.GetEntry())
+	}
+	if code := wfs.Flush(nil, &fuse.FlushIn{Fh: uint64(fh.fh)}); code != fuse.OK {
+		t.Fatalf("flush: %v", code)
+	}
+	// The written chunk replaced the cached one in the filer and in the handle.
+	stored := stub.entry()
+	if len(stored.Chunks) != 1 || stored.Chunks[0].GetFileIdString() != "3,02637037d6" || stored.Chunks[0].ModifiedTsNs != first {
+		t.Fatalf("flushed chunks %v, want the write at %d", stored.Chunks, first)
+	}
+	if got := readHandle(t, fh, 8); got != "newer" {
+		t.Fatalf("read %q after the flush", got)
+	}
+
+	write("newest")
+	if fh.lastWriteTsNs <= first {
+		t.Fatalf("second write at %d after the first at %d", fh.lastWriteTsNs, first)
+	}
+
+	// A copy into the file is a write too.
+	src := wfs.testOpen("/d/src", &filer_pb.Entry{Name: "src", Content: []byte("world"), Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 5}})
+	second := fh.lastWriteTsNs
+	if written, code := wfs.CopyFileRange(nil, &fuse.CopyFileRangeIn{FhIn: uint64(src.fh), FhOut: uint64(fh.fh), Len: 5}); code != fuse.OK || written != 5 {
+		t.Fatalf("copy: %v %d", code, written)
+	}
+	if fh.lastWriteTsNs <= second {
+		t.Fatalf("copy at %d after the write at %d", fh.lastWriteTsNs, second)
+	}
+}
+
+// Attribute changes on a handle are ordered with its reads, writes and the
+// filer's metadata events, like writes: a download running for a read
+// completes before a truncation, and the filer's event for a download made
+// by a truncation waits for it.
+func TestSetAttrOrderedWithDownload(t *testing.T) {
+	saved := cacheRemoteObject
+	defer func() { cacheRemoteObject = saved }()
+	open := func() (*WFS, *FileHandle) {
+		wfs := testWFS(t)
+		wfs.chunkCache = chunk_cache.NewTieredChunkCache(16, t.TempDir(), 64, 1024)
+		wfs.chunkCache.SetChunk("3,01637037d6", []byte("world"))
+		return wfs, wfs.testOpen("/d/a", remoteOnlyEntry())
+	}
+	setAttr := func(wfs *WFS, fh *FileHandle, in *fuse.SetAttrIn) fuse.Status {
+		in.NodeId, in.Valid, in.Fh = fh.inode, in.Valid|fuse.FATTR_FH, uint64(fh.fh)
+		return wfs.SetAttr(nil, in, &fuse.AttrOut{})
+	}
+
+	// A chmod, then a truncation whose download the filer announces before
+	// it responds: the event waits for the truncation, is recognized as the
+	// handle's own, and changes nothing.
+	wfs, fh := open()
+	if code := setAttr(wfs, fh, &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{Valid: fuse.FATTR_MODE, Mode: 0600}}); code != fuse.OK {
+		t.Fatalf("chmod: %v", code)
+	}
+	var event sync.WaitGroup
+	cacheRemoteObject = func(*WFS, *filer_pb.CacheRemoteObjectToLocalClusterRequest) (*filer_pb.CacheRemoteObjectToLocalClusterResponse, error) {
+		wfs.metaCache.InsertEntry(context.Background(), wfs.localEntryFromFiler("/d", cachedRemoteEntry(1)))
+		event.Add(1)
+		go func() {
+			defer event.Done()
+			wfs.invalidateHandle("/d/a", remoteOnlyEntry())
+		}()
+		time.Sleep(50 * time.Millisecond)
+		return &filer_pb.CacheRemoteObjectToLocalClusterResponse{Entry: cachedRemoteEntry(1)}, nil
+	}
+	setSize(t, wfs, fh, 3)
+	event.Wait()
+	e := fh.entry.GetEntry()
+	if got := readHandle(t, fh, 8); got != "wor" || e.Attributes.FileMode&0777 != 0600 || e.Attributes.FileSize != 3 || fh.cachedRemote.Load() != nil {
+		t.Fatalf("after the event: read %q, mode %o, size %d, download recorded %v", got, e.Attributes.FileMode, e.Attributes.FileSize, fh.cachedRemote.Load() != nil)
+	}
+
+	// A truncation to 0 during the download for a read waits for it, then
+	// cuts the cached file; the event of the download changes nothing.
+	wfs, fh = open()
+	entered, release := make(chan struct{}), make(chan struct{})
+	cacheRemoteObject = func(*WFS, *filer_pb.CacheRemoteObjectToLocalClusterRequest) (*filer_pb.CacheRemoteObjectToLocalClusterResponse, error) {
+		close(entered)
+		<-release
+		return &filer_pb.CacheRemoteObjectToLocalClusterResponse{Entry: cachedRemoteEntry(1)}, nil
+	}
+	read := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 8)
+		result, code := wfs.Read(nil, &fuse.ReadIn{Fh: uint64(fh.fh), Size: 8}, buf)
+		if code != fuse.OK {
+			read <- code.String()
+			return
+		}
+		data, _ := result.Bytes(nil)
+		read <- string(data)
+	}()
+	<-entered
+	truncated := make(chan fuse.Status, 1)
+	go func() {
+		truncated <- setAttr(wfs, fh, &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{Valid: fuse.FATTR_SIZE, Size: 0}})
+	}()
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case code := <-truncated:
+		t.Fatalf("truncated during the download: %v", code)
+	default:
+	}
+	close(release)
+	if got := <-read; got != "world" {
+		t.Fatalf("read %q", got)
+	}
+	if code := <-truncated; code != fuse.OK {
+		t.Fatalf("truncate: %v", code)
+	}
+	wfs.invalidateHandle("/d/a", remoteOnlyEntry())
+	e = fh.entry.GetEntry()
+	if got := readHandle(t, fh, 8); got != "" || e.Attributes.FileSize != 0 || e.RemoteEntry != nil || len(e.Chunks) != 0 {
+		t.Fatalf("after the event: read %q, entry %+v", got, e)
 	}
 }

@@ -3,7 +3,6 @@ package mount
 import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"net/http"
-	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
@@ -91,7 +90,7 @@ func (wfs *WFS) CopyFileRange(cancel <-chan struct{}, in *fuse.CopyFileRangeIn) 
 	fhOut.dirtyPages.writerPattern.MonitorWriteAt(int64(in.OffOut), int(in.Len))
 	fhOut.entry.Content = nil
 	fhOut.clearHiddenContent(fhOut.entry.GetEntry())
-	fhOut.dirtyPages.AddPage(int64(in.OffOut), data, fhOut.dirtyPages.writerPattern.IsSequentialMode(), time.Now().UnixNano())
+	fhOut.dirtyPages.AddPage(int64(in.OffOut), data, fhOut.dirtyPages.writerPattern.IsSequentialMode(), fhOut.writeTsNs())
 	fhOut.entry.Attributes.FileSize = uint64(max(int64(in.OffOut)+totalRead, int64(fhOut.entry.Attributes.FileSize)))
 	fhOut.dirtyMetadata = true
 	written = uint32(totalRead)

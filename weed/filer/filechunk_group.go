@@ -112,6 +112,21 @@ func (group *ChunkGroup) SetChunks(chunks []*filer_pb.FileChunk) error {
 	return nil
 }
 
+// LatestModifiedTsNs returns the newest modification time of the chunks in
+// the group, manifests resolved; 0 without chunks.
+func (group *ChunkGroup) LatestModifiedTsNs() (tsNs int64) {
+	group.sectionsLock.RLock()
+	defer group.sectionsLock.RUnlock()
+	for _, section := range group.sections {
+		section.lock.RLock()
+		for _, chunk := range section.chunks {
+			tsNs = max(tsNs, chunk.ModifiedTsNs)
+		}
+		section.lock.RUnlock()
+	}
+	return
+}
+
 const (
 	// see weedfs_file_lseek.go
 	SEEK_DATA uint32 = 3 // seek to next data after the offset

@@ -19,7 +19,9 @@ type ChunkReadAt struct {
 	fileSize      int64
 	readerCache   *ReaderCache
 	readerPattern *ReaderPattern
+	// lastChunkFid is shared by the concurrent readers of one file.
 	lastChunkFid  string
+	lastChunkLock sync.Mutex
 }
 
 var _ = io.ReaderAt(&ChunkReadAt{})
@@ -204,17 +206,20 @@ func (c *ChunkReadAt) readChunkSliceAt(buffer []byte, chunkView *ChunkView, next
 
 	shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
 	n, err = c.readerCache.ReadChunkAt(buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
-	if c.lastChunkFid != chunkView.FileId {
+	c.lastChunkLock.Lock()
+	lastChunkFid := c.lastChunkFid
+	c.lastChunkFid = chunkView.FileId
+	c.lastChunkLock.Unlock()
+	if lastChunkFid != chunkView.FileId {
 		if chunkView.OffsetInChunk == 0 { // start of a new chunk
-			if c.lastChunkFid != "" {
-				c.readerCache.UnCache(c.lastChunkFid)
+			if lastChunkFid != "" {
+				c.readerCache.UnCache(lastChunkFid)
 			}
 			if nextChunkViews != nil {
 				c.readerCache.MaybeCache(nextChunkViews) // just read the next chunk if at the very beginning
 			}
 		}
 	}
-	c.lastChunkFid = chunkView.FileId
 	return
 }
 

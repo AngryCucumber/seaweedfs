@@ -6,7 +6,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"net/http"
 	"syscall"
-	"time"
 )
 
 /**
@@ -61,7 +60,7 @@ func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (wr
 		return 0, fuse.EIO
 	}
 	// Taken after the cache, whose chunks the written data must overwrite.
-	tsNs := time.Now().UnixNano()
+	tsNs := fh.writeTsNs()
 
 	entry.Content = nil
 	fh.clearHiddenContent(entry.GetEntry())

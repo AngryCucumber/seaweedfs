@@ -5,6 +5,7 @@ import (
 	"io"
 	"math"
 	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -102,6 +103,40 @@ func testReadAt(t *testing.T, readerAt *ChunkReadAt, offset int64, size int, exp
 	if expectedData != nil && !bytes.Equal(data, expectedData) {
 		t.Errorf("unexpected read data: %v, expect: %v", data, expectedData)
 	}
+}
+
+// Concurrent readers of one file share its ChunkReadAt.
+func TestReaderAtConcurrent(t *testing.T) {
+	visibles := NewIntervalList[*VisibleInterval]()
+	for i := int64(0); i < 8; i++ {
+		addVisibleInterval(visibles, &VisibleInterval{start: i * 2, stop: i*2 + 2, fileId: strconv.FormatInt(i+1, 10), chunkSize: 2})
+	}
+	readerAt := &ChunkReadAt{
+		chunkViews:    ViewFromVisibleIntervals(visibles, 0, math.MaxInt64),
+		fileSize:      16,
+		readerCache:   NewReaderCache(3, &mockChunkCache{}, nil),
+		readerPattern: NewReaderPattern(),
+	}
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				offset := int64((g+i)%6) * 2
+				data := make([]byte, 4)
+				if n, _, err := readerAt.doReadAt(data, offset); n != 4 || err != nil {
+					t.Errorf("read [%d,%d): %d %v", offset, offset+4, n, err)
+					return
+				}
+				if data[0] != byte(offset/2+1) || data[3] != byte(offset/2+2) {
+					t.Errorf("read [%d,%d): %v", offset, offset+4, data)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
 }
 
 func TestReaderAt0(t *testing.T) {

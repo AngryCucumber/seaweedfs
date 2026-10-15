@@ -9,6 +9,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func (wfs *WFS) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse.AttrOut) (code fuse.Status) {
@@ -45,6 +46,15 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 	path, fh, entry, status := wfs.maybeReadEntry(input.NodeId)
 	if status != fuse.OK || entry == nil {
 		return status
+	}
+	if fh != nil {
+		// Ordered with the reads, writes and metadata events of the handle
+		// like a write: a download for a read completes before a truncation
+		// cuts the file, and the filer's event for a download made here
+		// finds its record (ownCacheEvent).
+		fhActiveLock := fh.wfs.fhLockTable.AcquireLock("SetAttr", fh.fh, util.ExclusiveLock)
+		defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+		entry = fh.GetEntry().GetEntry()
 	}
 	// The content of a remote-only file is cached before its size changes,
 	// so the change applies to it like to any chunked file.

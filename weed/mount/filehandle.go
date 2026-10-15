@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type FileHandleId uint64
@@ -46,6 +47,9 @@ type FileHandle struct {
 	// (filehandle_read.go).
 	cachedRemote       atomic.Pointer[filer_pb.Entry]
 	remoteDownloadLock sync.Mutex
+	// lastWriteTsNs is the timestamp of the last write on this handle
+	// (writeTsNs); used under the handle's exclusive lock.
+	lastWriteTsNs int64
 
 	// for debugging
 	mirrorFile *os.File
@@ -112,6 +116,31 @@ func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
 
 func (fh *FileHandle) UpdateEntry(fn func(entry *filer_pb.Entry)) *filer_pb.Entry {
 	return fh.entry.UpdateEntry(fn)
+}
+
+// writeTsNs returns the timestamp of a write on this handle. Overlapping
+// chunks are resolved by timestamp, so a write must be newer than every
+// chunk of the entry, whose timestamps may come from the filer's clock (a
+// remote object it cached, an entry it returned), and than the previous
+// write on the handle, which may already have been moved past such a
+// chunk. Called with the handle's exclusive lock, before the write.
+func (fh *FileHandle) writeTsNs() int64 {
+	tsNs := time.Now().UnixNano()
+	if fh.lastWriteTsNs >= tsNs {
+		tsNs = fh.lastWriteTsNs + 1
+	}
+	for _, chunk := range fh.entry.GetEntry().GetChunks() {
+		if chunk.ModifiedTsNs >= tsNs {
+			tsNs = chunk.ModifiedTsNs + 1
+		}
+	}
+	if fh.entryChunkGroup != nil {
+		if latest := fh.entryChunkGroup.LatestModifiedTsNs(); latest >= tsNs {
+			tsNs = latest + 1
+		}
+	}
+	fh.lastWriteTsNs = tsNs
+	return tsNs
 }
 
 func (fh *FileHandle) AddChunks(chunks []*filer_pb.FileChunk) {
