@@ -116,12 +116,19 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 					fhActiveLock := fh.wfs.fhLockTable.AcquireLock("invalidateFunc", fh.fh, util.ExclusiveLock)
 					defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
+					// An update event passes the old entry; the meta cache
+					// already holds the new one. The handle's own download of
+					// a remote object brings nothing new.
+					newEntry, status := wfs.maybeLoadEntry(filePath)
+					if status == fuse.OK && fh.ownCacheEvent(newEntry) {
+						return
+					}
+
 					// Recreate dirty pages
 					fh.dirtyPages.Destroy()
 					fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
 
 					// Update handle entry
-					newEntry, status := wfs.maybeLoadEntry(filePath)
 					if status == fuse.OK {
 						if fh.GetEntry().GetEntry() != newEntry {
 							fh.SetEntry(newEntry)

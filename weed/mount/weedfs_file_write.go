@@ -2,6 +2,7 @@ package mount
 
 import (
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"net/http"
 	"syscall"
@@ -47,8 +48,6 @@ func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (wr
 
 	fh.dirtyPages.writerPattern.MonitorWriteAt(int64(in.Offset), int(in.Size))
 
-	tsNs := time.Now().UnixNano()
-
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("Write", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
@@ -56,6 +55,13 @@ func (wfs *WFS) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (wr
 	if entry == nil {
 		return 0, fuse.OK
 	}
+
+	if err := fh.cacheRemoteBeforeChange(); err != nil {
+		glog.Warningf("write %s: %v", fh.FullPath(), err)
+		return 0, fuse.EIO
+	}
+	// Taken after the cache, whose chunks the written data must overwrite.
+	tsNs := time.Now().UnixNano()
 
 	entry.Content = nil
 	fh.clearHiddenContent(entry.GetEntry())

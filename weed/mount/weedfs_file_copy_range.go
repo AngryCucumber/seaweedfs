@@ -82,6 +82,11 @@ func (wfs *WFS) CopyFileRange(cancel <-chan struct{}, in *fuse.CopyFileRangeIn) 
 		return 0, fuse.OK
 	}
 
+	if err := fhOut.cacheRemoteBeforeChange(); err != nil {
+		glog.Warningf("copy to %s: %v", fhOut.FullPath(), err)
+		return 0, fuse.EIO
+	}
+
 	// put data at the specified offset in target file
 	fhOut.dirtyPages.writerPattern.MonitorWriteAt(int64(in.OffOut), int(in.Len))
 	fhOut.entry.Content = nil

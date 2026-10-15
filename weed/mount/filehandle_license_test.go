@@ -2,6 +2,8 @@ package mount
 
 import (
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 )
 
 func TestFileHandleReadFailure(t *testing.T) {
@@ -451,5 +454,138 @@ func TestRefetchTakesChunksWithLocalChmod(t *testing.T) {
 	}
 	if found, _ := fh.entryChunkGroup.SearchChunks(0, 2000, SEEK_DATA); !found {
 		t.Fatal("the chunk group does not hold the filer's chunks")
+	}
+}
+
+// A remote-only file is cached in the cluster on the first read, write or
+// size change. Reads use the cached chunks, writes and size changes apply
+// to them, and the filer's event for the download does not replace the
+// handle.
+func TestDownloadRemoteEntry(t *testing.T) {
+	saved := cacheRemoteObject
+	defer func() { cacheRemoteObject = saved }()
+	remoteOnly := func() *filer_pb.Entry {
+		return &filer_pb.Entry{Name: "a", RemoteEntry: &filer_pb.RemoteEntry{StorageName: "s3", RemoteSize: 5},
+			Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 5}}
+	}
+	var calls atomic.Int32
+	cached := func() *filer_pb.Entry {
+		e := remoteOnly()
+		// The filer stamps cached chunks with the time of the download.
+		e.Chunks = []*filer_pb.FileChunk{{FileId: "3,01637037d6", Size: 5, ModifiedTsNs: time.Now().UnixNano()}}
+		e.RemoteEntry.LastLocalSyncTsNs = 1
+		return e
+	}
+	cacheRemoteObject = func(*WFS, *filer_pb.CacheRemoteObjectToLocalClusterRequest) (*filer_pb.CacheRemoteObjectToLocalClusterResponse, error) {
+		calls.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		return &filer_pb.CacheRemoteObjectToLocalClusterResponse{Entry: cached()}, nil
+	}
+	open := func() (*WFS, *FileHandle) {
+		calls.Store(0)
+		wfs := testWFS(t)
+		wfs.chunkCache = chunk_cache.NewTieredChunkCache(16, t.TempDir(), 64, 1024)
+		wfs.chunkCache.SetChunk("3,01637037d6", []byte("world"))
+		return wfs, wfs.testOpen("/d/a", remoteOnly())
+	}
+	chmod := func(wfs *WFS, fh *FileHandle) {
+		in := &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: fuse.InHeader{NodeId: fh.inode}, Valid: fuse.FATTR_MODE | fuse.FATTR_FH, Fh: uint64(fh.fh), Mode: 0600}}
+		if code := wfs.SetAttr(nil, in, &fuse.AttrOut{}); code != fuse.OK {
+			t.Fatalf("chmod: %v", code)
+		}
+	}
+	write := func(wfs *WFS, fh *FileHandle, data string) {
+		if _, code := wfs.Write(nil, &fuse.WriteIn{Fh: uint64(fh.fh), Size: uint32(len(data))}, []byte(data)); code != fuse.OK {
+			t.Fatalf("write: %v", code)
+		}
+	}
+	ownEvent := func(fh *FileHandle) bool {
+		return fh.ownCacheEvent(cached())
+	}
+
+	// Concurrent first reads download once; later reads not at all.
+	_, fh := open()
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if got := readHandle(t, fh, 8); got != "world" {
+				t.Errorf("read %q", got)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := readHandle(t, fh, 8); got != "world" || calls.Load() != 1 {
+		t.Fatalf("read %q after %d downloads", got, calls.Load())
+	}
+
+	// A write and a chmod after the download survive the filer's event for
+	// it, which is recognized once; an event with other chunks is not.
+	wfs, fh := open()
+	readHandle(t, fh, 8)
+	write(wfs, fh, "newer")
+	chmod(wfs, fh)
+	other := cached()
+	other.Chunks[0].FileId = "3,02637037d6"
+	if fh.ownCacheEvent(other) || !ownEvent(fh) || ownEvent(fh) {
+		t.Fatal("own download event not recognized exactly once")
+	}
+	if got := readHandle(t, fh, 8); got != "newer" || fh.entry.GetEntry().Attributes.FileMode&0777 != 0600 {
+		t.Fatalf("read %q, mode %o", got, fh.entry.GetEntry().Attributes.FileMode)
+	}
+
+	// A write before any read caches the file first: the written data is
+	// newer than the cached chunks, so a flush keeps it.
+	wfs, fh = open()
+	before := time.Now().UnixNano()
+	write(wfs, fh, "newer")
+	e := fh.entry.GetEntry()
+	if calls.Load() != 1 || len(e.Chunks) != 1 || e.Chunks[0].ModifiedTsNs < before {
+		t.Fatalf("write did not cache first: %d downloads, %+v", calls.Load(), e)
+	}
+	if got := readHandle(t, fh, 8); got != "newer" {
+		t.Fatalf("read %q", got)
+	}
+
+	// A chmod before the download stays; the content comes from the filer.
+	wfs, fh = open()
+	chmod(wfs, fh)
+	if got := readHandle(t, fh, 8); got != "world" || fh.entry.GetEntry().Attributes.FileMode&0777 != 0600 {
+		t.Fatalf("read %q, mode %o", got, fh.entry.GetEntry().Attributes.FileMode)
+	}
+	if !ownEvent(fh) {
+		t.Fatal("own download event not recognized")
+	}
+
+	// Truncating and growing cuts the cached chunks; truncating to 0
+	// drops the remote object, so nothing is fetched back.
+	wfs, fh = open()
+	setSize(t, wfs, fh, 3)
+	setSize(t, wfs, fh, 5)
+	if got := readHandle(t, fh, 8); got != "wor\x00\x00" || calls.Load() != 1 {
+		t.Fatalf("5->3->5: read %q after %d downloads", got, calls.Load())
+	}
+	wfs, fh = open()
+	setSize(t, wfs, fh, 0)
+	setSize(t, wfs, fh, 5)
+	if got := readHandle(t, fh, 8); got != "\x00\x00\x00\x00\x00" || calls.Load() != 0 || fh.entry.GetEntry().RemoteEntry != nil {
+		t.Fatalf("5->0->5: read %q after %d downloads", got, calls.Load())
+	}
+
+	// Without an open handle a size change caches the file into the entry.
+	wfs, _ = open()
+	entry := remoteOnly()
+	if err := wfs.cacheRemoteEntry("/d/a", entry); err != nil || len(entry.Chunks) != 1 || entry.RemoteEntry.GetLastLocalSyncTsNs() != 1 {
+		t.Fatalf("cache without a handle: %v %+v", err, entry)
+	}
+
+	// The filer found no remote object any more: no entry to install.
+	cacheRemoteObject = func(*WFS, *filer_pb.CacheRemoteObjectToLocalClusterRequest) (*filer_pb.CacheRemoteObjectToLocalClusterResponse, error) {
+		return &filer_pb.CacheRemoteObjectToLocalClusterResponse{}, nil
+	}
+	_, fh = open()
+	if _, err := readDataByFileHandle(make([]byte, 8), fh, 0); err == nil || fh.entry.GetEntry() == nil {
+		t.Fatalf("read without a cached entry: %v", err)
 	}
 }

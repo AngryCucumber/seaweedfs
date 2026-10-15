@@ -46,6 +46,20 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 	if status != fuse.OK || entry == nil {
 		return status
 	}
+	// The content of a remote-only file is cached before its size changes,
+	// so the change applies to it like to any chunked file.
+	if size, ok := input.GetSize(); ok && size > 0 {
+		if fh != nil {
+			if err := fh.cacheRemoteBeforeChange(); err != nil {
+				glog.Warningf("%v setattr: %v", path, err)
+				return fuse.EIO
+			}
+			entry = fh.GetEntry().GetEntry()
+		} else if err := wfs.cacheRemoteEntry(path, entry); err != nil {
+			glog.Warningf("%v setattr: %v", path, err)
+			return fuse.EIO
+		}
+	}
 	if fh != nil {
 		fh.entryLock.Lock()
 		defer fh.entryLock.Unlock()
@@ -91,6 +105,9 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 			entry.Content = entry.Content[:size]
 		}
 		if size == 0 {
+			// Nothing of a remote object remains either: without this the
+			// file would read as remote-only again and be fetched back.
+			entry.RemoteEntry = nil
 			// Nothing of a hidden inline content remains.
 			if fh != nil {
 				fh.clearHiddenContent(entry)

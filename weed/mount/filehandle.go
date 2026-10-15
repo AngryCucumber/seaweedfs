@@ -40,6 +40,12 @@ type FileHandle struct {
 	// is the size the entry had when it was set with hidden content.
 	hiddenCut  atomic.Uint64
 	hiddenSize atomic.Uint64
+	// cachedRemote holds the chunks and remote object of this handle's
+	// last download of a remote object until the filer's event for it
+	// arrives; remoteDownloadLock lets one download run at a time
+	// (filehandle_read.go).
+	cachedRemote       atomic.Pointer[filer_pb.Entry]
+	remoteDownloadLock sync.Mutex
 
 	// for debugging
 	mirrorFile *os.File
@@ -94,6 +100,7 @@ func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
 		// or the content is no longer hidden (plan 1.6).
 		fh.setEntryReadFailure(entry, resolveManifestErr)
 		fh.hiddenCut.Store(0)
+		fh.cachedRemote.Store(nil)
 		if entry.ContentHidden {
 			fh.hiddenSize.Store(fileSize)
 		}
