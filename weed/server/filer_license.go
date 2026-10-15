@@ -32,11 +32,12 @@ var licenseKvOffsetPrefixes = [][]byte{
 
 // licenseContentExempt reports whether the inline content of dir/name is
 // configuration that S3, IAM, filers, mount and MQ read over gRPC; it is
-// never hidden (contract 5.3). Lookups resolve "." and ".." in the request
-// directory (util.JoinPath), so the decision uses the resolved directory:
-// "/etc/../data" is "/data".
+// never hidden (contract 5.3). Lookups resolve "." and ".." in the joined
+// path (util.JoinPath), so the decision uses the resolved path of the
+// entry: dir "/etc/../data" or name "../data/a" under "/etc" is /data.
 func licenseContentExempt(dir, name string) bool {
-	dir = path.Clean(dir)
+	full := path.Clean(dir + "/" + name)
+	dir, name = path.Dir(full), path.Base(full)
 	if dir == "/etc" || strings.HasPrefix(dir, filer.DirectoryEtcRoot) {
 		return true
 	}

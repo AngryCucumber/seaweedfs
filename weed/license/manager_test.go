@@ -703,6 +703,139 @@ func TestManagerAcksOnlyDurableState(t *testing.T) {
 	}
 }
 
+func TestManagerDuplicateSyncWaitsForDisk(t *testing.T) {
+	c := newFakeCluster(t, "a", "b", "c")
+	c.startAll()
+	c.elect("a")
+	a, b := c.m("a"), c.m("b")
+	if _, err := a.Import(certRaw(t, 1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	c.setDown(true, "b")
+	if _, err := a.Import(certRaw(t, 2, nil)); err != nil {
+		t.Fatal(err)
+	}
+	c.setDown(false, "b")
+	st := a.State()
+	from := LeaderInfo{Address: "a", Term: c.term}
+
+	// b's next state.json write blocks until released.
+	bPath := filepath.Join(c.dirs["b"], StateDirName, StateFileName)
+	var gate atomic.Pointer[chan struct{}]
+	entered := make(chan struct{}, 1)
+	saved := writeState
+	writeState = func(path string, s *stateFile) error {
+		if path == bPath {
+			if g := gate.Swap(nil); g != nil {
+				entered <- struct{}{}
+				<-*g
+			}
+		}
+		return saved(path, s)
+	}
+	defer func() { writeState = saved }()
+	hold := func() chan struct{} {
+		g := make(chan struct{})
+		gate.Store(&g)
+		return g
+	}
+	// first starts a request whose write blocks, then a duplicate, which
+	// must not return before the first write completes.
+	check := func(what string, call func() error) {
+		t.Helper()
+		release := hold()
+		first := make(chan error, 1)
+		go func() { first <- call() }()
+		<-entered
+		second := make(chan error, 1)
+		go func() { second <- call() }()
+		select {
+		case err := <-second:
+			t.Fatalf("duplicate %s returned (%v) while the first write was still running", what, err)
+		case <-time.After(300 * time.Millisecond):
+		}
+		close(release)
+		if err := <-first; err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		if err := <-second; err != nil {
+			t.Fatalf("duplicate %s: %v", what, err)
+		}
+	}
+	check("SyncLicense", func() error { _, err := b.ApplySync(from, st); return err })
+	led := LedgerSnapshot{LedgerVersion: LedgerVersion{Term: b.Ledger().Term, Revision: 1000},
+		Entries: []LedgerEntry{{Address: "v1:8080", Type: NodeVolumeServer, LastSeen: 1, Online: true}}}
+	check("SyncLedger", func() error { return b.ApplyLedgerSync(from, led) })
+
+	c.start("b", nil)
+	if seq, l := newestSeq(c.m("b")), c.m("b").Ledger(); seq != 2 || l.Revision != 1000 {
+		t.Fatalf("b restarted with sequence %d, ledger %+v", seq, l.LedgerVersion)
+	}
+}
+
+func TestManagerAdoptsClockRepair(t *testing.T) {
+	setup := func(t *testing.T) (*fakeCluster, *Manager, []byte, *Certificate) {
+		c := newFakeCluster(t, "a", "b", "c")
+		c.startAll()
+		c.elect("a")
+		a := c.m("a")
+		if _, err := a.Import(certRaw(t, 1, nil)); err != nil {
+			t.Fatal(err)
+		}
+		now := c.now.Load()
+		a.refreshClock(now)
+		c.now.Store(now - 10) // a's wall clock went back
+		a.refreshClock(c.now.Load())
+		if s := a.Status(); s.Status != ReasonClockSuspect {
+			t.Fatalf("setup: status %s", s.Status)
+		}
+		raw := certRaw(t, 2, func(m map[string]interface{}) { m["issued_at"] = c.now.Load() - 100 })
+		cert, err := ParseCertificate(raw, c.trust)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c, a, raw, cert
+	}
+
+	t.Run("adopted from a peer", func(t *testing.T) {
+		c, a, _, cert := setup(t)
+		// b imported 2 as leader while a was away; that repaired b's clock.
+		b := c.m("b")
+		b.mu.Lock()
+		b.certs = Certs{Newest: cert}
+		b.clock = ClockState{Watermark: cert.Claims.IssuedAt, RepairSeq: 2}
+		b.bumpLocked()
+		b.mu.Unlock()
+		a.mu.Lock()
+		delete(a.acked, "b")
+		a.mu.Unlock()
+		a.pushPending(c.term)
+		waitFor(t, "a adopts b's certificate", func() bool { return newestSeq(a) == 2 })
+		waitFor(t, "the push to finish", func() bool { return !a.pushRun.Load() })
+		a.refreshClock(c.now.Load())
+		if s := a.Status(); s.Status != ReasonValid || s.RepairSeq != 2 {
+			t.Fatalf("status %s, repair %d after adopting a repaired state", s.Status, s.RepairSeq)
+		}
+	})
+
+	t.Run("imported again", func(t *testing.T) {
+		_, a, raw, cert := setup(t)
+		// a holds 2 without its repair, as an older adoptAhead left it.
+		a.mu.Lock()
+		a.certs = Certs{Newest: cert}
+		a.bumpLocked()
+		a.mu.Unlock()
+		out, err := a.Import(raw)
+		if err != nil || !out.Unchanged {
+			t.Fatalf("re-import %+v %v", out, err)
+		}
+		a.refreshClock(a.now())
+		if s := a.Status(); s.Status != ReasonValid || s.RepairSeq != 2 {
+			t.Fatalf("status %s, repair %d after importing again", s.Status, s.RepairSeq)
+		}
+	})
+}
+
 func TestManagerPrevConverges(t *testing.T) {
 	c := newFakeCluster(t, "a", "b", "c")
 	c.startAll()

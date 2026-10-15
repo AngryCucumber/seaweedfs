@@ -138,28 +138,45 @@ func (fh *FileHandle) refetchHiddenEntry() error {
 	if err != nil {
 		return err
 	}
+	dir, _ := fullPath.DirAndName()
+	cached := fh.wfs.localEntryFromFiler(dir, fresh)
 	if !fh.takeRefetchedEntry(fresh, group) {
 		return nil
 	}
-	dir, _ := fullPath.DirAndName()
-	if err := fh.wfs.metaCache.UpdateEntry(context.Background(), filer.FromPbEntry(dir, fresh)); err != nil {
+	if err := fh.wfs.metaCache.UpdateEntry(context.Background(), cached); err != nil {
 		glog.V(1).Infof("update meta cache %s: %v", fullPath, err)
 	}
 	return nil
 }
 
+// localEntryFromFiler returns the meta cache entry for an entry fetched
+// from the filer, which keeps the filer's uid and gid, and maps the entry
+// itself to the local ids that file handles hold (the meta cache maps them
+// on reads the same way).
+func (wfs *WFS) localEntryFromFiler(dir string, entry *filer_pb.Entry) *filer.Entry {
+	cached := filer.FromPbEntry(dir, entry)
+	wfs.mapPbIdFromFilerToLocal(entry)
+	return cached
+}
+
 // takeRefetchedEntry installs an entry whose content the filer no longer
-// hides. chmod, chown, utimes or xattr changes made on this handle while
-// the content was hidden are not flushed yet; they stay, and only the
-// content is taken from the filer. It reports whether the filer entry
-// replaced the local one.
+// hides, already mapped to local ids. chmod, chown, utimes, truncate or
+// xattr changes made on this handle while the content was hidden are not
+// flushed yet; they stay, and only the content is taken from the filer, cut
+// to the local size. It reports whether the filer entry replaced the local
+// one.
 func (fh *FileHandle) takeRefetchedEntry(fresh *filer_pb.Entry, group *filer.ChunkGroup) bool {
 	fh.entryLock.Lock()
 	defer fh.entryLock.Unlock()
 	fh.entryChunkGroup = group
 	if fh.dirtyMetadata {
 		fh.entry.UpdateEntry(func(e *filer_pb.Entry) {
-			e.Content = fresh.Content
+			content := fresh.Content
+			// A truncation not flushed yet keeps its size.
+			if e.Attributes != nil && e.Attributes.FileSize < uint64(len(content)) {
+				content = content[:e.Attributes.FileSize]
+			}
+			e.Content = content
 			e.ContentHidden = false
 		})
 		return false

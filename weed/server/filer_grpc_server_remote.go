@@ -192,7 +192,8 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 	fs.filer.NotifyUpdateEvent(ctx, entry, newEntry, true, false, nil)
 
 	resp.Entry = newEntry.ToProtoEntry()
-	fs.newLicenseContentFilter(ctx).apply(req.Directory, resp.Entry)
+	dir, _ := util.JoinPath(req.Directory, req.Name).DirAndName()
+	fs.newLicenseContentFilter(ctx).apply(dir, resp.Entry)
 
 	return resp, nil
 

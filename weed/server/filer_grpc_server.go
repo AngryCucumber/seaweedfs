@@ -33,7 +33,9 @@ func (fs *FilerServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.L
 	}
 
 	pbEntry := entry.ToProtoEntry()
-	fs.newLicenseContentFilter(ctx).apply(req.Directory, pbEntry)
+	// The name may hold "..": decide on the parent that was looked up.
+	dir, _ := util.JoinPath(req.Directory, req.Name).DirAndName()
+	fs.newLicenseContentFilter(ctx).apply(dir, pbEntry)
 	return &filer_pb.LookupDirectoryEntryResponse{
 		Entry: pbEntry,
 	}, nil

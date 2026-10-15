@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
@@ -82,6 +83,15 @@ func TestTakeRefetchedEntry(t *testing.T) {
 		t.Fatalf("content not taken: %+v", e)
 	}
 
+	// A truncation from 5 to 3 bytes not flushed yet keeps its size.
+	local = hidden()
+	local.Attributes.FileSize = 3
+	fh = &FileHandle{entry: &LockedEntry{Entry: local}, dirtyMetadata: true}
+	fh.takeRefetchedEntry(fresh(), nil)
+	if e := fh.entry.GetEntry(); string(e.Content) != "hel" || e.Attributes.FileSize != 3 {
+		t.Fatalf("truncated entry: size %d, content %q", e.Attributes.FileSize, e.Content)
+	}
+
 	// Without local changes the filer entry is taken as a whole.
 	fh = &FileHandle{entry: &LockedEntry{Entry: hidden()}}
 	if !fh.takeRefetchedEntry(fresh(), nil) {
@@ -89,5 +99,21 @@ func TestTakeRefetchedEntry(t *testing.T) {
 	}
 	if e := fh.entry.GetEntry(); string(e.Content) != "hello" || e.ContentHidden {
 		t.Fatalf("entry %+v", e)
+	}
+}
+
+func TestLocalEntryFromFiler(t *testing.T) {
+	mapper, err := meta_cache.NewUidGidMapper("2000:1000", "2000:1000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wfs := &WFS{option: &Option{UidGidMapper: mapper}}
+	fresh := &filer_pb.Entry{Name: "a", Content: []byte("hello"), Attributes: &filer_pb.FuseAttributes{FileMode: 0644, Uid: 1000, Gid: 1000}}
+	cached := wfs.localEntryFromFiler("/d", fresh)
+	if fresh.Attributes.Uid != 2000 || fresh.Attributes.Gid != 2000 {
+		t.Fatalf("handle entry keeps filer ids %d:%d", fresh.Attributes.Uid, fresh.Attributes.Gid)
+	}
+	if cached.Attr.Uid != 1000 || cached.Attr.Gid != 1000 || cached.FullPath != "/d/a" {
+		t.Fatalf("meta cache entry %s %d:%d, want filer ids", cached.FullPath, cached.Attr.Uid, cached.Attr.Gid)
 	}
 }

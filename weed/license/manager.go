@@ -154,10 +154,13 @@ type Manager struct {
 	clock     ClockState
 	ledger    *Ledger
 	ledgerVer LedgerVersion
-	// diskStale is set while the last state.json write failed: memory is
-	// ahead of the disk, and nothing may be acknowledged until a write
-	// succeeds (see ensureDurable).
-	diskStale bool
+	// diskRev, diskLedgerVer and diskRepairSeq describe what the last
+	// successful state.json write holds. A master confirms state only when
+	// they match memory (ensureDurable): after a failed write, and while a
+	// write of a change is still running, they lag behind.
+	diskRev       uint64
+	diskLedgerVer LedgerVersion
+	diskRepairSeq int64
 	// ledgerEpoch is the term part of the ledger versions this master
 	// writes as leader; epochFor is the raft term+1 it was chosen for, 0 for
 	// none (see ledgerEpochFor).
@@ -224,6 +227,8 @@ func NewManager(opt ManagerOption) (*Manager, error) {
 			return nil, err
 		}
 	}
+	// What was loaded is what the disk holds.
+	m.diskRev, m.diskLedgerVer, m.diskRepairSeq = m.rev, m.ledgerVer, m.clock.RepairSeq
 	if opt.LicenseFile != "" {
 		if err := m.applyLicenseFile(opt.LicenseFile); err != nil {
 			return nil, err
@@ -309,30 +314,35 @@ func (m *Manager) persist() error {
 	if len(m.key) == InternalKeySize {
 		s.InternalReadKey = EncodeInternalToken(m.key)
 	}
+	rev, ledgerVer, repairSeq := m.rev, m.ledgerVer, m.clock.RepairSeq
 	m.lastClockSave = m.timeNow()
 	m.mu.Unlock()
-	if m.stateFile == "" {
-		return nil
+	if m.stateFile != "" {
+		if err := writeState(m.stateFile, s); err != nil {
+			return err
+		}
 	}
-	err := writeState(m.stateFile, s)
 	m.mu.Lock()
-	m.diskStale = err != nil
+	m.diskRev, m.diskLedgerVer, m.diskRepairSeq = rev, ledgerVer, repairSeq
 	m.mu.Unlock()
-	return err
+	return nil
 }
 
 // writeState writes state.json; tests replace it to inject failures.
 var writeState = writeStateFile
 
-// ensureDurable rewrites state.json if the last write failed. A master
-// confirms state to the leader, or counts itself as leader, only after it
-// succeeds: otherwise a retry of an unchanged state would be confirmed
-// while the disk still holds the old one.
+// ensureDurable returns once state.json holds the current certificates,
+// key, ledger version and clock repair, writing it if it does not (persist
+// waits for a write in flight first). A master confirms state to the
+// leader, or counts itself as leader, only after this: otherwise a retry
+// of an unchanged state, or a duplicate request arriving while the first
+// one is still writing, would be confirmed while the disk holds the old
+// state.
 func (m *Manager) ensureDurable() error {
 	m.mu.Lock()
-	stale := m.diskStale
+	durable := m.diskRev == m.rev && m.diskLedgerVer == m.ledgerVer && m.diskRepairSeq == m.clock.RepairSeq
 	m.mu.Unlock()
-	if !stale {
+	if durable {
 		return nil
 	}
 	return m.persist()
@@ -857,6 +867,11 @@ func (m *Manager) adoptAhead(states []State) {
 			m.bumpLocked()
 			changed = true
 		}
+		// The peer's clock repair belongs to the certificate it imported.
+		if m.clusterID == s.ClusterID && s.Clock.RepairSeq > m.clock.RepairSeq {
+			m.clock = m.clock.Merge(s.Clock)
+			changed = true
+		}
 		m.mu.Unlock()
 	}
 	if changed {
@@ -996,6 +1011,11 @@ func (m *Manager) Import(raw []byte) (*ImportOutcome, error) {
 		m.certs = res.Certs
 		m.clock = m.clock.RepairOnImport(c, now)
 		m.bumpLocked()
+	} else {
+		// The certificate may have come from a peer without its clock
+		// repair (adoptAhead before it merged clocks); importing it again
+		// applies the repair.
+		m.clock = m.clock.RepairOnImport(c, now)
 	}
 	st, rev := m.stateLocked(), m.rev
 	m.mu.Unlock()

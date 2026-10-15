@@ -31,6 +31,7 @@ func TestLicenseContentExempt(t *testing.T) {
 		{"/topics/ns/t/v2025", "group.offset"},
 		{"/etc/", "a"},
 		{"/data/../etc/iam", "identity.json"},
+		{"/data", "../etc/iam/identity.json"},
 	}
 	for _, p := range exempt {
 		if !licenseContentExempt(p[0], p[1]) {
@@ -44,6 +45,8 @@ func TestLicenseContentExempt(t *testing.T) {
 		{"/topics/ns/t", "data"},
 		{"/buckets/etc", "identity.json"},
 		{"/etc/../data", "a"},
+		{"/etc", "../data/a"},
+		{"/etc/iam", "../../data/a"},
 		{"/etc/../../data", "a"},
 		{"/topics/../data", "topic.conf"},
 		{"etc/iam", "identity.json"},
