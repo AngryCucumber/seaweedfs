@@ -158,6 +158,8 @@ func (fh *FileHandle) resolveChunksAgain(f *readFailure) error {
 		group.AddChunk(chunk)
 	}
 	fh.entryChunkGroup = group
+	// The chunks of a manifest become visible only now.
+	fh.noteChunks(current, group)
 	return nil
 }
 

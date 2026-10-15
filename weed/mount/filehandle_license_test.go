@@ -775,6 +775,51 @@ func TestWriteAfterUploadedChunks(t *testing.T) {
 	}
 }
 
+// A manifest that could not be resolved when the handle opened brings the
+// timestamps of its chunks only when a retry resolves it: a write after
+// that is later than them.
+func TestWriteAfterManifestResolved(t *testing.T) {
+	util_http.InitGlobalHttpClient()
+	ahead := time.Now().Add(30 * time.Second).UnixNano()
+	chunks := []*filer_pb.FileChunk{{FileId: "3,01637037d6", Size: 5, ModifiedTsNs: ahead}}
+	filer_pb.BeforeEntrySerialization(chunks)
+	manifest, err := proto.Marshal(&filer_pb.FileChunkManifest{Chunks: chunks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var licensed atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !licensed.Load() {
+			http.Error(w, "NO_LICENSE", http.StatusForbidden)
+			return
+		}
+		w.Write(manifest)
+	}))
+	t.Cleanup(server.Close)
+	wfs := testWFS(t)
+	wfs.option.VolumeServerAccess = "filerProxy"
+	wfs.option.FilerAddresses = []pb.ServerAddress{pb.ServerAddress(strings.TrimPrefix(server.URL, "http://"))}
+	wfs.chunkCache = chunk_cache.NewTieredChunkCache(16, t.TempDir(), 64, 1024)
+	wfs.chunkCache.SetChunk("3,01637037d6", []byte("world"))
+	fh := wfs.testOpen("/d/a", &filer_pb.Entry{Name: "a", Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 5},
+		Chunks: []*filer_pb.FileChunk{{FileId: "3,0f637037d6", Size: 5, IsChunkManifest: true}}})
+	f := fh.readFailure.Load()
+	if f == nil {
+		t.Fatal("manifest resolved without a certificate")
+	}
+	licensed.Store(true)
+	fh.readFailure.Store(&readFailure{err: f.err, at: time.Now().Add(-readRetryInterval)})
+	if got := readHandle(t, fh, 8); got != "world" || fh.readError() != nil {
+		t.Fatalf("read %q, error %v after the retry", got, fh.readError())
+	}
+	if _, code := wfs.Write(nil, &fuse.WriteIn{Fh: uint64(fh.fh), Size: 5}, []byte("newer")); code != fuse.OK {
+		t.Fatalf("write: %v", code)
+	}
+	if fh.lastWriteTsNs <= ahead {
+		t.Fatalf("write at %d, resolved chunk at %d", fh.lastWriteTsNs, ahead)
+	}
+}
+
 // The write timestamp does not depend on the number of chunks.
 func BenchmarkWriteTsNs(b *testing.B) {
 	for _, n := range []int{500, 50000} {

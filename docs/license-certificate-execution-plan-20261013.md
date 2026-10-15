@@ -122,7 +122,7 @@ v4 处理：只在只读 HTTP 接口（M1）隐藏，gRPC 面列为边界。部�
 
 独立 `weed mount` 首次打开含 manifest 的文件时，要经 volume GET 解析 manifest，它没有内部令牌，证书无效时被拒。现有代码在 [filehandle.go:78](../weed/mount/filehandle.go:78) 对解析失败只打 `Warningf`，分块表为空；随后 [filechunk_group.go:59](../weed/filer/filechunk_group.go:59) 把缺失区间当作稀疏文件补零并返回成功，应用会拿到伪造的全零正文而不是错误。
 
-续期后对隐藏正文条目的重取（P3 实现，`refetchHiddenEntry`）**保留句柄上尚未 flush 的本地修改（2026-10-14 修订，8.6；2026-10-15 补充截断与 id 映射，8.8；同日再修订，8.9–8.14）**：读失败状态单独记录“正文隐藏”，重试方式按它决定，不按最近一次错误：查询 filer 失败只替换错误，下次重试仍是重取条目，直到取回正文或写入丢弃正文；重取在锁外等待 filer 应答，期间截断到 0 或句柄装入新条目都会替换句柄的读失败状态；应答回来时若句柄已不是发起时的状态，结果整个丢弃，既不装入正文，也不恢复读错误；取回的正文按句柄上的文件大小截断（未提交的截断），并从句柄在隐藏期间截到过的最小非 0 长度起补零（先截短再扩长时，被截掉的字节不能回来）；隐藏期间截短后又扩长、使截到的最小长度小于当前大小时，flush 返回 `EIO`（`CONTENT_HIDDEN`）而不发送，因为大小回到原值时 filer 会按纯元数据更新补回全部旧字节（其余大小 filer 本就拒绝）；`copy_file_range` 与写入一样丢弃内联正文并清除隐藏标志；整体替换时先把 filer 的 uid/gid 映射为本地 id（与 meta cache 读出时相同），meta cache 仍存 filer 的 id；证书无效期间在打开的句柄上做的 `chmod`、`chown`、`utimes`、`setfattr` 只记在句柄里，等 flush 才写回 filer；重取时若句柄有未提交修改，只取 filer 的正文、清除隐藏标志，其余字段保持本地，meta cache 等 flush 后更新；没有未提交修改时才整体替换。“正文”是内联字节、分块、远端对象描述、大小与 MD5 一起取，分块组按 filer 的分块重建（8.12、8.13）：其间别的客户端可能已改写文件，包括改为分块存储或远端对象。句柄在隐藏期间改过大小（截断或扩长，与隐藏时的大小比较）时，只能把内联字节按本地大小裁剪；filer 已改为分块存储或远端对象则无法合并，保持隐藏与读失败，之后 flush 由 filer 以 `CONTENT_HIDDEN` 拒绝，不会丢掉 filer 上的分块。取回的是远端对象时，首次读取、写入或改变大小前经 `CacheRemoteObjectToLocalCluster` 缓存，缓存结果装入句柄并换上新的分块组，句柄上只可能有的属性修改保留；截断到 0 去掉远端描述（8.14）。写入与 `copy_file_range` 的时间戳晚于条目全部分块与句柄上一次写入，覆盖顺序不依赖 mount 与 filer 的时钟一致；属性修改与读写、filer 事件同持句柄锁（8.15）。分块的最大时间戳在分块进入条目时维护，写入不遍历分块（8.16）。
+续期后对隐藏正文条目的重取（P3 实现，`refetchHiddenEntry`）**保留句柄上尚未 flush 的本地修改（2026-10-14 修订，8.6；2026-10-15 补充截断与 id 映射，8.8；同日再修订，8.9–8.14）**：读失败状态单独记录“正文隐藏”，重试方式按它决定，不按最近一次错误：查询 filer 失败只替换错误，下次重试仍是重取条目，直到取回正文或写入丢弃正文；重取在锁外等待 filer 应答，期间截断到 0 或句柄装入新条目都会替换句柄的读失败状态；应答回来时若句柄已不是发起时的状态，结果整个丢弃，既不装入正文，也不恢复读错误；取回的正文按句柄上的文件大小截断（未提交的截断），并从句柄在隐藏期间截到过的最小非 0 长度起补零（先截短再扩长时，被截掉的字节不能回来）；隐藏期间截短后又扩长、使截到的最小长度小于当前大小时，flush 返回 `EIO`（`CONTENT_HIDDEN`）而不发送，因为大小回到原值时 filer 会按纯元数据更新补回全部旧字节（其余大小 filer 本就拒绝）；`copy_file_range` 与写入一样丢弃内联正文并清除隐藏标志；整体替换时先把 filer 的 uid/gid 映射为本地 id（与 meta cache 读出时相同），meta cache 仍存 filer 的 id；证书无效期间在打开的句柄上做的 `chmod`、`chown`、`utimes`、`setfattr` 只记在句柄里，等 flush 才写回 filer；重取时若句柄有未提交修改，只取 filer 的正文、清除隐藏标志，其余字段保持本地，meta cache 等 flush 后更新；没有未提交修改时才整体替换。“正文”是内联字节、分块、远端对象描述、大小与 MD5 一起取，分块组按 filer 的分块重建（8.12、8.13）：其间别的客户端可能已改写文件，包括改为分块存储或远端对象。句柄在隐藏期间改过大小（截断或扩长，与隐藏时的大小比较）时，只能把内联字节按本地大小裁剪；filer 已改为分块存储或远端对象则无法合并，保持隐藏与读失败，之后 flush 由 filer 以 `CONTENT_HIDDEN` 拒绝，不会丢掉 filer 上的分块。取回的是远端对象时，首次读取、写入或改变大小前经 `CacheRemoteObjectToLocalCluster` 缓存，缓存结果装入句柄并换上新的分块组，句柄上只可能有的属性修改保留；截断到 0 去掉远端描述（8.14）。写入与 `copy_file_range` 的时间戳晚于条目全部分块与句柄上一次写入，覆盖顺序不依赖 mount 与 filer 的时钟一致；属性修改与读写、filer 事件同持句柄锁（8.15）。分块的最大时间戳在分块进入条目时维护，含重试解析 manifest 成功时，写入不遍历分块（8.16、8.17）。
 
 处理：`FileHandle` 记录 `resolveManifestErr` 与 `lastResolveAttempt`；读取入口（`filehandle_read.go`）在该错误非空时：若距上次尝试 ≥ 5 秒，用同一 entry 重新调用 `NewChunkGroup`，成功则清错并正常读，失败则更新时间戳并返回 `EIO`；5 秒内直接 `EIO`，不发网络请求。只在失败状态重试，正常读取不新增任何调用。这样续期或网络恢复后，原句柄与按 inode 复用的句柄（[filehandle_map.go:44](../weed/mount/filehandle_map.go:44) 只在 entry 指针变化时重解析）都会在目标 volume 新证书生效后、下一次满足重试间隔的读取时触发重解析并恢复，不需要关闭全部旧句柄；端到端时间见 S1b。写入不受该错误影响（写路径不依赖已解析的分块表）。v9 起同一入口还处理 `ContentHidden` 条目（1.5）：返回 `EIO`，失败态下 ≥ 5 秒用 `LookupDirectoryEntry` 重取，未隐藏则替换句柄条目并写回 meta cache；两类重试共用 single-flight 与节流。mount 改动合计约 40 行。同样的补零逻辑在 filer 进程内不触发：filer 的 manifest 解析带内部令牌（1.4）。S1b 验收。
 
@@ -929,6 +929,14 @@ e 的 filer 读取是上游另一个问题：普通分块文件经 mount 截断�
 单测 `TestWriteAfterUploadedChunks`：一个协程追加 1000 个时间戳领先 5 秒的分块（`AddChunks` 与分块组），主协程在句柄排他锁内反复取写入时间戳并做修改前缓存判断，之后一次写入的时间戳晚于全部追加的分块；去掉修复后 `-race` 报告竞争。基准 `BenchmarkWriteTsNs`：500 与 50000 个分块都约 25 ns、零分配。
 
 修复后 mount（含 `page_writer`）与 filer 全包 `-race` 通过；server、license、s3api、command、shell 测试（`CGO_ENABLED=0`）与 Linux 交叉编译通过，`go vet ./mount/ ./filer/` 只报上游已有的一条。本轮未重做真实 FUSE 验收与 S13。
+
+### 8.17 外部第十二轮审核（性能复测）修复（2026-10-15）
+
+第十二轮审核基于 `c00783ec7`，复测 8.16：4 KB 写入（`WFS.Write` 写入内存缓冲，不含网络与落盘，五轮中位数）500、5000、50000 分块分别从 1.24、9.30、97.60 µs 降到 0.40、0.40、0.41 µs；时间戳计算约 25 ns、零分配；50000 分块的条目初始化多约 0.09 ms（1.91 → 2.00 ms），不再由每次写入承担。8.16 的两项并发复现连续三轮通过。
+
+另确认 1 项条件性回归（P2）：manifest 首次解析失败（无证书）、重试成功时，`resolveChunksAgain` 装入新分块组没有抬高 `chunkTsNs`，而 `SetEntry` 时分块组里还没有 manifest 的内部分块（manifest 块本身的时间戳为 0）。内部分块的时间戳若领先本机（复现用 30 秒），之后的写入时间戳更旧，上传后读取仍是旧内容。8.16 把“同一批分块重建分块组”当作不引入新时间戳，漏掉了这种情况。
+
+修复：`resolveChunksAgain` 装入新分块组时同样调用 `noteChunks`。单测 `TestWriteAfterManifestResolved`：manifest 经 filer 代理从 httptest 取，首次 403、恢复后内部分块时间戳领先 30 秒，重试读到 `world` 后写入的时间戳晚于该分块；去掉修复则失败。mount 全包 `-race` 通过。
 
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 
