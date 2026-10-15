@@ -7,6 +7,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/filer/leveldb"
@@ -179,6 +180,19 @@ func TestMergeHiddenContent(t *testing.T) {
 		t.Fatalf("truncated: %v %+v", err, in)
 	}
 
+	// The file became a remote object after the client read it: the client
+	// entry no longer describes what is stored.
+	remote := &filer_pb.RemoteEntry{StorageName: "s3", RemoteSize: 5, RemoteETag: "e"}
+	remoteOnly := &filer.Entry{FullPath: "/d/f", Attr: filer.Attr{FileSize: 5}, Remote: remote}
+	if err := mergeHiddenContent(remoteOnly, hidden(5)); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("older entry over a remote object: %v", err)
+	}
+	in = hidden(5)
+	in.RemoteEntry = proto.Clone(remote).(*filer_pb.RemoteEntry)
+	if err := mergeHiddenContent(remoteOnly, in); err != nil || in.ContentHidden || !proto.Equal(in.RemoteEntry, remote) {
+		t.Fatalf("metadata update of a remote object: %v %+v", err, in)
+	}
+
 	// The stored form never carries the flag.
 	stored := filer.FromPbEntry("/d", hidden(5))
 	stored.ContentHidden = false
@@ -241,5 +255,40 @@ func TestLicenseMergeHiddenHardLink(t *testing.T) {
 	in = &filer_pb.Entry{Name: "c", ContentHidden: true, Attributes: &filer_pb.FuseAttributes{FileSize: 5}}
 	if err := fs.licenseMergeHiddenContent(ctx, "/d/c", nil, in); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("new name: %v", err)
+	}
+}
+
+// A mount or S3 client holding the hidden inline entry of a file that has
+// become a remote object since must not store an entry without it.
+func TestLicenseMergeHiddenRemote(t *testing.T) {
+	testFiler := filer.NewFiler(pb.ServerDiscovery{}, nil, "", "", "", "", "", 255, nil)
+	store := &leveldb.LevelDBStore{}
+	if err := store.Initialize(testStoreDir(t.TempDir()), ""); err != nil {
+		t.Fatal(err)
+	}
+	testFiler.SetStore(store)
+	fs := &FilerServer{filer: testFiler, license: licensetest.DeniedNode(t)}
+	ctx := context.Background()
+
+	remote := &filer_pb.RemoteEntry{StorageName: "s3", RemoteSize: 5, RemoteETag: "e"}
+	stored := &filer.Entry{FullPath: "/d/r", Attr: filer.Attr{Mode: 0644, FileSize: 5}, Remote: remote}
+	if err := testFiler.CreateEntry(ctx, stored, false, false, nil, false, 255); err != nil {
+		t.Fatal(err)
+	}
+	stale := &filer_pb.Entry{Name: "r", ContentHidden: true, Attributes: &filer_pb.FuseAttributes{FileSize: 5, FileMode: 0600}}
+	if err := fs.licenseMergeHiddenContent(ctx, "/d/r", nil, stale); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("older entry: %v", err)
+	}
+	current := &filer_pb.Entry{Name: "r", ContentHidden: true, RemoteEntry: proto.Clone(remote).(*filer_pb.RemoteEntry),
+		Attributes: &filer_pb.FuseAttributes{FileSize: 5, FileMode: 0600}}
+	if err := fs.licenseMergeHiddenContent(ctx, "/d/r", nil, current); err != nil {
+		t.Fatal(err)
+	}
+	if err := testFiler.CreateEntry(ctx, filer.FromPbEntry("/d", current), false, false, nil, false, 255); err != nil {
+		t.Fatal(err)
+	}
+	got, err := testFiler.FindEntry(ctx, "/d/r")
+	if err != nil || !proto.Equal(got.Remote, remote) || got.Mode&0777 != 0600 {
+		t.Fatalf("stored %+v, %v", got, err)
 	}
 }

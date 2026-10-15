@@ -234,21 +234,22 @@ func (fh *FileHandle) takeRefetchedEntry(f *readFailure, fresh *filer_pb.Entry, 
 
 // takeContent puts the content of fresh into the local entry e and keeps
 // the rest of e. Without a size change on this handle the filer's inline
-// bytes, chunks, size and md5 are taken together, whatever another client
-// wrote meanwhile. After a truncation or extension only inline bytes can be
-// cut to the local size (keptContent); chunks that the filer holds now
-// cannot be, so the content stays hidden and a flush is refused by the
-// filer (CONTENT_HIDDEN) instead of dropping them.
+// bytes, chunks, remote object, size and md5 are taken together, whatever
+// another client wrote meanwhile. After a truncation or extension only
+// inline bytes can be cut to the local size (keptContent); chunks or a
+// remote object that the filer holds now cannot be, so the content stays
+// hidden and a flush is refused by the filer (CONTENT_HIDDEN) instead of
+// dropping them.
 func (fh *FileHandle) takeContent(e, fresh *filer_pb.Entry) error {
 	cut := fh.hiddenCut.Load()
 	if cut == 0 && e.Attributes.FileSize == fh.hiddenSize.Load() {
-		e.Content, e.Chunks = fresh.Content, fresh.Chunks
+		e.Content, e.Chunks, e.RemoteEntry = fresh.Content, fresh.Chunks, fresh.RemoteEntry
 		e.Attributes.FileSize = filer.FileSize(fresh)
 		e.Attributes.Md5 = fresh.GetAttributes().GetMd5()
-	} else if len(fresh.Chunks) > 0 {
-		return fmt.Errorf("size changed on this handle while the content, now in chunks, was hidden: %w", filer_pb.ErrContentHidden)
+	} else if len(fresh.Chunks) > 0 || fresh.RemoteEntry != nil {
+		return fmt.Errorf("size changed on this handle while the content, now in chunks or a remote object, was hidden: %w", filer_pb.ErrContentHidden)
 	} else {
-		e.Content, e.Chunks = keptContent(fresh.Content, e.Attributes.FileSize, cut), nil
+		e.Content, e.Chunks, e.RemoteEntry = keptContent(fresh.Content, e.Attributes.FileSize, cut), nil, nil
 	}
 	e.ContentHidden = false
 	return nil

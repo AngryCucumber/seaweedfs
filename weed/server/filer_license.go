@@ -193,12 +193,18 @@ func (fs *FilerServer) hardLinkEntry(ctx context.Context, id []byte) (*filer.Ent
 // content, an entry whose bytes cannot be known is refused with
 // CONTENT_HIDDEN, and anything else (new content, changed chunks, a
 // truncation) is written as sent. The flag itself is never stored.
+//
+// An update is metadata-only when it has the size, chunks and remote object
+// of the stored entry: the client then saw the content that is stored. A
+// client holding an older entry, such as one from before the file became a
+// remote object, would otherwise drop what the stored entry points to.
 func mergeHiddenContent(existing *filer.Entry, in *filer_pb.Entry) error {
 	in.ContentHidden = false
 	if len(in.Content) > 0 {
 		return nil
 	}
-	if existing != nil && filer.FileSize(in) == existing.Size() && sameChunks(existing.GetChunks(), in.GetChunks()) {
+	if existing != nil && filer.FileSize(in) == existing.Size() && sameChunks(existing.GetChunks(), in.GetChunks()) &&
+		proto.Equal(existing.Remote, in.RemoteEntry) {
 		in.Content = existing.Content
 		return nil
 	}

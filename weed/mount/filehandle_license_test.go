@@ -120,6 +120,18 @@ func TestTakeRefetchedEntry(t *testing.T) {
 		t.Fatalf("longer inline rewrite: size %d, content %q", e.Attributes.FileSize, e.Content)
 	}
 
+	// Or turned it into a remote object: reads must fetch it, not return
+	// the empty inline content.
+	remoteOnly := &filer_pb.Entry{Name: "a", RemoteEntry: &filer_pb.RemoteEntry{StorageName: "s3", RemoteSize: 5},
+		Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 5}}
+	local = hidden()
+	local.Attributes.FileMode = 0600
+	fh = handle(local, true)
+	take(fh, remoteOnly)
+	if e := fh.entry.GetEntry(); !e.IsInRemoteOnly() || e.Attributes.FileMode != 0600 || e.ContentHidden {
+		t.Fatalf("remote rewrite: %+v", e)
+	}
+
 	// A truncation from 5 to 3 bytes not flushed yet keeps its size.
 	local = hidden()
 	local.Attributes.FileSize = 3
@@ -130,16 +142,19 @@ func TestTakeRefetchedEntry(t *testing.T) {
 		t.Fatalf("truncated entry: size %d, content %q", e.Attributes.FileSize, e.Content)
 	}
 
-	// Chunks cannot be cut to a local size change: the content stays hidden.
-	local = hidden()
-	local.Attributes.FileSize = 3
-	fh = handle(local, true)
-	fh.hiddenCut.Store(3)
-	if _, err := fh.takeRefetchedEntry(hide(fh), chunked, nil); !errors.Is(err, filer_pb.ErrContentHidden) {
-		t.Fatalf("merged chunks into a truncated handle: %v", err)
-	}
-	if e := fh.entry.GetEntry(); !e.ContentHidden || len(e.Chunks) != 0 || e.Attributes.FileSize != 3 {
-		t.Fatalf("entry changed: %+v", e)
+	// Chunks or a remote object cannot be cut to a local size change: the
+	// content stays hidden.
+	for _, fresh := range []*filer_pb.Entry{chunked, remoteOnly} {
+		local = hidden()
+		local.Attributes.FileSize = 3
+		fh = handle(local, true)
+		fh.hiddenCut.Store(3)
+		if _, err := fh.takeRefetchedEntry(hide(fh), fresh, nil); !errors.Is(err, filer_pb.ErrContentHidden) {
+			t.Fatalf("merged %+v into a truncated handle: %v", fresh, err)
+		}
+		if e := fh.entry.GetEntry(); !e.ContentHidden || len(e.Chunks) != 0 || e.RemoteEntry != nil || e.Attributes.FileSize != 3 {
+			t.Fatalf("entry changed: %+v", e)
+		}
 	}
 
 	// Without local changes the filer entry is taken as a whole.

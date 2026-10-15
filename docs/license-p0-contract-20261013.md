@@ -344,7 +344,7 @@ P3 修订：
 | --- | --- |
 | `content_hidden=false` | 原样（现有行为） |
 | `content_hidden=true` 且 `Content` 非空 | 客户端显式给了新正文，按来者写入 |
-| `content_hidden=true`、`Content` 为空、已有条目存在且 chunks 与 `FileSize` 都与已有条目相同 | 纯元数据更新（S3 标签、`touch`、mount chmod/xattr/硬链接、Java HDFS 属性更新）：**保留已有 `Content`** |
+| `content_hidden=true`、`Content` 为空、已有条目存在且 chunks、`FileSize` 与远端对象描述（`remote_entry`）都与已有条目相同（2026-10-15 修订，计划 8.13：加入远端对象描述） | 纯元数据更新（S3 标签、`touch`、mount chmod/xattr/硬链接、Java HDFS 属性更新）：**保留已有 `Content`** |
 | `content_hidden=true`、`Content` 为空、无 chunks 且 `FileSize > 0`，且不满足上一行 | 字节未知（隐藏条目被复制到新位置或内容已变），返回 `FailedPrecondition`，消息 `license: CONTENT_HIDDEN` |
 | 其它（chunks 变化，或截断到 0） | 客户端改写了数据（mount 写入、`copy_file_range`、截断），按来者写入，旧正文丢弃。与上游一致：mount 写内联文件本就直接丢弃原正文（`mount/weedfs_file_write.go:60`），隐藏不引入新的数据丢失 |
 
@@ -370,7 +370,7 @@ P3 修订：
 - 元数据聚合（`meta_aggregator.go`）在事件写入聚合日志与 Replay 之前检查隐藏条目，遇到即断开并从该事件重新订阅；新 filer 引导遇到隐藏条目每 5 秒重试，直到拿到令牌。
 - `weed filer.cat` 出错时打印到 stderr 并以 1 退出（上游吞掉全部错误）；`fs.meta.save` 遇到隐藏条目时删除未完成的转储文件；`filer.meta.backup` 首轮遍历报错退出。
 - webdav 读入口对隐藏条目返回 `ErrContentHidden`（上游 webdav 不读 `Entry.Content`，内联文件本就返回全零，这一上游缺陷未改）。
-- mount：来自 meta cache 的隐藏条目在新句柄上首次读取立即重取一次，之后 ≥ 5 秒一次；mount 写入丢弃内联正文（上游行为）后清除隐藏标志。2026-10-15 修订（计划 8.9）：`copy_file_range` 同样清除隐藏标志。句柄上截短隐藏正文后又扩长回原大小时，按写入合并规则第三行 filer 会补回被截掉的字节；因此截到的最小长度小于当前大小时，mount 在 flush 时返回 `EIO`（`CONTENT_HIDDEN`），不发送（大小不同于原值时 filer 本就拒绝）；续期重取的正文从该长度起补零。重取应答回来时句柄若已不是发起时的状态（截断到 0、装入新条目），结果整个丢弃（计划 8.10）。查询 filer 失败不改变“正文隐藏”状态，之后仍重取条目，不会按无 chunks 的内联文件返回全零（计划 8.11）。句柄有未提交修改时，重取把内联字节、分块、大小与 MD5 一起取回；句柄改过大小而 filer 已改为分块存储时不合并，保持隐藏（计划 8.12）。
+- mount：来自 meta cache 的隐藏条目在新句柄上首次读取立即重取一次，之后 ≥ 5 秒一次；mount 写入丢弃内联正文（上游行为）后清除隐藏标志。2026-10-15 修订（计划 8.9）：`copy_file_range` 同样清除隐藏标志。句柄上截短隐藏正文后又扩长回原大小时，按写入合并规则第三行 filer 会补回被截掉的字节；因此截到的最小长度小于当前大小时，mount 在 flush 时返回 `EIO`（`CONTENT_HIDDEN`），不发送（大小不同于原值时 filer 本就拒绝）；续期重取的正文从该长度起补零。重取应答回来时句柄若已不是发起时的状态（截断到 0、装入新条目），结果整个丢弃（计划 8.10）。查询 filer 失败不改变“正文隐藏”状态，之后仍重取条目，不会按无 chunks 的内联文件返回全零（计划 8.11）。句柄有未提交修改时，重取把内联字节、分块、远端对象描述、大小与 MD5 一起取回；句柄改过大小而 filer 已改为分块存储或远端对象时不合并，保持隐藏（计划 8.12、8.13）。
 - 8.2 的 S20 中“mount 硬链接后正文完整”“mount 截断到 0 得到空文件”原受上游缺陷限制（基线版本的 mount 对内联文件做硬链接即返回 `EIO` 并清空原正文，`truncate -s 0` 对内联文件不生效），P3 已修复并验证。写入合并规则补充：带 `content_hidden` 新建的名字不存在已有条目但带 `hard_link_id` 时，以共享的硬链接数据作为已有条目；隐藏正文的文件截断到非 0 长度返回 `CONTENT_HIDDEN`。
 - 边界补充：master 的 gRPC `GetLicense(include_state=true)`（master 之间对账用）不鉴权，能连 master 的任何客户端都可取得 `internal_read_key`；filer 按 `notification.toml` 发往外部队列的事件不隐藏内联正文。2026-10-14 修订：前者已加固，master 之间的 `GetLicense(include_state=true)`、`GetLedger`、`SyncLicense`、`SyncLedger` 只接受来源 IP 属于 raft 成员、`-peers` 或 `[master.license] peer_ips` 的调用，其余返回 `PermissionDenied`（计划 1.3、8.4）；gRPC mTLS 不作为部署要求。
 

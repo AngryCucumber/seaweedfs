@@ -122,7 +122,7 @@ v4 处理：只在只读 HTTP 接口（M1）隐藏，gRPC 面列为边界。部�
 
 独立 `weed mount` 首次打开含 manifest 的文件时，要经 volume GET 解析 manifest，它没有内部令牌，证书无效时被拒。现有代码在 [filehandle.go:78](../weed/mount/filehandle.go:78) 对解析失败只打 `Warningf`，分块表为空；随后 [filechunk_group.go:59](../weed/filer/filechunk_group.go:59) 把缺失区间当作稀疏文件补零并返回成功，应用会拿到伪造的全零正文而不是错误。
 
-续期后对隐藏正文条目的重取（P3 实现，`refetchHiddenEntry`）**保留句柄上尚未 flush 的本地修改（2026-10-14 修订，8.6；2026-10-15 补充截断与 id 映射，8.8；同日再修订，8.9、8.10、8.11、8.12）**：读失败状态单独记录“正文隐藏”，重试方式按它决定，不按最近一次错误：查询 filer 失败只替换错误，下次重试仍是重取条目，直到取回正文或写入丢弃正文；重取在锁外等待 filer 应答，期间截断到 0 或句柄装入新条目都会替换句柄的读失败状态；应答回来时若句柄已不是发起时的状态，结果整个丢弃，既不装入正文，也不恢复读错误；取回的正文按句柄上的文件大小截断（未提交的截断），并从句柄在隐藏期间截到过的最小非 0 长度起补零（先截短再扩长时，被截掉的字节不能回来）；隐藏期间截短后又扩长、使截到的最小长度小于当前大小时，flush 返回 `EIO`（`CONTENT_HIDDEN`）而不发送，因为大小回到原值时 filer 会按纯元数据更新补回全部旧字节（其余大小 filer 本就拒绝）；`copy_file_range` 与写入一样丢弃内联正文并清除隐藏标志；整体替换时先把 filer 的 uid/gid 映射为本地 id（与 meta cache 读出时相同），meta cache 仍存 filer 的 id；证书无效期间在打开的句柄上做的 `chmod`、`chown`、`utimes`、`setfattr` 只记在句柄里，等 flush 才写回 filer；重取时若句柄有未提交修改，只取 filer 的正文、清除隐藏标志，其余字段保持本地，meta cache 等 flush 后更新；没有未提交修改时才整体替换。“正文”是内联字节、分块、大小与 MD5 一起取，分块组按 filer 的分块重建（8.12）：其间别的客户端可能已改写文件，包括改为分块存储。句柄在隐藏期间改过大小（截断或扩长，与隐藏时的大小比较）时，只能把内联字节按本地大小裁剪；filer 已改为分块存储则无法合并，保持隐藏与读失败，之后 flush 由 filer 以 `CONTENT_HIDDEN` 拒绝，不会丢掉 filer 上的分块。
+续期后对隐藏正文条目的重取（P3 实现，`refetchHiddenEntry`）**保留句柄上尚未 flush 的本地修改（2026-10-14 修订，8.6；2026-10-15 补充截断与 id 映射，8.8；同日再修订，8.9–8.13）**：读失败状态单独记录“正文隐藏”，重试方式按它决定，不按最近一次错误：查询 filer 失败只替换错误，下次重试仍是重取条目，直到取回正文或写入丢弃正文；重取在锁外等待 filer 应答，期间截断到 0 或句柄装入新条目都会替换句柄的读失败状态；应答回来时若句柄已不是发起时的状态，结果整个丢弃，既不装入正文，也不恢复读错误；取回的正文按句柄上的文件大小截断（未提交的截断），并从句柄在隐藏期间截到过的最小非 0 长度起补零（先截短再扩长时，被截掉的字节不能回来）；隐藏期间截短后又扩长、使截到的最小长度小于当前大小时，flush 返回 `EIO`（`CONTENT_HIDDEN`）而不发送，因为大小回到原值时 filer 会按纯元数据更新补回全部旧字节（其余大小 filer 本就拒绝）；`copy_file_range` 与写入一样丢弃内联正文并清除隐藏标志；整体替换时先把 filer 的 uid/gid 映射为本地 id（与 meta cache 读出时相同），meta cache 仍存 filer 的 id；证书无效期间在打开的句柄上做的 `chmod`、`chown`、`utimes`、`setfattr` 只记在句柄里，等 flush 才写回 filer；重取时若句柄有未提交修改，只取 filer 的正文、清除隐藏标志，其余字段保持本地，meta cache 等 flush 后更新；没有未提交修改时才整体替换。“正文”是内联字节、分块、远端对象描述、大小与 MD5 一起取，分块组按 filer 的分块重建（8.12、8.13）：其间别的客户端可能已改写文件，包括改为分块存储或远端对象。句柄在隐藏期间改过大小（截断或扩长，与隐藏时的大小比较）时，只能把内联字节按本地大小裁剪；filer 已改为分块存储或远端对象则无法合并，保持隐藏与读失败，之后 flush 由 filer 以 `CONTENT_HIDDEN` 拒绝，不会丢掉 filer 上的分块。
 
 处理：`FileHandle` 记录 `resolveManifestErr` 与 `lastResolveAttempt`；读取入口（`filehandle_read.go`）在该错误非空时：若距上次尝试 ≥ 5 秒，用同一 entry 重新调用 `NewChunkGroup`，成功则清错并正常读，失败则更新时间戳并返回 `EIO`；5 秒内直接 `EIO`，不发网络请求。只在失败状态重试，正常读取不新增任何调用。这样续期或网络恢复后，原句柄与按 inode 复用的句柄（[filehandle_map.go:44](../weed/mount/filehandle_map.go:44) 只在 entry 指针变化时重解析）都会在目标 volume 新证书生效后、下一次满足重试间隔的读取时触发重解析并恢复，不需要关闭全部旧句柄；端到端时间见 S1b。写入不受该错误影响（写路径不依赖已解析的分块表）。v9 起同一入口还处理 `ContentHidden` 条目（1.5）：返回 `EIO`，失败态下 ≥ 5 秒用 `LookupDirectoryEntry` 重取，未隐藏则替换句柄条目并写回 meta cache；两类重试共用 single-flight 与节流。mount 改动合计约 40 行。同样的补零逻辑在 filer 进程内不触发：filer 的 manifest 解析带内部令牌（1.4）。S1b 验收。
 
@@ -460,7 +460,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | P2 master 管理 | proto（先行）、manager、HTTP/gRPC、voter 多数派、任期与配置索引、对账写回、账本 `(term,revision)` 复制与对账、对账期间注册延后、加入两阶段、移除前重提交、`voters_acked`、cluster_id、令牌、水位、页面 | **已完成（2026-10-13）**，证据与差异见 8.1：`go test -race ./weed/license/` 通过（含 19 个 manager 用例）；`server/command/shell/cluster/topology/wdclient/pb` 测试通过；真实进程验证单 master、goraft 与 hashicorp 3 master、3→5 扩容与缩容、切主对账、页面导入、`license.init` 与 `-license.file`、日志无证书与令牌 | 6 天 |
 | P3 下发与拦截 | 按流对账、volume/filer 守卫、M1、G1（含 `filer.proto`、合并规则、客户端改动）、G2、缓存、内部令牌传递链、mount 错误传播、S3 两处 | **已完成（2026-10-14）**，证据与差异见 8.2：S1–S4、S6、S15–S20 真实进程通过（mount 与 `-cipher` 在 Linux 虚拟机上补测；mount 硬链接与截断的上游缺陷已修复）；S5、S7、S8 属 master 侧，P2 已验证；新增 server/filer/mount/wdclient/pb/license 单测通过 | 6.5 天 |
 | P4 节点额度 | 账本、宽限、预占、`NODE_REJECTED`（volume 与 filer）、三个 master 加入入口、无证书额度 0 与 master 启动检查 | **已完成（2026-10-14）**，证据与差异见 8.3：S9–S12 与 S21 的节点部分真实进程通过（单 master、hashicorp 3 master 强杀切主、`weed server`、基线版本升级）；10 分钟宽限实测 603 秒自动释放；新增 license 单测通过（master 加入入口与启动检查的 S21 部分 P2 已验证） | 2.5 天 |
-| P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13。**进行中**：**已完成（2026-10-14）**：全量检查、S14、`weed server` 一体化、docker-compose 与[运维手册](license-operations-manual-20261014.md)见 8.5（其间发现并修复 goraft 全集群重启后对账卡死），外部审核修复见 8.6、8.8–8.12，S13 见 8.7 | 2 天 |
+| P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13。**进行中**：**已完成（2026-10-14）**：全量检查、S14、`weed server` 一体化、docker-compose 与[运维手册](license-operations-manual-20261014.md)见 8.5（其间发现并修复 goraft 全集群重启后对账卡死），外部审核修复见 8.6、8.8–8.13，S13 见 8.7 | 2 天 |
 
 合计约 20.5 人天（单人，不含签发工具；签发工具为独立项目，另计，见 7.3）。v9 增量见 P0 契约 8.1。
 
@@ -825,6 +825,27 @@ Linux 虚拟机上用真实 FUSE 跑了以下场景：
 - 8.9 与 8.11 的场景，用修复版重跑，结果与此前修复版一致。
 
 修复后 mount（含 `page_writer`；mount 相关单测另跑 3 次 `-race`）、license、server、command 测试与 CI 标签 Linux 构建通过，`go vet ./mount/` 只报上游已有的一条。正常读取路径未改动，未重跑 S13。
+
+### 8.13 外部第七轮审核修复（2026-10-15）
+
+第七轮审核基于 `3d9b55b1d`。8.12 的分块场景已通过；本轮新提出 2 项 P1，都出在同一个时间窗：正文被隐藏的内联文件后来变为仅远端存储的对象（`RemoteEntry`，无正文、无分块），而客户端仍持有旧条目。先复现、再修复：
+
+| # | 问题 | 修复 | 验证 |
+| --- | --- | --- | --- |
+| 1（P1） | mount 重取时，句柄有未提交修改（如 chmod）则只取内联字节、分块、大小与 MD5，漏了远端对象描述。远端对象的正文与分块都为空，读取因此不触发远端取数（`IsInRemoteOnly` 为假），直接成功返回全零；之后 flush 提交的条目也不带远端引用。句柄改过大小时同样如此 | 远端对象描述与内联字节、分块、大小、MD5 一起取回；句柄改过大小而 filer 已是远端对象时，与分块一样不合并，保持隐藏（1.6） | 单测 `TestTakeRefetchedEntry` 增加两种情况：带 chmod 的远端对象改写（取回后为仅远端存储，本地 chmod 保留），以及本地截断后遇到远端对象（保持隐藏） |
+| 2（P1） | filer 的写入合并只比较大小与分块。客户端带着旧的隐藏条目做纯元数据更新时，若已有条目是仅远端存储（大小相同、双方都无分块），就判为可合并，只复制已有的（空）正文，落盘条目丢掉远端引用。这条不依赖 mount 的读取路径 | 判定纯元数据更新时同时要求远端对象描述与已有条目相同；不同则走已有的拒绝分支，返回 `CONTENT_HIDDEN`（契约 5.3 写入合并规则第三行） | 单测 `TestMergeHiddenContent` 增加远端对象的两种情况；`TestLicenseMergeHiddenRemote` 用 LevelDB 与真实 filer：存入仅远端存储的条目，不带远端描述的隐藏更新被拒，带相同描述的更新落盘后保留远端引用与新的权限位 |
+
+三个新单测在修复前的逻辑上都失败。修复后通过的检查：server、filer（含各存储子包）、mount（含 `page_writer`；mount 相关单测另跑 3 次 `-race`）、license、s3api、command、shell、wdclient、pb 测试，以及 CI 标签的 Linux 构建。`go vet ./mount/` 只报上游已有的一条。
+
+关于第 2 项的影响面：
+- S3 打标签、mount chmod 等回写的是读到的条目，远端描述与已有条目相同，照常合并。
+- `filer.remote.sync` 上传后回写远端描述，用的是事件里的条目；它遇到隐藏事件本就停下（契约 8.2 S20），不受影响。
+- `remote.mount` 与 `remote.meta.sync` 新建条目时不带隐藏标志，不受影响。
+- 例外：远端版本有更新时，这两个命令会把经 gRPC 读到的已有条目改为新的远端描述、清空正文后写回（`doSaveRemoteEntry`）。已有条目是被隐藏的内联正文时，写回带着隐藏标志：
+  - 修复前：大小不同则被拒；大小相同则被当作纯元数据更新，旧内联正文与新远端描述并存，本该清空的旧正文被保留。
+  - 修复后：一律返回 `CONTENT_HIDDEN`，该条目留待证书恢复后再同步。
+
+本轮未做真实 FUSE 验证：触发需要远端存储，且只发生在时间窗内（见 8.12）。正常读取路径未改动，未重跑 S13。
 
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 
