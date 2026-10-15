@@ -24,6 +24,10 @@ var lookupEntry = filer_pb.GetEntry
 type readFailure struct {
 	err error
 	at  time.Time
+	// hidden is set while the inline content is hidden. It decides the
+	// retry, not err: a failed lookup of the entry replaces err but the
+	// content stays hidden until the lookup succeeds or a write drops it.
+	hidden bool
 }
 
 // setEntryReadFailure records the read failure of a newly set entry. An
@@ -32,7 +36,7 @@ type readFailure struct {
 // right away; a manifest that just failed to resolve waits the interval.
 func (fh *FileHandle) setEntryReadFailure(entry *filer_pb.Entry, resolveManifestErr error) {
 	if entry.ContentHidden {
-		fh.readFailure.Store(&readFailure{err: filer_pb.ErrContentHidden})
+		fh.readFailure.Store(&readFailure{err: filer_pb.ErrContentHidden, hidden: true})
 		return
 	}
 	fh.setReadFailure(resolveManifestErr)
@@ -63,7 +67,7 @@ func (fh *FileHandle) clearHiddenContent(entry *filer_pb.Entry) {
 	}
 	entry.ContentHidden = false
 	fh.hiddenCut.Store(0)
-	if f := fh.readFailure.Load(); f != nil && f.err == filer_pb.ErrContentHidden {
+	if f := fh.readFailure.Load(); f != nil && f.hidden {
 		fh.readFailure.CompareAndSwap(f, nil)
 	}
 }
@@ -117,7 +121,7 @@ func (fh *FileHandle) maybeRetryRead() {
 	}
 
 	var err error
-	if f.err == filer_pb.ErrContentHidden {
+	if f.hidden {
 		err = fh.refetchHiddenEntry(f)
 	} else {
 		err = fh.resolveChunksAgain(f)
@@ -127,7 +131,7 @@ func (fh *FileHandle) maybeRetryRead() {
 	}
 	var next *readFailure
 	if err != nil {
-		next = &readFailure{err: err, at: time.Now()}
+		next = &readFailure{err: err, at: time.Now(), hidden: f.hidden}
 	}
 	fh.readFailure.CompareAndSwap(f, next)
 }

@@ -32,7 +32,7 @@ func TestFileHandleReadFailure(t *testing.T) {
 	// Hidden content may come from a stale meta cache: retry at once.
 	entry := &filer_pb.Entry{ContentHidden: true}
 	fh.setEntryReadFailure(entry, nil)
-	if f := fh.readFailure.Load(); f == nil || f.err != filer_pb.ErrContentHidden || !f.at.IsZero() {
+	if f := fh.readFailure.Load(); f == nil || f.err != filer_pb.ErrContentHidden || !f.hidden || !f.at.IsZero() {
 		t.Fatalf("hidden failure %+v", f)
 	}
 
@@ -116,7 +116,7 @@ func TestTakeRefetchedEntry(t *testing.T) {
 // hide marks fh as failing reads on hidden content and returns the failure
 // a refetch starts from.
 func hide(fh *FileHandle) *readFailure {
-	f := &readFailure{err: filer_pb.ErrContentHidden}
+	f := &readFailure{err: filer_pb.ErrContentHidden, hidden: true}
 	fh.readFailure.Store(f)
 	return f
 }
@@ -143,7 +143,10 @@ func testWFS(t *testing.T) *WFS {
 	if err != nil {
 		t.Fatal(err)
 	}
+	metaCache := meta_cache.NewMetaCache(t.TempDir(), mapper, "/", func(util.FullPath) {}, func(util.FullPath) bool { return true }, func(util.FullPath, *filer_pb.Entry) {})
+	t.Cleanup(metaCache.Shutdown)
 	return &WFS{
+		metaCache:   metaCache,
 		option:      &Option{ChunkSizeLimit: 1 << 20, ConcurrentWriters: 4, uniqueCacheDirForWrite: t.TempDir(), UidGidMapper: mapper},
 		inodeToPath: NewInodeToPath("/", 0),
 		fhMap:       NewFileHandleToInode(),
@@ -291,5 +294,68 @@ func TestRefetchDroppedAfterTruncate(t *testing.T) {
 		if got := readHandle(t, fh, 8); got != "world" {
 			t.Fatalf("filer hides %v: read %q after writing", filerHides, got)
 		}
+	}
+}
+
+// A failed lookup of a hidden entry must not turn the next retry into a
+// manifest resolve, which succeeds for an inline file and reads zeros.
+func TestRefetchKeepsHiddenAfterLookupError(t *testing.T) {
+	defer func() { lookupEntry = filer_pb.GetEntry }()
+	unavailable := errors.New("rpc error: code = Unavailable")
+	expire := func(fh *FileHandle) {
+		f := *fh.readFailure.Load()
+		f.at = time.Now().Add(-readRetryInterval)
+		fh.readFailure.Store(&f)
+	}
+	read := func(fh *FileHandle) (string, error) {
+		buf := make([]byte, 8)
+		n, err := readDataByFileHandle(buf, fh, 0)
+		return string(buf[:n]), err
+	}
+
+	for _, filerHides := range []bool{false, true} {
+		wfs := testWFS(t)
+		fh := wfs.testOpen("/d/a", hiddenEntry("a", 5))
+		lookups := 0
+		lookupEntry = func(filer_pb.FilerClient, util.FullPath) (*filer_pb.Entry, error) {
+			lookups++
+			switch {
+			case lookups == 1:
+				return nil, unavailable
+			case filerHides:
+				return hiddenEntry("a", 5), nil
+			}
+			return &filer_pb.Entry{Name: "a", Content: []byte("hello"), Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 5}}, nil
+		}
+		if got, err := read(fh); err != unavailable {
+			t.Fatalf("first read %q, %v", got, err)
+		}
+		expire(fh)
+		got, err := read(fh)
+		if lookups != 2 {
+			t.Fatalf("filer hides %v: %d lookups, the retry did not ask the filer", filerHides, lookups)
+		}
+		if filerHides && (err != filer_pb.ErrContentHidden || got != "") {
+			t.Fatalf("still hidden: read %q, %v", got, err)
+		}
+		if !filerHides && (err != nil || got != "hello") {
+			t.Fatalf("renewed: read %q, %v", got, err)
+		}
+	}
+
+	// A truncation to 0 after a failed lookup drops the hidden content and
+	// the failure with it.
+	wfs := testWFS(t)
+	fh := wfs.testOpen("/d/a", hiddenEntry("a", 5))
+	lookupEntry = func(filer_pb.FilerClient, util.FullPath) (*filer_pb.Entry, error) { return nil, unavailable }
+	if _, err := read(fh); err != unavailable {
+		t.Fatalf("read: %v", err)
+	}
+	setSize(t, wfs, fh, 0)
+	if _, code := wfs.Write(nil, &fuse.WriteIn{Fh: uint64(fh.fh), Size: 5}, []byte("world")); code != fuse.OK {
+		t.Fatalf("write: %v", code)
+	}
+	if got, err := read(fh); err != nil || got != "world" {
+		t.Fatalf("read after truncate and write: %q, %v", got, err)
 	}
 }

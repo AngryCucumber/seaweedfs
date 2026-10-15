@@ -122,7 +122,7 @@ v4 处理：只在只读 HTTP 接口（M1）隐藏，gRPC 面列为边界。部�
 
 独立 `weed mount` 首次打开含 manifest 的文件时，要经 volume GET 解析 manifest，它没有内部令牌，证书无效时被拒。现有代码在 [filehandle.go:78](../weed/mount/filehandle.go:78) 对解析失败只打 `Warningf`，分块表为空；随后 [filechunk_group.go:59](../weed/filer/filechunk_group.go:59) 把缺失区间当作稀疏文件补零并返回成功，应用会拿到伪造的全零正文而不是错误。
 
-续期后对隐藏正文条目的重取（P3 实现，`refetchHiddenEntry`）**保留句柄上尚未 flush 的本地修改（2026-10-14 修订，8.6；2026-10-15 补充截断与 id 映射，8.8；同日再修订，8.9、8.10）**：重取在锁外等待 filer 应答，期间截断到 0 或句柄装入新条目都会替换句柄的读失败状态；应答回来时若句柄已不是发起时的状态，结果整个丢弃，既不装入正文，也不恢复读错误；取回的正文按句柄上的文件大小截断（未提交的截断），并从句柄在隐藏期间截到过的最小非 0 长度起补零（先截短再扩长时，被截掉的字节不能回来）；隐藏期间截短后又扩长、使截到的最小长度小于当前大小时，flush 返回 `EIO`（`CONTENT_HIDDEN`）而不发送，因为大小回到原值时 filer 会按纯元数据更新补回全部旧字节（其余大小 filer 本就拒绝）；`copy_file_range` 与写入一样丢弃内联正文并清除隐藏标志；整体替换时先把 filer 的 uid/gid 映射为本地 id（与 meta cache 读出时相同），meta cache 仍存 filer 的 id；证书无效期间在打开的句柄上做的 `chmod`、`chown`、`utimes`、`setfattr` 只记在句柄里，等 flush 才写回 filer；重取时若句柄有未提交修改，只取 filer 的正文、清除隐藏标志，其余字段保持本地，meta cache 等 flush 后更新；没有未提交修改时才整体替换。
+续期后对隐藏正文条目的重取（P3 实现，`refetchHiddenEntry`）**保留句柄上尚未 flush 的本地修改（2026-10-14 修订，8.6；2026-10-15 补充截断与 id 映射，8.8；同日再修订，8.9、8.10、8.11）**：读失败状态单独记录“正文隐藏”，重试方式按它决定，不按最近一次错误：查询 filer 失败只替换错误，下次重试仍是重取条目，直到取回正文或写入丢弃正文；重取在锁外等待 filer 应答，期间截断到 0 或句柄装入新条目都会替换句柄的读失败状态；应答回来时若句柄已不是发起时的状态，结果整个丢弃，既不装入正文，也不恢复读错误；取回的正文按句柄上的文件大小截断（未提交的截断），并从句柄在隐藏期间截到过的最小非 0 长度起补零（先截短再扩长时，被截掉的字节不能回来）；隐藏期间截短后又扩长、使截到的最小长度小于当前大小时，flush 返回 `EIO`（`CONTENT_HIDDEN`）而不发送，因为大小回到原值时 filer 会按纯元数据更新补回全部旧字节（其余大小 filer 本就拒绝）；`copy_file_range` 与写入一样丢弃内联正文并清除隐藏标志；整体替换时先把 filer 的 uid/gid 映射为本地 id（与 meta cache 读出时相同），meta cache 仍存 filer 的 id；证书无效期间在打开的句柄上做的 `chmod`、`chown`、`utimes`、`setfattr` 只记在句柄里，等 flush 才写回 filer；重取时若句柄有未提交修改，只取 filer 的正文、清除隐藏标志，其余字段保持本地，meta cache 等 flush 后更新；没有未提交修改时才整体替换。
 
 处理：`FileHandle` 记录 `resolveManifestErr` 与 `lastResolveAttempt`；读取入口（`filehandle_read.go`）在该错误非空时：若距上次尝试 ≥ 5 秒，用同一 entry 重新调用 `NewChunkGroup`，成功则清错并正常读，失败则更新时间戳并返回 `EIO`；5 秒内直接 `EIO`，不发网络请求。只在失败状态重试，正常读取不新增任何调用。这样续期或网络恢复后，原句柄与按 inode 复用的句柄（[filehandle_map.go:44](../weed/mount/filehandle_map.go:44) 只在 entry 指针变化时重解析）都会在目标 volume 新证书生效后、下一次满足重试间隔的读取时触发重解析并恢复，不需要关闭全部旧句柄；端到端时间见 S1b。写入不受该错误影响（写路径不依赖已解析的分块表）。v9 起同一入口还处理 `ContentHidden` 条目（1.5）：返回 `EIO`，失败态下 ≥ 5 秒用 `LookupDirectoryEntry` 重取，未隐藏则替换句柄条目并写回 meta cache；两类重试共用 single-flight 与节流。mount 改动合计约 40 行。同样的补零逻辑在 filer 进程内不触发：filer 的 manifest 解析带内部令牌（1.4）。S1b 验收。
 
@@ -460,7 +460,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | P2 master 管理 | proto（先行）、manager、HTTP/gRPC、voter 多数派、任期与配置索引、对账写回、账本 `(term,revision)` 复制与对账、对账期间注册延后、加入两阶段、移除前重提交、`voters_acked`、cluster_id、令牌、水位、页面 | **已完成（2026-10-13）**，证据与差异见 8.1：`go test -race ./weed/license/` 通过（含 19 个 manager 用例）；`server/command/shell/cluster/topology/wdclient/pb` 测试通过；真实进程验证单 master、goraft 与 hashicorp 3 master、3→5 扩容与缩容、切主对账、页面导入、`license.init` 与 `-license.file`、日志无证书与令牌 | 6 天 |
 | P3 下发与拦截 | 按流对账、volume/filer 守卫、M1、G1（含 `filer.proto`、合并规则、客户端改动）、G2、缓存、内部令牌传递链、mount 错误传播、S3 两处 | **已完成（2026-10-14）**，证据与差异见 8.2：S1–S4、S6、S15–S20 真实进程通过（mount 与 `-cipher` 在 Linux 虚拟机上补测；mount 硬链接与截断的上游缺陷已修复）；S5、S7、S8 属 master 侧，P2 已验证；新增 server/filer/mount/wdclient/pb/license 单测通过 | 6.5 天 |
 | P4 节点额度 | 账本、宽限、预占、`NODE_REJECTED`（volume 与 filer）、三个 master 加入入口、无证书额度 0 与 master 启动检查 | **已完成（2026-10-14）**，证据与差异见 8.3：S9–S12 与 S21 的节点部分真实进程通过（单 master、hashicorp 3 master 强杀切主、`weed server`、基线版本升级）；10 分钟宽限实测 603 秒自动释放；新增 license 单测通过（master 加入入口与启动检查的 S21 部分 P2 已验证） | 2.5 天 |
-| P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13。**进行中**：**已完成（2026-10-14）**：全量检查、S14、`weed server` 一体化、docker-compose 与[运维手册](license-operations-manual-20261014.md)见 8.5（其间发现并修复 goraft 全集群重启后对账卡死），外部审核修复见 8.6、8.8、8.9 与 8.10，S13 见 8.7 | 2 天 |
+| P5 验收与交付 | `go vet`、`go test ./weed/...`、Benchmark 命令、`CGO_ENABLED=0` 构建、`weed server` 一体化、docker-compose、运维手册 | 全部场景记录；S13。**进行中**：**已完成（2026-10-14）**：全量检查、S14、`weed server` 一体化、docker-compose 与[运维手册](license-operations-manual-20261014.md)见 8.5（其间发现并修复 goraft 全集群重启后对账卡死），外部审核修复见 8.6、8.8、8.9、8.10 与 8.11，S13 见 8.7 | 2 天 |
 
 合计约 20.5 人天（单人，不含签发工具；签发工具为独立项目，另计，见 7.3）。v9 增量见 P0 契约 8.1。
 
@@ -790,6 +790,25 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 - Linux 虚拟机：license、mount（含 `page_writer`）、server、filer 测试通过，测试临时目录放在磁盘上。`-race` 在虚拟机上链接失败（race 运行时缺 `clock_gettime` 符号），属工具链环境问题，未在虚拟机上跑。
 
 性能：正常读取路径未改动；重取结果多一次比较并交换。master 每次写 `state.json` 多一次目录同步（`fsync`），只在导入、同步、账本批次等确认路径上，不在读路径。未重跑 S13，也未做断电验收。
+
+### 8.11 外部第五轮审核修复（2026-10-15）
+
+第五轮审核基于 `3e1273c66`。8.10 的 2 项原复现均已通过；本轮新提出 1 项 P1，先复现、再修复：
+
+| # | 问题 | 修复 | 验证 |
+| --- | --- | --- | --- |
+| 1（P1） | mount 的重试方式由最近一次错误决定。重取隐藏正文时查询 filer 失败（如 `Unavailable`），`ErrContentHidden` 被该错误替换，下一次重试就改走 manifest 重解析；内联文件没有 chunks，解析直接成功并清除读错误，正文却仍隐藏，读取与 `copy_file_range` 都成功返回全零。同一原因还使查询失败后截断到 0 再写入时，读错误没有被清除，暂时返回 `EIO` | 读失败状态单独记录“正文隐藏”：重试方式与写入、截断到 0 时是否清除，都按它判断；查询失败只替换错误，保留该标记（1.6） | 单测 `TestRefetchKeepsHiddenAfterLookupError`：第一次查询返回错误；5 秒间隔后重试再次查询 filer，filer 已恢复正文时读到 `hello`，仍隐藏时读失败，不再返回全零；查询失败后截断到 0 并写入 `world`，立即读到 `world`。修复前的逻辑上，第二次读取不查询 filer（共 1 次查询） |
+
+修复后，mount（含 `page_writer`；mount 相关单测另跑 3 次 `-race`）、license、server、command 测试与 CI 标签 Linux 构建通过，`go vet ./mount/` 只报上游已有的一条。新单测经 `readDataByFileHandle` 走完整重试路径，查询 filer 的函数在测试中被替换。Linux 虚拟机真实 FUSE（证书到期后挂载，隐藏的内联文件 `hello`；在重取进行中停掉 filer，再重启，最后续期），对比 `3e1273c66` 与修复版：
+
+| 步骤 | 修复前 | 修复后 |
+| --- | --- | --- |
+| filer 停止期间读取（查询失败，约 26 秒后返回） | `EIO` | `EIO` |
+| filer 停止期间截断到 0、写入 `world` 后读取 | `EIO` | `world` |
+| filer 恢复、证书仍过期，5 秒后读取 | 成功返回 5 个零字节 | `EIO` |
+| 续期后同一句柄读取 | 仍为 5 个零字节 | `hello` |
+
+两个版本里 filer 停止期间写入的 `world` 关闭时都返回 `EIO`、未写入 filer：mount 写入后即后台上传，向 filer 申请 volume 的重试在 filer 恢复前约 0.15 秒放弃。这是上游 mount 在 filer 不可用时写入的行为，与本项无关。正常读取路径未改动，未重跑 S13。
 
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 
