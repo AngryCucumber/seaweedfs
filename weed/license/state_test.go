@@ -1,6 +1,10 @@
 package license
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestEffectiveAndStatusBoundaries(t *testing.T) {
 	c := certWith(t, 1, t2026, t2027, FeatureDataRead)
@@ -181,4 +185,70 @@ func TestClockState(t *testing.T) {
 	if got := local.Merge(ClockState{Watermark: 9000, RepairSeq: 6}); got != local {
 		t.Errorf("late older repair must not raise the watermark: %+v", got)
 	}
+}
+
+func TestCheckImportChanges(t *testing.T) {
+	now := int64(t2026 + 100)
+	cert := func(seq, notBefore, expiresAt int64, limits [3]int64, features ...interface{}) *Certificate {
+		return mustCert(t, func(c map[string]interface{}) {
+			c["license_id"] = fmt.Sprintf("oss-%03d", seq)
+			c["sequence"], c["not_before"], c["expires_at"] = seq, notBefore, expiresAt
+			c["issued_at"] = min(notBefore, int64(t2026))
+			c["limits"] = map[string]interface{}{"max_master_nodes": limits[0], "max_volume_servers": limits[1], "max_filers": limits[2]}
+			c["features"] = append([]interface{}{}, features...)
+		})
+	}
+	codes := func(changes []Change) string {
+		var s []string
+		for _, c := range changes {
+			s = append(s, fmt.Sprint(c["code"]))
+		}
+		return strings.Join(s, ",")
+	}
+	check := func(name string, s Certs, c *Certificate, want string) []Change {
+		t.Helper()
+		r, err := s.CheckImport(c, testDeployment, now, Usage{})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if r.Changes == nil || codes(r.Changes) != want {
+			t.Fatalf("%s: changes %v, want %q", name, r.Changes, want)
+		}
+		return r.Changes
+	}
+	c10 := cert(10, t2026, t2027, [3]int64{3, 10, 2}, FeatureDataRead)
+
+	// Nothing taken away, or nothing to take it from.
+	check("longer and larger", Certs{Newest: c10}, cert(11, t2026, t2027+100, [3]int64{5, 10, 2}, FeatureDataRead), "")
+	check("first certificate", Certs{}, c10, "")
+	if r, _ := (Certs{Newest: c10}).CheckImport(c10, testDeployment, now, Usage{}); r.Changes == nil || len(r.Changes) != 0 {
+		t.Fatalf("an idempotent retry reports no changes: %v", r.Changes)
+	}
+
+	// Shorter, smaller, without DATA_READ, starting at once.
+	changes := check("immediate reduction", Certs{Newest: c10}, cert(11, t2026, t2027-100, [3]int64{1, 10, 1}),
+		"EXPIRY_SHORTENED,MASTER_LIMIT_REDUCED,FILER_LIMIT_REDUCED,FEATURES_REMOVED")
+	if c := changes[0]; c["previous_expires_at"] != int64(t2027) || c["expires_at"] != int64(t2027-100) {
+		t.Errorf("expiry %v", c)
+	}
+	if c := changes[1]; c["previous_limit"] != int64(3) || c["limit"] != int64(1) {
+		t.Errorf("master limit %v", c)
+	}
+	if c := changes[3]; strings.Join(c["features"].([]string), ",") != FeatureDataRead {
+		t.Errorf("features %v", c)
+	}
+
+	// A future certificate replacing a pending one and starting after the
+	// certificate in effect expires; lower limits are accepted too.
+	pending := Certs{Newest: cert(12, now+50, t2027+100, [3]int64{3, 10, 2}, FeatureDataRead), Prev: c10}
+	changes = check("future replacement", pending, cert(13, t2027+60, t2027+500, [3]int64{3, 4, 2}, FeatureDataRead),
+		"COVERAGE_GAP,VOLUME_SERVER_LIMIT_REDUCED,PENDING_DISCARDED")
+	if changes[0]["gap_seconds"] != int64(60) || changes[2]["license_id"] != "oss-012" || changes[2]["sequence"] != int64(12) {
+		t.Errorf("gap and discarded pending %v", changes)
+	}
+
+	// Once the pending certificate has started it is the one in effect:
+	// it is compared, not discarded.
+	started := Certs{Newest: cert(12, now-10, t2027+100, [3]int64{3, 10, 2}, FeatureDataRead), Prev: c10}
+	check("started pending", started, cert(13, t2026, t2027+50, [3]int64{3, 10, 2}, FeatureDataRead), "EXPIRY_SHORTENED")
 }

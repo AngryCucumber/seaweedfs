@@ -114,6 +114,7 @@ func (ms *MasterServer) writeLicenseError(w http.ResponseWriter, r *http.Request
 		if out != nil {
 			body["voters_ok"] = out.VotersOK
 			body["peers_failed"] = out.PeersFailed
+			body["changes"] = out.Changes
 		}
 	}
 	writeJsonQuiet(w, r, le.Code.HTTPStatus(), body)

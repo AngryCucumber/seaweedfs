@@ -76,7 +76,25 @@ type ImportResult struct {
 	// Unchanged is true when the certificate is byte-identical to Newest;
 	// an import retry only re-pushes the current state.
 	Unchanged bool
+	// Changes lists what the import takes away; empty, never nil.
+	Changes []Change
 }
+
+// Change codes. A higher sequence replaces every earlier certificate, so
+// shorter, smaller or later certificates import like any other; validate
+// and import report what they take away, as MassDB SQL does (contract 1.5).
+const (
+	ChangeExpiryShortened          = "EXPIRY_SHORTENED"
+	ChangeCoverageGap              = "COVERAGE_GAP"
+	ChangeMasterLimitReduced       = "MASTER_LIMIT_REDUCED"
+	ChangeVolumeServerLimitReduced = "VOLUME_SERVER_LIMIT_REDUCED"
+	ChangeFilerLimitReduced        = "FILER_LIMIT_REDUCED"
+	ChangePendingDiscarded         = "PENDING_DISCARDED"
+	ChangeFeaturesRemoved          = "FEATURES_REMOVED"
+)
+
+// Change is one fact about an import: "code" and the fields of that code.
+type Change map[string]interface{}
 
 // CheckImport validates importing c into the current state on the master
 // (contract 1.5 steps 2-6). Verification of c itself is done by
@@ -91,7 +109,7 @@ func (s Certs) CheckImport(c *Certificate, clusterID string, now int64, used Usa
 	if s.Newest != nil {
 		switch {
 		case c.SameBytes(s.Newest):
-			return ImportResult{Certs: s, Unchanged: true}, nil
+			return ImportResult{Certs: s, Unchanged: true, Changes: []Change{}}, nil
 		case c.Claims.Sequence == s.Newest.Claims.Sequence:
 			return ImportResult{}, errorf(CodeSequenceConflict, "sequence %d is already used by a different certificate", c.Claims.Sequence)
 		case c.Claims.Sequence < s.Newest.Claims.Sequence:
@@ -109,7 +127,51 @@ func (s Certs) CheckImport(c *Certificate, clusterID string, now int64, used Usa
 	if c.Claims.NotBefore > now {
 		next.Prev = s.Effective(now)
 	}
-	return ImportResult{Certs: next}, nil
+	return ImportResult{Certs: next, Changes: s.changes(c, now)}, nil
+}
+
+// changes compares c with the certificate in effect at now and with a
+// pending Newest that c replaces.
+func (s Certs) changes(c *Certificate, now int64) []Change {
+	changes := []Change{}
+	n := c.Claims
+	active := s.Effective(now)
+	if active != nil {
+		a := active.Claims
+		if n.ExpiresAt < a.ExpiresAt {
+			changes = append(changes, Change{"code": ChangeExpiryShortened, "previous_expires_at": a.ExpiresAt, "expires_at": n.ExpiresAt})
+		}
+		if n.NotBefore > now && n.NotBefore > a.ExpiresAt {
+			changes = append(changes, Change{"code": ChangeCoverageGap, "gap_seconds": n.NotBefore - a.ExpiresAt})
+		}
+		for _, l := range []struct {
+			code          string
+			previous, now int64
+		}{
+			{ChangeMasterLimitReduced, a.Limits.MaxMasterNodes, n.Limits.MaxMasterNodes},
+			{ChangeVolumeServerLimitReduced, a.Limits.MaxVolumeServers, n.Limits.MaxVolumeServers},
+			{ChangeFilerLimitReduced, a.Limits.MaxFilers, n.Limits.MaxFilers},
+		} {
+			if l.now < l.previous {
+				changes = append(changes, Change{"code": l.code, "previous_limit": l.previous, "limit": l.now})
+			}
+		}
+	}
+	if s.Newest != nil && now < s.Newest.Claims.NotBefore {
+		changes = append(changes, Change{"code": ChangePendingDiscarded, "license_id": s.Newest.Claims.LicenseID, "sequence": s.Newest.Claims.Sequence})
+	}
+	if active != nil {
+		var removed []string
+		for _, f := range active.Claims.Features {
+			if !c.Claims.HasFeature(f) {
+				removed = append(removed, f)
+			}
+		}
+		if len(removed) > 0 {
+			changes = append(changes, Change{"code": ChangeFeaturesRemoved, "features": removed})
+		}
+	}
+	return changes
 }
 
 // Compare decides whether incoming certificates replace the local ones

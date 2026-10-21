@@ -2,6 +2,7 @@ package license
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1515,5 +1516,46 @@ func TestManagerValidateRateLimit(t *testing.T) {
 	}
 	if newestSeq(a) != 0 {
 		t.Fatal("validate must not import")
+	}
+}
+
+// Validate and import report the same changes for the same certificate;
+// they are facts, not a reason to refuse it.
+func TestManagerReportsChanges(t *testing.T) {
+	c := newFakeCluster(t, "a")
+	a := c.start("a", nil)
+	c.elect("a")
+	if _, err := a.Import(certRaw(t, 1, withLimits(3, 10, 2))); err != nil {
+		t.Fatal(err)
+	}
+	reduced := certRaw(t, 2, func(m map[string]interface{}) {
+		m["expires_at"] = t2027 - 100
+		withLimits(3, 4, 2)(m)
+	})
+	v, err := a.Validate(reduced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := a.Import(reduced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"code":"EXPIRY_SHORTENED","expires_at":1798761500,"previous_expires_at":1798761600},{"code":"VOLUME_SERVER_LIMIT_REDUCED","limit":4,"previous_limit":10}]`
+	for name, changes := range map[string][]Change{"validate": v.Changes, "import": out.Changes} {
+		if got, _ := json.Marshal(changes); string(got) != want {
+			t.Errorf("%s changes %s, want %s", name, got, want)
+		}
+	}
+	if s := a.Status(); s.Nodes[string(NodeVolumeServer)].Limit != 4 {
+		t.Errorf("the reduced certificate is in effect: %+v", s.Nodes)
+	}
+
+	// A retry of the same bytes reports none, as an empty list.
+	out, err = a.Import(reduced)
+	if err != nil || !out.Unchanged {
+		t.Fatalf("retry: %+v %v", out, err)
+	}
+	if got, _ := json.Marshal(out); !strings.Contains(string(got), `"changes":[]`) {
+		t.Errorf("retry outcome %s", got)
 	}
 }

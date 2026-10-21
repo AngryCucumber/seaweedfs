@@ -75,6 +75,8 @@ P0 只交付契约与核对记录，不含实现与运行测试。
 5. 新证书自身的三类额度分别 ≥ 当前账本条目数，否则 `LICENSE_NODE_LIMIT_TOO_SMALL`（P1 修订：它生效后只有它的额度适用；`min(prev, newest)` 只用于等待期的准入，不用于导入校验）。
 6. 缺少 `DATA_READ` 不拒绝导入，状态为 `FEATURE_MISSING`。
 7. master 不检查 `customer_id` 连续性与 `license_id` 唯一性（签发方登记与 `sign --previous` 负责）。
+8. **取代式续期与变更提示（2026-10-21 修订，计划 8.20）：** 以上即取代式规则，与 MassDB SQL 2026-10-15 起的规则一致。序号更高的证书整体取代 `newest` 与 `prev`，不比较到期时间、生效时间、额度与功能，只有第 5 条的实际用量检查。validate 与 import 的成功响应带 `changes`（第 3 节），列出这张证书相对导入时生效的证书拿走了什么。它是事实陈述，不是拒绝理由。幂等重试返回空数组；`PARTIAL_COMMIT` 的错误体同样带 `changes`。
+9. **未来生效的降额证书照常接受（2026-10-21 确认）：** 等待期按新旧两张证书的较小额度准入（计划 3.4）。MassDB SQL 2026-10-16 起拒绝这类证书（`LICENSE_RENEWAL_REDUCTION`），理由是它更早的带许可 FE 版本回放这种记录时会退出；OSS 还没有发布过带许可的旧版本，不存在这个问题，因此不跟进。签发方对两个产品要区别对待：SQL 的降额证书必须立即生效，OSS 不限。
 
 ### 1.6 OSS v1 不使用的协议 v1 部分
 
@@ -83,7 +85,7 @@ P0 只交付契约与核对记录，不含实现与运行测试。
 
 ### 1.7 签发工具（独立项目；2026-10-14 修订）
 
-原定在 massdb-sql 的 `license_issuer.py` 上加 `--product massdb-oss` 档案，现改为：massdb-sql 的签发工具只作测试用（`weed/license/testdata` 的互通向量），不加 OSS 档案；生产签发工具放在另一个独立项目（项目待定），按本节的声明、文本规则与信任清单格式实现协议 v1 与 OSS 产品档案，要求见计划 7.3。生产 kid 与公钥由它产出，是发布的前置条件，不阻塞 P5 的功能验收。
+原定在 massdb-sql 的 `license_issuer.py` 上加 `--product massdb-oss` 档案，现改为：massdb-sql 的签发工具只作测试用（`weed/license/testdata` 的互通向量），不加 OSS 档案；生产签发工具放在另一个独立项目（项目待定），按本节的声明、文本规则与信任清单格式实现协议 v1 与 OSS 产品档案，要求见计划 7.3。生产 kid 与公钥由它产出，是发布的前置条件，不阻塞 P5 的功能验收。2026-10-21 确认：OSS 使用自己的签名密钥，不沿用 MassDB SQL 内置的 `self-use-license-20260929`（计划 8.20）。
 
 ---
 
@@ -190,6 +192,7 @@ P4 修订：
 | 重试间隔 | mount 失败态重解析/重取 ≥ 5 秒；`RECONCILING` 未达多数派每 5 秒重试 |
 | 限流 | `validate` 每进程 10 次/分钟；拒绝日志每节点每分钟 1 条 |
 | 请求体上限 | 96 KiB；证书 64 KiB |
+| 变更提示（`changes`，1.5 第 8 条） | 数组，按以下顺序列出，每项为 `code` 加对应字段：`EXPIRY_SHORTENED`（`previous_expires_at`、`expires_at`）、`COVERAGE_GAP`（`gap_seconds`）、`MASTER_LIMIT_REDUCED` / `VOLUME_SERVER_LIMIT_REDUCED` / `FILER_LIMIT_REDUCED`（`previous_limit`、`limit`）、`PENDING_DISCARDED`（`license_id`、`sequence`）、`FEATURES_REMOVED`（`features`）。比较对象是导入时生效的证书（已到 `not_before` 的 `newest`，否则 `prev`）；`PENDING_DISCARDED` 指尚未生效、将被顶掉的 `newest`。代码与 MassDB SQL 相同，额度按三类节点分开 |
 | 指标 | `license_state{reason}`、`license_expires_at_seconds`、`license_denied_reads_total{server,path}`（`path` ∈ `volume_http/filer_http/filer_proxy/volume_grpc/filer_grpc_hidden`）、`license_nodes_online{type}`、`license_nodes_grace{type}`、`license_nodes_limit{type}` |
 | raft 任期 | hashicorp 用 `Raft.CurrentTerm()`（v1.7.2 提供，替代计划 v8 的 `Stats()["term"]` 解析）；goraft 用 `Server.Term()` |
 | raft 配置索引 | hashicorp `GetConfiguration().Index()`；goraft 无，记 0 |

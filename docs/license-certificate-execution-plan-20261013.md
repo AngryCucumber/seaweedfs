@@ -348,8 +348,8 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | --- | --- | --- |
 | `GET /license` | 状态 `VALID/EXPIRED/NO_LICENSE/NOT_YET_VALID/CLOCK_SUSPECT/FEATURE_MISSING/RECONCILING`、newest/prev 摘要与当前生效证书、到期时间、三类节点在线/宽限/上限、`state_version`、`repair_seq`、`voters_acked`（已确认当前状态的 voter 列表，goraft 缩容前必查） | 脱敏 |
 | `GET /license/deployment` | 申请 DTO | |
-| `POST /license/validate` | `{"certificate":"<jws>"}` 或 multipart `file` | 每进程 10 次/分钟令牌桶 |
-| `POST /license/import` | 落盘、同步、下发；返回 `{"accepted":true,"effective_now":bool,"state_version":n,"voters_ok":[...],"peers_failed":[...]}`；非 leader 或对账中 503 | 导入串行；相同字节幂等 |
+| `POST /license/validate` | `{"certificate":"<jws>"}` 或 multipart `file`；返回 `valid`、`unchanged`、`effective_now`、`certificate`、`changes`（2026-10-21 加，8.20） | 每进程 10 次/分钟令牌桶 |
+| `POST /license/import` | 落盘、同步、下发；返回 `{"accepted":true,"effective_now":bool,"state_version":n,"voters_ok":[...],"peers_failed":[...],"changes":[...]}`（`changes` 2026-10-21 加，8.20）；非 leader 或对账中 503 | 导入串行；相同字节幂等 |
 | `DELETE /license/nodes/{addr}` | 删除宽限中的账本条目 | 不踢在线节点；宽限中的地址见 `GET /license` 的 `grace_nodes`（P5 补，8.5） |
 | gRPC `GetLicense/ImportLicense` | `weed shell license.show / license.import -file / license.validate`；`-disableHttp` 的唯一导入入口 | |
 
@@ -953,6 +953,52 @@ e 的 filer 读取是上游另一个问题：普通分块文件经 mount 截断�
 另确认 1 项（P2）：`Lseek`（`SEEK_DATA`/`SEEK_HOLE`）只持句柄共享锁，直接读 `entryChunkGroup` 指针搜索分块；`Read` 也只持共享锁，续期恢复时经 `resolveChunksAgain` 在 `entryLock` 写锁内替换分块组，两者不互斥，`-race` 稳定报告。续期重取与缓存远端对象的装入同样受影响。修复：`Lseek` 取文件大小与搜索分块都在 `entryLock` 读锁内，锁序与 `Read` 相同（句柄共享锁 → `entryLock` 读锁）。
 
 单测 `TestLseekDuringManifestRetry`：manifest 取回延迟 50 ms，期间 20 次 `SEEK_DATA`，重试读到 `world` 后分块组能搜到数据（未解析的分块组没有 section）；去掉读锁则 `-race` 报告竞争。mount 全包 `-race` 通过。
+
+### 8.20 对照 MassDB SQL 2026-10-15/16 修订（2026-10-21）
+
+MassDB SQL（`2.0.5-license` 分支）在 OSS 契约冻结（2026-10-13）之后有两轮许可修订：
+- 2026-10-15 `c9b69a9a6b0`：取代式续期。序号更高的证书完全取代旧证书，不再要求不缩短期限、不降额度、不减功能、不留空档，只检查实际用量；validate 与 import 的响应新增 `changes`。
+- 2026-10-16 `4f53a3e9585`：降级兼容、内置公钥、取消导入前的 FE 包检查。
+
+协议 v1 文档自 2026-09-25 起未改。签发工具只改了续期预检，`weed/license/testdata/gen_issuer_vectors.py` 用到的签名与导出函数没变，互通向量仍然有效。
+
+| MassDB SQL 的变化 | OSS 现状 | 处理 |
+| --- | --- | --- |
+| 取代式续期，只查实际用量 | 已经如此：`CheckImport` 只查序号、到期与账本用量；未来生效时等待期取新旧较小额度，被顶掉的待生效证书丢弃 | 不改规则，契约 1.5 第 8 条写明 |
+| validate、import 返回 `changes` | 没有，缩短与降额静默接受 | **本次补上**（见下） |
+| 拒绝未来生效的降额证书（D1） | 接受 | **不跟进**：D1 的理由是 Doris 旧版本回放兼容，OSS 没有带许可的旧版本；契约 1.5 第 9 条写明差异 |
+| 内置公钥、外部清单可选 | 本来就只用编译进二进制的清单，没有外部文件 | 不适用 |
+| 取消导入前的 FE 包检查 | 从未有过 | 不适用 |
+| 许可持久化格式冻结（D2） | 未发布 | 发布后同样遵守：`state.json`、`license-cache.json` 与 master 间同步的格式要让旧版本能读 |
+| 换钥纪律（D4） | 同样适用；OSS 换钥只能发版 | 运维手册写明 |
+
+正式信任根（`productionTrustManifest`）的来源：2026-10-21 决定由独立签发项目为 OSS 生成自己的密钥，不沿用 MassDB SQL 内置的 `self-use-license-20260929`（契约 1.7）。理由：
+- MassDB SQL 的签发工具只能签 `MassDB SQL` 的证书，OSS 无论用哪把密钥都需要独立签发项目，共用密钥省不掉这部分工作；
+- OSS 的公钥编译在二进制里，换钥只能发版，共用密钥会让两个产品的换钥与回退约束绑在一起；
+- 一把私钥泄露只影响一个产品。`product` 字段能防止证书在两个产品间串用，防不住泄露后的任意签发。
+
+信任清单在签发项目产出公钥前保持为空，发布前填入。
+
+**本次改动：**
+- `Certs.CheckImport` 计算 `changes`（`state.go`），validate、import 与启动时的 `-license.file` 共用。比较对象是导入时生效的证书。代码与 MassDB SQL 相同，额度按 master、volume、filer 分开。
+- `ImportOutcome`、`ValidateOutcome` 加 `changes`，HTTP 与 gRPC（shell 用）同一份 JSON，`PARTIAL_COMMIT` 的错误体也带上。
+- 导入日志与 `-license.file` 应用日志附上变更代码。shell 的 `license.validate/import` 在 JSON 后加一行 `changes: ...`。
+- master 页面的 Import 先做 validate，在确认框里列出变化；validate 失败直接显示错误，不弹确认框。validate 与 import 的结果上方也列出变化。
+
+**验证：**
+- 单测 `TestCheckImportChanges`：无变化、首个证书、幂等重试为空数组；立即生效的缩短、降额与去掉 `DATA_READ`；未来证书顶掉待生效证书并留空档、降低 volume 额度；待生效证书已到点时按生效证书比较。
+- 单测 `TestManagerReportsChanges`：同一证书 validate 与 import 的 `changes` 序列化后逐字节相同；重试为 `"changes":[]`。
+- license（含 `-race`）、server、shell、command 测试与 CI 标签 Linux 构建通过。
+- 本机真实进程（单 master，测试信任根）：
+
+| 步骤 | 结果 |
+| --- | --- |
+| HTTP 与 shell validate、shell import c2（期限 30 天→10 天，volume 3→1） | `EXPIRY_SHORTENED`、`VOLUME_SERVER_LIMIT_REDUCED`；shell 另起一行 `changes: ...`；master 日志 `imported oss-c2 sequence 2; changes: ...` |
+| 导入 c3（1 小时后生效，额度不降） | `changes` 为空 |
+| validate 与 import c4（c2 到期 21 天后才生效） | 两者相同：`COVERAGE_GAP`（1814400 秒）、`PENDING_DISCARDED`（c3） |
+| 导入 c5（2 小时后生效，filer 2→1） | 接受：`FILER_LIMIT_REDUCED`、`PENDING_DISCARDED`（c4）；重试 `unchanged=true`、`changes=[]`；等待期 filer 额度为 1 |
+| 页面导入 c6（立即生效，期限缩短，filer 2→1，顶掉 c5） | validate 结果、导入确认框与导入结果都列出三项变化，导入成功 |
+| 页面导入已被取代的 c1 | 显示 409 `LICENSE_SEQUENCE_NOT_INCREASING`，不弹确认框 |
 
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 

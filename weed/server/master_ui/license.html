@@ -79,14 +79,43 @@ function licenseShow(text) {
     el.style.display = 'block';
     el.textContent = text;
 }
-function licenseSend(action, certificate) {
+// licenseChanges describes the "changes" of a validate or import result:
+// what the certificate takes away from the one in effect.
+function licenseChanges(body) {
+    if (!body || !body.changes || !body.changes.length) {
+        return '';
+    }
+    function time(s) { return new Date(s * 1000).toISOString().replace('.000Z', 'Z'); }
+    function limit(name, c) { return name + ' limit ' + c.previous_limit + ' -> ' + c.limit; }
+    var lines = body.changes.map(function (c) {
+        switch (c.code) {
+        case 'EXPIRY_SHORTENED': return 'expires earlier: ' + time(c.expires_at) + ' instead of ' + time(c.previous_expires_at);
+        case 'COVERAGE_GAP': return 'leaves ' + c.gap_seconds + ' seconds without a license before it starts';
+        case 'MASTER_LIMIT_REDUCED': return limit('master', c);
+        case 'VOLUME_SERVER_LIMIT_REDUCED': return limit('volume server', c);
+        case 'FILER_LIMIT_REDUCED': return limit('filer', c);
+        case 'PENDING_DISCARDED': return 'replaces the pending certificate ' + c.license_id + ' (sequence ' + c.sequence + ')';
+        case 'FEATURES_REMOVED': return 'removes features: ' + c.features.join(', ');
+        }
+        return String(c.code);
+    });
+    return 'This certificate changes the license:\n  - ' + lines.join('\n  - ') + '\n';
+}
+function licenseSend(action, certificate, done) {
     var req = new XMLHttpRequest();
     req.open('POST', '/license/' + action);
     req.setRequestHeader('Content-Type', 'application/json');
     req.onload = function () {
         var body;
         try { body = JSON.parse(req.responseText); } catch (e) { body = req.responseText; }
+        if (done && done(req.status, body)) {
+            return;
+        }
         var text = req.status + ' ' + JSON.stringify(body, null, 2);
+        var changes = licenseChanges(body);
+        if (changes) {
+            text = changes + '\n' + text;
+        }
         if (body && body.error === 'NOT_LEADER' && body.leader) {
             text = 'This master is not the leader; import on http://' + body.leader + '/\n\n' + text;
         }
@@ -98,14 +127,26 @@ function licenseSend(action, certificate) {
     req.onerror = function () { licenseShow('request failed'); };
     req.send(JSON.stringify({certificate: certificate.trim()}));
 }
+// licenseImport validates first and asks for confirmation, naming the
+// changes; a failed validation is shown instead.
+function licenseImport(certificate) {
+    licenseSend('validate', certificate, function (status, body) {
+        if (status !== 200) {
+            return false;
+        }
+        var changes = licenseChanges(body);
+        if (confirm('Import this license certificate into the cluster?' + (changes ? '\n\n' + changes : ''))) {
+            licenseSend('import', certificate);
+        }
+        return true;
+    });
+}
 function licenseSubmit(action) {
-    if (action === 'import' && !confirm('Import this license certificate into the cluster?')) {
-        return;
-    }
+    var run = action === 'import' ? licenseImport : function (certificate) { licenseSend(action, certificate); };
     var file = document.getElementById('license-file').files[0];
     if (file) {
         var reader = new FileReader();
-        reader.onload = function () { licenseSend(action, reader.result); };
+        reader.onload = function () { run(reader.result); };
         reader.readAsText(file);
         return;
     }
@@ -114,7 +155,7 @@ function licenseSubmit(action) {
         licenseShow('choose a certificate file or paste the certificate');
         return;
     }
-    licenseSend(action, text);
+    run(text);
 }
 </script>
 {{ end }}

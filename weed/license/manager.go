@@ -294,7 +294,7 @@ func (m *Manager) applyLicenseFile(path string) error {
 	m.certs = res.Certs
 	m.clock = m.clock.RepairOnImport(c, now)
 	m.rev++
-	glog.V(0).Infof("license: applied -license.file %s sequence %d", c.Claims.LicenseID, c.Claims.Sequence)
+	glog.V(0).Infof("license: applied -license.file %s sequence %d%s", c.Claims.LicenseID, c.Claims.Sequence, changeNotice(res.Changes))
 	return m.persist()
 }
 
@@ -970,6 +970,7 @@ type ImportOutcome struct {
 	VotersOK     []string            `json:"voters_ok"`
 	PeersFailed  []string            `json:"peers_failed"`
 	Certificate  *CertificateSummary `json:"certificate"`
+	Changes      []Change            `json:"changes"`
 }
 
 // ValidateOutcome is the result of POST /license/validate.
@@ -978,6 +979,7 @@ type ValidateOutcome struct {
 	Unchanged    bool                `json:"unchanged"`
 	EffectiveNow bool                `json:"effective_now"`
 	Certificate  *CertificateSummary `json:"certificate"`
+	Changes      []Change            `json:"changes"`
 }
 
 // Import imports a certificate on the leader (contract 1.5) and commits it
@@ -1023,7 +1025,7 @@ func (m *Manager) Import(raw []byte) (*ImportOutcome, error) {
 		if err := m.persist(); err != nil {
 			return nil, err
 		}
-		glog.V(0).Infof("license: imported %s sequence %d", c.Claims.LicenseID, c.Claims.Sequence)
+		glog.V(0).Infof("license: imported %s sequence %d%s", c.Claims.LicenseID, c.Claims.Sequence, changeNotice(res.Changes))
 	} else if err := m.ensureDurable(); err != nil {
 		return nil, err
 	}
@@ -1039,6 +1041,7 @@ func (m *Manager) Import(raw []byte) (*ImportOutcome, error) {
 		VotersOK:     votersOK,
 		PeersFailed:  failed,
 		Certificate:  c.Summary(),
+		Changes:      res.Changes,
 	}
 	if !ok {
 		return out, errorf(CodePartialCommit, "%d of %d voters confirmed; failed: %s", len(votersOK), len(mem.Voters), strings.Join(failed, ","))
@@ -1069,7 +1072,19 @@ func (m *Manager) Validate(raw []byte) (*ValidateOutcome, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ValidateOutcome{Valid: true, Unchanged: res.Unchanged, EffectiveNow: c.Claims.NotBefore <= now, Certificate: c.Summary()}, nil
+	return &ValidateOutcome{Valid: true, Unchanged: res.Unchanged, EffectiveNow: c.Claims.NotBefore <= now, Certificate: c.Summary(), Changes: res.Changes}, nil
+}
+
+// changeNotice is the log suffix listing the codes of changes.
+func changeNotice(changes []Change) string {
+	if len(changes) == 0 {
+		return ""
+	}
+	codes := make([]string, len(changes))
+	for i, c := range changes {
+		codes[i] = fmt.Sprint(c["code"])
+	}
+	return "; changes: " + strings.Join(codes, ", ")
 }
 
 func (m *Manager) takeValidateToken() bool {

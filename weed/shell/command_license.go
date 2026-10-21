@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/seaweedfs/seaweedfs/weed/license"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
@@ -113,8 +114,28 @@ func (c *commandLicenseImport) Do(args []string, commandEnv *CommandEnv, writer 
 		if err != nil {
 			return err
 		}
-		return printJson(writer, resp.ResultJson)
+		if err := printJson(writer, resp.ResultJson); err != nil {
+			return err
+		}
+		return printLicenseChanges(writer, resp.ResultJson)
 	})
+}
+
+// printLicenseChanges adds one line naming what the certificate takes away
+// (the "changes" of the result), so they are not missed in the JSON.
+func printLicenseChanges(writer io.Writer, doc string) error {
+	var out struct {
+		Changes []map[string]interface{} `json:"changes"`
+	}
+	if err := json.Unmarshal([]byte(doc), &out); err != nil || len(out.Changes) == 0 {
+		return nil
+	}
+	codes := make([]string, len(out.Changes))
+	for i, c := range out.Changes {
+		codes[i] = fmt.Sprint(c["code"])
+	}
+	_, err := fmt.Fprintf(writer, "changes: %s\n", strings.Join(codes, ", "))
+	return err
 }
 
 func printJson(writer io.Writer, doc string) error {

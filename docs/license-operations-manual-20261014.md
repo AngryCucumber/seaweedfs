@@ -119,6 +119,19 @@ echo "license.show" | weed shell -master=<master>:9333
 | `accepted` / `unchanged` | 是否接受；`unchanged=true` 表示同一证书重复导入，只重新推送 |
 | `effective_now` | 是否立即生效（`not_before` 在未来则为 false） |
 | `voters_ok` / `peers_failed` | 已确认的 master 与推送失败的 master |
+| `changes` | 这张证书相对当前生效证书拿走了什么，见下表；为空表示没有缩减。校验与导入返回的内容相同 |
+
+`changes` 的每一项都只是陈述事实，不会阻止导入：
+
+| `code` | 含义 | 附带字段 |
+| --- | --- | --- |
+| `EXPIRY_SHORTENED` | 到期时间早于当前证书 | `previous_expires_at`、`expires_at` |
+| `COVERAGE_GAP` | 当前证书到期后，这张证书还要再过一段时间才生效，期间读取按 `EXPIRED` 被拒 | `gap_seconds` |
+| `MASTER_LIMIT_REDUCED` / `VOLUME_SERVER_LIMIT_REDUCED` / `FILER_LIMIT_REDUCED` | 该类节点额度低于当前证书 | `previous_limit`、`limit` |
+| `PENDING_DISCARDED` | 已导入但尚未生效的证书会被这张证书取代 | `license_id`、`sequence` |
+| `FEATURES_REMOVED` | 去掉了当前证书的功能（去掉 `DATA_READ` 后状态为 `FEATURE_MISSING`） | `features` |
+
+**导入前先校验，确认 `changes` 符合预期。** shell 会在结果后另起一行 `changes: ...`；master 页面点 Import 时会先校验，在确认框里列出这些变化。
 
 导入返回 503 `PARTIAL_COMMIT` 时，证书只在不足半数的 master 上落盘：等故障 master 恢复后**重新导入同一个文件**即可（幂等）。
 
@@ -139,9 +152,10 @@ echo "license.show" | weed shell -master=<master>:9333
 
 ## 7. 续期、降额与释放名额
 
-- **续期**：签发 `sequence` 更大的证书并导入。建议在 `days_remaining` 低于 30 时续期。
-- **提前签发**：`not_before` 在未来的证书可以提前导入，到点各节点按本地时钟自动切换，不需要再操作；期间额度取新旧证书的较小值。若之后又导入一张序号更高、立即生效的证书，它会整体替换前两张。
+- **续期**：签发 `sequence` 更大的证书并导入。建议在 `days_remaining` 低于 30 时续期。序号更大的证书总是整体取代当前证书：期限可以更短、额度可以更低、功能可以更少，只要额度容纳当前账本（见下条）就接受，校验与导入的 `changes` 会列出这些变化（第 6 节）。导入错了只能再签一张序号更大的证书纠正，被取代的旧证书不能再导入（`LICENSE_SEQUENCE_NOT_INCREASING`）。
+- **提前签发**：`not_before` 在未来的证书可以提前导入，到点各节点按本地时钟自动切换，不需要再操作；期间额度取新旧证书的较小值，所以额度更低的未来证书导入后立即限制新加入的节点。若之后又导入一张序号更高的证书，它会整体替换前两张（`changes` 里的 `PENDING_DISCARDED`）。注意与 MassDB SQL 不同：MassDB SQL 拒绝额度更低的未来证书，OSS 接受。
 - **降额**：新证书任一类额度小于当前账本里该类的节点数（在线 + 宽限）时，导入返回 409 `LICENSE_NODE_LIMIT_TOO_SMALL`，原证书不变。先下线多余节点，等宽限期过去或手动释放，再导入。
+- **换钥**：公钥编译在二进制里，换钥只能发新版本。新公钥先随一个版本发布，所有可能回退到的版本都包含新公钥后，才改用新私钥签发；旧公钥在不再有版本或证书依赖它之后才能移除。
 - **释放宽限中的名额**：节点下线后 10 分钟内仍占名额。要立即释放，在 leader 上：
 
   ```bash
