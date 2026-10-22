@@ -102,3 +102,5 @@ docker/weed_sub_record
 
 # MassDB OSS installation packages (make massdb-package / massdb-meta-package)
 /dist/
+# the upstream "build" rule above would hide the package build scripts
+!/package/build/
