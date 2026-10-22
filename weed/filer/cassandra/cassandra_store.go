@@ -189,8 +189,29 @@ func (store *CassandraStore) DeleteFolderChildren(ctx context.Context, fullpath 
 	return nil
 }
 
+// ListDirectoryPrefixedEntries reads only the names with the prefix, as one
+// range of the directory's partition, instead of the filer store wrapper
+// reading the directory from startFileName and filtering in memory.
 func (store *CassandraStore) ListDirectoryPrefixedEntries(ctx context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, prefix string, eachEntryFunc filer.ListEachEntryFunc) (lastFileName string, err error) {
-	return lastFileName, filer.ErrUnsupportedListDirectoryPrefixed
+
+	if _, ok := store.isSuperLargeDirectory(string(dirPath)); ok {
+		return // nil, filer.ErrUnsupportedSuperLargeDirectoryListing
+	}
+	if prefix == "" {
+		return store.ListDirectoryEntries(ctx, dirPath, startFileName, includeStartFile, limit, eachEntryFunc)
+	}
+
+	cqlStr, lower, upper, ok := store.layout.prefixListQuery(startFileName, includeStartFile, prefix)
+	if !ok {
+		// the wrapper falls back to listing and filtering
+		return lastFileName, filer.ErrUnsupportedListDirectoryPrefixed
+	}
+	if lower >= upper || limit <= 0 {
+		return lastFileName, nil
+	}
+
+	query := store.session.Query(cqlStr, store.layout.partitionValue(string(dirPath)), lower, upper, limit)
+	return store.listEntries(ctx, dirPath, query, eachEntryFunc)
 }
 
 func (store *CassandraStore) ListDirectoryEntries(ctx context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, eachEntryFunc filer.ListEachEntryFunc) (lastFileName string, err error) {
@@ -204,9 +225,14 @@ func (store *CassandraStore) ListDirectoryEntries(ctx context.Context, dirPath u
 		cqlStr = store.layout.listInclusive
 	}
 
+	query := store.session.Query(cqlStr, store.layout.partitionValue(string(dirPath)), startFileName, limit+1)
+	return store.listEntries(ctx, dirPath, query, eachEntryFunc)
+}
+
+func (store *CassandraStore) listEntries(ctx context.Context, dirPath util.FullPath, query *gocql.Query, eachEntryFunc filer.ListEachEntryFunc) (lastFileName string, err error) {
 	var data []byte
 	var name string
-	iter := store.session.Query(cqlStr, store.layout.partitionValue(string(dirPath)), startFileName, limit+1).WithContext(ctx).Iter()
+	iter := query.WithContext(ctx).Iter()
 	for iter.Scan(&name, &data) {
 		entry := &filer.Entry{
 			FullPath: util.NewFullPath(string(dirPath), name),

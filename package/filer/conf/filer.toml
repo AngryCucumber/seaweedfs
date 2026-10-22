@@ -1,0 +1,21 @@
+# MassDB OSS filer 的元数据存储配置（WEED_CONFIG_DIR / -config_dir 指向本目录）。
+# MassDB OSS 的元数据只用 Cassandra（技术来源 Apache Cassandra）；平台部署时由平台渲染
+# hosts、keyspace 与账号。表结构见 weed/filer/cassandra/schema.cql（哈希键 dirhash）。
+
+[filer.options]
+# 删除非空目录时是否递归删除
+recursive_delete = false
+
+[cassandra]
+enabled = true
+keyspace = "seaweedfs"
+hosts = [
+  "localhost:9042",
+]
+username = ""
+password = ""
+# 只按 key 读写、从不列举的超大目录（必须在写入前配置，配置后该目录不能列举）
+superLargeDirectories = []
+# 本数据中心名，作为选择主机的回退策略
+localDC = ""
+connection_timeout_millisecond = 600

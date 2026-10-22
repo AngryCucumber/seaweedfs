@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,14 +26,8 @@ const legacyTestSchema = `CREATE TABLE filemeta (
 ) WITH CLUSTERING ORDER BY (name ASC)`
 
 func TestCassandraStoreIntegration(t *testing.T) {
-	hostsValue := os.Getenv("SEAWEEDFS_CASSANDRA_TEST_HOSTS")
-	if hostsValue == "" {
-		t.Skip("set SEAWEEDFS_CASSANDRA_TEST_HOSTS to a disposable Cassandra instance")
-	}
-	hosts := strings.Split(hostsValue, ",")
-	for i := range hosts {
-		hosts[i] = strings.TrimSpace(hosts[i])
-	}
+	hosts := integrationHosts(t)
+	username, password := integrationCredentials()
 	admin := integrationSession(t, hosts, "")
 	hashedSchema, err := os.ReadFile("schema.cql")
 	if err != nil {
@@ -81,7 +77,7 @@ func TestCassandraStoreIntegration(t *testing.T) {
 			seedValue("ZmlsZXIuc3Q=", "b3JlLmlk", []byte{1, 2, 3, 4}, 0)
 
 			store := &CassandraStore{}
-			if err := store.initialize(keyspace, hosts, "", "", []string{"/huge"}, "", 10000); err != nil {
+			if err := store.initialize(keyspace, hosts, username, password, []string{"/huge"}, "", 10000); err != nil {
 				t.Fatalf("initialize: %v", err)
 			}
 			t.Cleanup(store.Shutdown)
@@ -130,6 +126,45 @@ func TestCassandraStoreIntegration(t *testing.T) {
 			if err != nil || last != "a" {
 				t.Fatalf("stop after first entry: last=%q err=%v", last, err)
 			}
+
+			prefixDir := util.FullPath("/prefix")
+			for _, name := range []string{"a", "p", "p1", "p2", "q", "目录", "目录-1", "目\U0010ffff"} {
+				if err := store.InsertEntry(ctx, integrationEntry(string(prefixDir.Child(name)), name)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ranged := filer.NewFilerStoreWrapper(store)
+			legacy := filer.NewFilerStoreWrapper(&legacyPrefixStore{CassandraStore: store})
+			for _, c := range []struct {
+				prefix, start string
+				include       bool
+				limit         int64
+				want          []string
+			}{
+				{prefix: "p", limit: 10, want: []string{"p", "p1", "p2"}},
+				{prefix: "p", start: "p", limit: 10, want: []string{"p1", "p2"}},
+				{prefix: "p", start: "p1", include: true, limit: 10, want: []string{"p1", "p2"}},
+				{prefix: "p", start: "a", limit: 10, want: []string{"p", "p1", "p2"}},
+				{prefix: "p", limit: 2, want: []string{"p", "p1"}},
+				{prefix: "目录", limit: 10, want: []string{"目录", "目录-1"}},
+				{prefix: "目", limit: 10, want: []string{"目录", "目录-1", "目\U0010ffff"}},
+				{prefix: "x", limit: 10},
+				{prefix: "p", start: "z", limit: 10},
+				{prefix: "\U0010ffff", limit: 10}, // no upper bound: the wrapper lists and filters
+				{prefix: "", start: "p2", limit: 10, want: []string{"q", "目录", "目录-1", "目\U0010ffff"}},
+			} {
+				for kind, wrapper := range map[string]*filer.FilerStoreWrapper{"range": ranged, "legacy": legacy} {
+					names, err := listNames(ctx, wrapper, prefixDir, c.start, c.include, c.limit, c.prefix)
+					if err != nil || !reflect.DeepEqual(names, c.want) {
+						t.Fatalf("%s prefix=%q start=%q inclusive=%v limit=%d: names=%q err=%v; want %q",
+							kind, c.prefix, c.start, c.include, c.limit, names, err, c.want)
+					}
+				}
+			}
+			if _, err := store.ListDirectoryPrefixedEntries(ctx, prefixDir, "", false, 10, "\U0010ffff", func(*filer.Entry) bool { return true }); err != filer.ErrUnsupportedListDirectoryPrefixed {
+				t.Fatalf("prefix without an upper bound: %v", err)
+			}
+
 			if err := store.DeleteEntry(ctx, "/目录/b"); err != nil {
 				t.Fatal(err)
 			}
@@ -173,6 +208,9 @@ func TestCassandraStoreIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			assertIntegrationEntry(t, store, huge.FullPath, huge.Content)
+			if names, err := listNames(ctx, filer.NewFilerStoreWrapper(store), "/huge", "", false, 10, "i"); err != nil || len(names) != 0 {
+				t.Fatalf("super large directory must stay unlistable with a prefix: %q %v", names, err)
+			}
 			huge.Content = []byte("updated huge entry")
 			if err := store.UpdateEntry(ctx, huge); err != nil {
 				t.Fatal(err)
@@ -218,6 +256,9 @@ func TestCassandraStoreIntegration(t *testing.T) {
 			if _, err := store.ListDirectoryEntries(ctx, "/seed", "", false, 10, func(*filer.Entry) bool { return true }); err == nil {
 				t.Fatal("list swallowed query/iterator failure")
 			}
+			if _, err := store.ListDirectoryPrefixedEntries(ctx, "/seed", "", false, 10, "e", func(*filer.Entry) bool { return true }); err == nil {
+				t.Fatal("prefixed list swallowed query/iterator failure")
+			}
 		})
 	}
 
@@ -235,7 +276,7 @@ func TestCassandraStoreIntegration(t *testing.T) {
 				}
 			}
 			store := &CassandraStore{}
-			err := store.initialize(keyspace, hosts, "", "", nil, "", 10000)
+			err := store.initialize(keyspace, hosts, username, password, nil, "", 10000)
 			if err == nil || !strings.Contains(err.Error(), "filemeta") {
 				t.Fatalf("expected explicit schema failure, got %v", err)
 			}
@@ -257,9 +298,169 @@ func TestCassandraStoreIntegration(t *testing.T) {
 	}
 }
 
+// TestCassandraPrefixListingLargeDirectory lists a prefix at the end of one
+// large directory the way the filer did before the store implemented
+// ListDirectoryPrefixedEntries and the way it does now, and logs the rows
+// each read and the time taken. It writes SEAWEEDFS_CASSANDRA_LARGE_DIR_ENTRIES
+// entries (default 1000000) into the dirhash layout.
+func TestCassandraPrefixListingLargeDirectory(t *testing.T) {
+	hosts := integrationHosts(t)
+	username, password := integrationCredentials()
+	if testing.Short() {
+		t.Skip("writes a large directory")
+	}
+	total := 1000000
+	if value := os.Getenv("SEAWEEDFS_CASSANDRA_LARGE_DIR_ENTRIES"); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 {
+			t.Fatalf("SEAWEEDFS_CASSANDRA_LARGE_DIR_ENTRIES=%q", value)
+		}
+		total = n
+	}
+	admin := integrationSession(t, hosts, "")
+	keyspace := integrationKeyspace(t, admin)
+	seed := integrationSession(t, hosts, keyspace)
+	schema, err := os.ReadFile("schema.cql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Query(string(schema)).Exec(); err != nil {
+		t.Fatal(err)
+	}
+
+	const dir = "/buckets/large"
+	meta, err := integrationEntry(dir+"/object", "small object").EncodeAttributesAndChunks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirHash := fmt.Sprintf("%x", md5.Sum([]byte(dir)))
+	name := func(i int) string { return fmt.Sprintf("obj-%07d", i) }
+	started := time.Now()
+	work := make(chan int, 1024)
+	var failed sync.Once
+	var writeErr error
+	var wg sync.WaitGroup
+	for w := 0; w < 64; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range work {
+				if err := seed.Query("INSERT INTO filemeta (dirhash,directory,name,meta) VALUES (?,?,?,?)", dirHash, dir, name(i), meta).Exec(); err != nil {
+					failed.Do(func() { writeErr = err })
+				}
+			}
+		}()
+	}
+	for i := 0; i < total; i++ {
+		work <- i
+	}
+	close(work)
+	wg.Wait()
+	if writeErr != nil {
+		t.Fatalf("write entries: %v", writeErr)
+	}
+	t.Logf("wrote %d entries into %s in %v", total, dir, time.Since(started).Round(time.Millisecond))
+
+	store := &CassandraStore{}
+	if err := store.initialize(keyspace, hosts, username, password, nil, "", 10000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Shutdown)
+	last := name(total - 1)
+	prefix := last[:len(last)-2]
+	var want []string
+	for i := 0; i < total; i++ {
+		if strings.HasPrefix(name(i), prefix) {
+			want = append(want, name(i))
+		}
+	}
+
+	ctx := context.Background()
+	const limit = 1002 // what S3 asks the filer for one ListObjects page of 1000 keys
+	legacyStore := &legacyPrefixStore{CassandraStore: store}
+	started = time.Now()
+	before, err := listNames(ctx, filer.NewFilerStoreWrapper(legacyStore), dir, "", false, limit, prefix)
+	beforeTime := time.Since(started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started = time.Now()
+	after, err := listNames(ctx, filer.NewFilerStoreWrapper(store), dir, "", false, limit, prefix)
+	afterTime := time.Since(started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, want) || !reflect.DeepEqual(after, want) {
+		t.Fatalf("prefix %q: before %d names, after %d names, want %d", prefix, len(before), len(after), len(want))
+	}
+	t.Logf("prefix %q at the end of %d entries, %d matches: before %d rows read in %v, after %d rows read in %v",
+		prefix, total, len(want), legacyStore.rows, beforeTime.Round(time.Millisecond), len(after), afterTime.Round(time.Millisecond))
+}
+
+// legacyPrefixStore lists prefixes the way the filer did before the store
+// implemented ListDirectoryPrefixedEntries and counts the rows it reads.
+type legacyPrefixStore struct {
+	*CassandraStore
+	rows int
+}
+
+func (store *legacyPrefixStore) ListDirectoryPrefixedEntries(context.Context, util.FullPath, string, bool, int64, string, filer.ListEachEntryFunc) (string, error) {
+	return "", filer.ErrUnsupportedListDirectoryPrefixed
+}
+
+func (store *legacyPrefixStore) ListDirectoryEntries(ctx context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, eachEntryFunc filer.ListEachEntryFunc) (string, error) {
+	return store.CassandraStore.ListDirectoryEntries(ctx, dirPath, startFileName, includeStartFile, limit, func(entry *filer.Entry) bool {
+		store.rows++
+		return eachEntryFunc(entry)
+	})
+}
+
+// listNames pages through a prefixed listing the way the filer's ListEntries
+// does: it lists again from the last name until a page is empty or limit
+// names were returned.
+func listNames(ctx context.Context, store *filer.FilerStoreWrapper, dir util.FullPath, start string, include bool, limit int64, prefix string) (names []string, err error) {
+	page := min(limit, int64(filer.PaginationSize))
+	for limit > 0 {
+		found := false
+		start, err = store.ListDirectoryPrefixedEntries(ctx, dir, start, include, page, prefix, func(entry *filer.Entry) bool {
+			found = true
+			names = append(names, entry.FullPath.Name())
+			limit--
+			return limit > 0
+		})
+		if err != nil || !found {
+			return names, err
+		}
+		include = false
+	}
+	return names, nil
+}
+
+func integrationHosts(t *testing.T) []string {
+	t.Helper()
+	hostsValue := os.Getenv("SEAWEEDFS_CASSANDRA_TEST_HOSTS")
+	if hostsValue == "" {
+		t.Skip("set SEAWEEDFS_CASSANDRA_TEST_HOSTS to a disposable Cassandra instance")
+	}
+	hosts := strings.Split(hostsValue, ",")
+	for i := range hosts {
+		hosts[i] = strings.TrimSpace(hosts[i])
+	}
+	return hosts
+}
+
+// integrationCredentials are SEAWEEDFS_CASSANDRA_TEST_USERNAME and
+// SEAWEEDFS_CASSANDRA_TEST_PASSWORD, for an instance with password authentication.
+func integrationCredentials() (username, password string) {
+	return os.Getenv("SEAWEEDFS_CASSANDRA_TEST_USERNAME"), os.Getenv("SEAWEEDFS_CASSANDRA_TEST_PASSWORD")
+}
+
 func integrationSession(t *testing.T, hosts []string, keyspace string) *gocql.Session {
 	t.Helper()
 	cluster := gocql.NewCluster(hosts...)
+	if username, password := integrationCredentials(); username != "" {
+		cluster.Authenticator = gocql.PasswordAuthenticator{Username: username, Password: password}
+	}
 	cluster.Keyspace = keyspace
 	cluster.Timeout = 10 * time.Second
 	cluster.ConnectTimeout = 10 * time.Second

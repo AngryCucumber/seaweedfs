@@ -1,0 +1,91 @@
+MassDB OSS defaults on top of Apache Cassandra 5.0.8 conf/cassandra.yaml, applied with
+patch -p1 -F0 by package/build/massdb-meta-package.sh (see package/README.md).
+
+--- a/conf/cassandra.yaml
++++ b/conf/cassandra.yaml
+@@ -23,7 +23,7 @@
+ 
+ # The name of the cluster. This is mainly used to prevent machines in
+ # one logical cluster from joining another.
+-cluster_name: 'Test Cluster'
++cluster_name: 'weed_filer_cluster'
+ 
+ # This defines the number of tokens randomly assigned to this node on the ring
+ # The more tokens, relative to other nodes, the larger the proportion of data
+@@ -94,7 +94,7 @@
+ 
+ # Directory where Cassandra should store hints.
+ # If not set, the default directory is $CASSANDRA_HOME/data/hints.
+-# hints_directory: /var/lib/cassandra/hints
++hints_directory: /data/massdb-oss-storage/massdb-oss-filer-meta/hints
+ 
+ # How often hints should be flushed from the internal buffers to disk.
+ # Will *not* trigger fsync.
+@@ -195,7 +195,8 @@
+ #   users. It keeps usernames and hashed passwords in system_auth.roles table.
+ #   Please increase system_auth keyspace replication factor if you use this authenticator.
+ #   If using PasswordAuthenticator, CassandraRoleManager must also be used (see below)
+-authenticator: AllowAllAuthenticator
++# MassDB OSS: password authentication; the platform creates its own superuser and disables the default one
++authenticator: PasswordAuthenticator
+ # MutualTlsAuthenticator can be configured using the following configuration. One can add their own validator
+ # which implements MutualTlsCertificateValidator class and provide logic for extracting identity out of certificates
+ # and validating certificates.
+@@ -392,8 +393,8 @@
+ # directories are specified, Cassandra will spread data evenly across
+ # them by partitioning the token ranges.
+ # If not set, the default directory is $CASSANDRA_HOME/data/data.
+-# data_file_directories:
+-#     - /var/lib/cassandra/data
++data_file_directories:
++    - /data/massdb-oss-storage/massdb-oss-filer-meta/data
+ 
+ # Directory were Cassandra should store the data of the local system keyspaces.
+ # By default Cassandra will store the data of the local system keyspaces in the first of the data directories specified
+@@ -405,7 +406,7 @@
+ # commit log.  when running on magnetic HDD, this should be a
+ # separate spindle than the data directories.
+ # If not set, the default directory is $CASSANDRA_HOME/data/commitlog.
+-# commitlog_directory: /var/lib/cassandra/commitlog
++commitlog_directory: /data/massdb-oss-storage/massdb-oss-filer-meta/commitlog
+ 
+ # Enable / disable CDC functionality on a per-node basis. This modifies the logic used
+ # for write path allocation rejection (standard: never reject. cdc: reject Mutation
+@@ -608,7 +609,7 @@
+ 
+ # saved caches
+ # If not set, the default directory is $CASSANDRA_HOME/data/saved_caches.
+-# saved_caches_directory: /var/lib/cassandra/saved_caches
++saved_caches_directory: /data/massdb-oss-storage/massdb-oss-filer-meta/saved_caches
+ 
+ # Number of seconds the server will wait for each cache (row, key, etc ...) to load while starting
+ # the Cassandra process. Setting this to zero is equivalent to disabling all cache loading on startup
+@@ -719,8 +720,8 @@
+ # On the other hand, since writes are almost never IO bound, the ideal
+ # number of "concurrent_writes" is dependent on the number of cores in
+ # your system; (8 * number_of_cores) is a good rule of thumb.
+-concurrent_reads: 32
+-concurrent_writes: 32
++concurrent_reads: 64
++concurrent_writes: 192
+ concurrent_counter_writes: 32
+ 
+ # For materialized view writes, as there is a read involved, so this should
+@@ -822,7 +823,7 @@
+ #
+ # offheap_objects
+ #    off heap objects
+-memtable_allocation_type: heap_buffers
++memtable_allocation_type: offheap_objects
+ 
+ # Limit memory usage for Merkle tree calculations during repairs of a certain
+ # table and common token range. Repair commands targetting multiple tables or
+@@ -1553,7 +1554,7 @@
+ #
+ # You can use a custom Snitch by setting this to the full class name
+ # of the snitch, which will be assumed to be on your classpath.
+-endpoint_snitch: SimpleSnitch
++endpoint_snitch: GossipingPropertyFileSnitch
+ 
+ # controls how often to perform the more expensive part of host score
+ # calculation

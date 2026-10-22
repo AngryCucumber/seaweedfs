@@ -1,4 +1,4 @@
-.PHONY: test
+.PHONY: test massdb-package massdb-meta-package
 
 BINARY = weed
 
@@ -35,3 +35,12 @@ benchmark_with_pprof: benchmark
 
 test:
 	cd weed; go test -tags "elastic gocdk sqlite ydb tikv rclone" -v ./...
+
+# MassDB OSS installation packages, see package/README.md.
+# make massdb-package [VERSION=3.84] [ARCH="arm64 amd64"] TRUST=<trust manifest> [LARGE_DISK=1] [OUT=dist] [ALLOW_DIRTY=1]
+massdb-package:
+	VERSION="$(VERSION)" ARCH="$(ARCH)" TRUST="$(TRUST)" LARGE_DISK="$(LARGE_DISK)" OUT="$(OUT)" ALLOW_DIRTY="$(ALLOW_DIRTY)" package/build/massdb-package.sh
+
+# make massdb-meta-package CASSANDRA_TARBALL=<apache-cassandra-5.0.x-bin.tar.gz> JMX_EXPORTER_JAR=<jmx_prometheus_javaagent-x.y.z.jar> [OUT=dist]
+massdb-meta-package:
+	CASSANDRA_TARBALL="$(CASSANDRA_TARBALL)" JMX_EXPORTER_JAR="$(JMX_EXPORTER_JAR)" OUT="$(OUT)" package/build/massdb-meta-package.sh

@@ -1,0 +1,7 @@
+# MassDB OSS master 的 toml 配置（WEED_CONFIG_DIR / -config_dir 指向本目录）。
+# 完整可选项见 weed scaffold -config=master。
+
+[master.license]
+# master 之间的授权 RPC 只接受 raft 成员和 -peers 的地址。某台 master 经 NAT 或另一块
+# 网卡访问其它 master 时，在这里列出它的 IP 或网段，逗号分隔，例如 "10.0.0.0/24"。
+peer_ips = ""

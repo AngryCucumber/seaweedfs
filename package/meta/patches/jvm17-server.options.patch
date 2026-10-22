@@ -1,0 +1,16 @@
+MassDB OSS defaults on top of Apache Cassandra 5.0.8 conf/jvm17-server.options, applied with
+patch -p1 -F0 by package/build/massdb-meta-package.sh (see package/README.md).
+
+--- a/conf/jvm17-server.options
++++ b/conf/jvm17-server.options
+@@ -120,3 +120,10 @@
+ -Dio.netty.allocator.maxOrder=11
+ 
+ # The newline in the end of file is intentional
++
++### MassDB OSS: heap size
++# The platform renders -Xms and -Xmx here, as a pair, from the host's memory
++# (a quarter of it, below 31G so compressed oops stay on). Without them
++# cassandra-env.sh computes the heap itself.
++#-Xms8G
++#-Xmx8G

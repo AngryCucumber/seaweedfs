@@ -46,12 +46,33 @@ a large directory or a demonstrated performance improvement. The original
 `superLargeDirectories` layout and its listing limitations are unchanged.
 Directory hashes are used as keys without a collision-resolution scheme.
 
+## Prefixed listing
+
+`ListDirectoryPrefixedEntries` (S3 ListObjects with a prefix, filer listings
+with a name prefix) reads one range of the directory's partition in both
+layouts: `name >= max(start, prefix) AND name < bound`, where `bound` is the
+prefix with its last code point replaced by the next one (trailing U+10FFFF is
+dropped first). Cassandra orders text clustering keys by their UTF-8 bytes,
+which is code point order for valid UTF-8, so the range holds exactly the
+names with the prefix; a byte-wise increment could produce invalid UTF-8,
+which Cassandra rejects as a text value. An empty prefix uses the plain
+listing. A prefix that is not valid UTF-8 or consists only of U+10FFFF has no
+bound; the store returns `ErrUnsupportedListDirectoryPrefixed` and the filer
+store wrapper lists from the start name and filters in memory, as it did for
+every prefix before. `superLargeDirectories` remain unlistable.
+
+Previously every prefixed listing read the directory from its start (or the
+start name) up to the prefix and filtered in memory. With 1,000,000 entries in
+one directory and a prefix matching the last 100, one listing read 1,000,000
+rows (about 2.1–2.4 s on a single local node) before and 100 rows (4–8 ms)
+after; see `TestCassandraPrefixListingLargeDirectory`.
+
 ## Tests
 
 Unit tests run without Cassandra:
 
 ```sh
-go test ./weed/filer/cassandra -run TestDetectFileMetaLayout -count=1
+go test ./weed/filer/cassandra -run 'TestDetectFileMetaLayout|TestPrefix' -count=1
 ```
 
 Integration tests are opt-in and must point to a **disposable** Cassandra
@@ -65,8 +86,18 @@ SEAWEEDFS_CASSANDRA_TEST_HOSTS=127.0.0.1:9042 \
   go test ./weed/filer/cassandra -run TestCassandraStoreIntegration -count=1 -v -timeout=5m
 ```
 
+For an instance with password authentication, also set
+`SEAWEEDFS_CASSANDRA_TEST_USERNAME` and `SEAWEEDFS_CASSANDRA_TEST_PASSWORD`.
+
 The integration suite executes `schema.cql`, reads pre-existing legacy rows,
 exercises both layouts through initialization, CRUD, ordered listing and
-inclusive/exclusive cursors, directory deletion, KV operations, TTL expiration,
-and super-large-directory point operations. It also checks missing/unsupported
+inclusive/exclusive cursors, prefixed listing (compared with the wrapper's
+in-memory filtering), directory deletion, KV operations, TTL expiration, and
+super-large-directory point operations. It also checks missing/unsupported
 schemas, session cleanup, and propagation of query and iterator failures.
+
+`TestCassandraPrefixListingLargeDirectory` writes
+`SEAWEEDFS_CASSANDRA_LARGE_DIR_ENTRIES` entries (default 1,000,000) into one
+directory of the hashed layout and logs the rows read and the time taken by a
+prefixed listing at its end, before (in-memory filtering) and after (range
+query). It is skipped with `-short`; allow a few minutes for the writes.

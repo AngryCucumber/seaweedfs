@@ -15,6 +15,10 @@ import (
 // certificate verifies.
 const productionTrustManifest = ``
 
+// ProductionTrustManifest returns the production trust manifest exactly as
+// compiled in; the installation package build records it in package.json.
+func ProductionTrustManifest() string { return productionTrustManifest }
+
 // testTrustManifest adds non-production keys at build time:
 //
 //	-ldflags "-X github.com/seaweedfs/seaweedfs/weed/license.testTrustManifest=<base64url of manifest JSON>"

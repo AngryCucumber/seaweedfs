@@ -444,6 +444,8 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 
 它产出生产 kid 与公钥（7.4），是发布的前置条件；P5 的功能验收仍用测试根，不被它阻塞。工作量随项目另计。
 
+2026-10-21 修订：独立签发项目定为 MassDB Manager 的签发中心 `manager-license`（Manager 计划决策 D3），为 OSS 建自己的密钥；它的互通测试经 `weed/license` 的外部向量测试验证本仓库的验签，安装包由 `make massdb-package` 注入测试根，见 8.21。
+
 ### 7.4 开工前准备
 
 - protoc v5.28.3、protoc-gen-go v1.34.2、protoc-gen-go-grpc v1.5.1（本机未安装，版本须与现有生成文件一致；v9 起 `master.proto` 与 `filer.proto` 都要重新生成，`filer.proto` 同步到 `other/java`）。
@@ -999,6 +1001,15 @@ MassDB SQL（`2.0.5-license` 分支）在 OSS 契约冻结（2026-10-13）之后
 | 导入 c5（2 小时后生效，filer 2→1） | 接受：`FILER_LIMIT_REDUCED`、`PENDING_DISCARDED`（c4）；重试 `unchanged=true`、`changes=[]`；等待期 filer 额度为 1 |
 | 页面导入 c6（立即生效，期限缩短，filer 2→1，顶掉 c5） | validate 结果、导入确认框与导入结果都列出三项变化，导入成功 |
 | 页面导入已被取代的 c1 | 显示 409 `LICENSE_SEQUENCE_NOT_INCREASING`，不弹确认框 |
+
+### 8.21 安装包与签发中心互通入口（2026-10-21）
+
+MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发中心出 OSS 证书）对本仓库授权部分的改动，不改授权行为：
+
+- `TestExternalIssuerVectors`（`weed/license/external_vectors_test.go`）：`SEAWEEDFS_LICENSE_VECTORS_DIR` 指向外部签发方产出的目录时运行，未设时跳过。目录含 `trust.json`（导出的信任清单）、可选的 `trust.b64`（同一清单的 base64url，必须逐字节解码回 `trust.json`）与 `vectors.json`（`{"vectors":[{"file","expect","kid","claims"}]}`，`expect` 为 `VALID` 或 `ParseCertificate` 的原因码）。证书文件先去首尾空白，与 `-license.file` 和导入接口一致；两份清单分别作为生产根与测试根各验一遍。签发中心的 `MassDbOssInteropTest` 调用它。已用 `testdata`（kid `interop-2026`）与签发中心测试根（kid `massdb-oss-test-20261021`）的向量验证通过，并确认期望不符时失败。
+- `license.ProductionTrustManifest()`：返回编译进去的生产清单原文，供出包工具写进 `package.json` 并核对二进制。
+- `make massdb-package`（`package/`，规范见 `package/README.md`）：测试根经 `-ldflags -X …/weed/license.testTrustManifest=` 注入，注入前用 `NewTrustStore` 按同样规则校验（与生产清单 kid 重复也会报错）；`package.json` 记录 `trust` 与 `trustEncoding`（测试根 `ldflags-base64url`，生产根 `embedded-json`），出包时确认该串原样存在于 `bin/weed`。生产清单为空且没给测试根时拒绝出包；生产清单非空时暂不支持叠加测试根。
+- 实测：签发中心测试根打出的 arm64 包在容器里起 master，`GET /license` 为 `trust_root: "test"`，签发中心的样例证书（占位部署标识）`POST /license/validate` 返回 `LICENSE_DEPLOYMENT_MISMATCH`，即 kid 受信任、验签通过。未签发本集群的证书，带证书的 volume / filer 注册与读放开留待 Manager 计划 O9。
 
 验收场景（真实进程：3 master（另测 2 voter + 1 nonvoter 与 5 voter 两组）+ 3 volume + 2 filer + 1 s3 + 1 mount + 1 `weed server -filer -webdav`；一组开启 `-cipher`）：
 

@@ -1,0 +1,81 @@
+# MassDB OSS 元数据库（技术来源 Apache Cassandra）的 JMX exporter 规则，
+# jmx_prometheus_javaagent 1.x 由 start_cassandra.sh 以 -javaagent 加载，端口见 massdb-cassandra.conf。
+#
+# 指标名沿用平台仪表盘已在用的写法（cassandra_<type>_<name>，Count 计数器带 _count_total，
+# 标签 scope）；JVM 的堆与 GC 停顿（jvm_memory_*、jvm_gc_collection_seconds）由 exporter 自带。
+# 元数据关注项：
+#   待合并任务数          cassandra_compaction_pendingtasks
+#   每次读涉及的 SSTable 数 cassandra_table_sstablesperreadoperation_{mean,max,99thpercentile}{keyspace,table}
+#   分区大小              cassandra_table_{max,mean}partitionsize{keyspace,table}
+#   每次读扫描的墓碑数      cassandra_table_tombstonescannedhistogram_{mean,max,99thpercentile}{keyspace,table}
+#   被丢弃的写入           cassandra_droppedmessage_dropped_count_total{scope="MUTATION"}
+#   线程池积压            cassandra_threadpools_pendingtasks{path,scope}
+# 表级指标只导出非 system* keyspace，避免系统表带来大量时间序列。
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+includeObjectNames:
+  - "org.apache.cassandra.metrics:*"
+rules:
+  # 表级（keyspace + scope=表名）
+  - pattern: 'org.apache.cassandra.metrics<type=Table, keyspace=((?!system)\S+), scope=(\S+), name=(\S+)><>Value'
+    name: cassandra_table_$3
+    type: GAUGE
+    labels:
+      keyspace: "$1"
+      table: "$2"
+  - pattern: 'org.apache.cassandra.metrics<type=Table, keyspace=((?!system)\S+), scope=(\S+), name=(\S+)><>Count'
+    name: cassandra_table_$3_count
+    type: COUNTER
+    labels:
+      keyspace: "$1"
+      table: "$2"
+  - pattern: 'org.apache.cassandra.metrics<type=Table, keyspace=((?!system)\S+), scope=(\S+), name=(\S+)><>(Mean|Max|99thPercentile)'
+    name: cassandra_table_$3_$4
+    type: GAUGE
+    labels:
+      keyspace: "$1"
+      table: "$2"
+  # 有规则时没匹配上任何规则的属性不导出：system* 表、Keyspace 级等 bean 的属性列表里
+  # 还有 keyspace=，匹配不上下面要求 type 后紧跟 scope= 或 name= 的规则
+
+  # 线程池（path=request|internal|transport，scope=线程池名）
+  - pattern: 'org.apache.cassandra.metrics<type=ThreadPools, path=(\S+), scope=(\S+), name=(\S+)><>Value'
+    name: cassandra_threadpools_$3
+    type: GAUGE
+    labels:
+      path: "$1"
+      scope: "$2"
+  - pattern: 'org.apache.cassandra.metrics<type=ThreadPools, path=(\S+), scope=(\S+), name=(\S+)><>Count'
+    name: cassandra_threadpools_$3_count
+    type: COUNTER
+    labels:
+      path: "$1"
+      scope: "$2"
+
+  # 带 scope 的（ClientRequest 的 Read/Write、DroppedMessage 的 MUTATION 等）
+  - pattern: 'org.apache.cassandra.metrics<type=(\S+), scope=(\S+), name=(\S+)><>Value'
+    name: cassandra_$1_$3
+    type: GAUGE
+    labels:
+      scope: "$2"
+  - pattern: 'org.apache.cassandra.metrics<type=(\S+), scope=(\S+), name=(\S+)><>Count'
+    name: cassandra_$1_$3_count
+    type: COUNTER
+    labels:
+      scope: "$2"
+  - pattern: 'org.apache.cassandra.metrics<type=(\S+), scope=(\S+), name=(\S+)><>(Mean|Max|99thPercentile)'
+    name: cassandra_$1_$3_$4
+    type: GAUGE
+    labels:
+      scope: "$2"
+
+  # 只有 type 与 name 的（Compaction、CommitLog、Storage、MemtablePool 等）
+  - pattern: 'org.apache.cassandra.metrics<type=(\S+), name=(\S+)><>Value'
+    name: cassandra_$1_$2
+    type: GAUGE
+  - pattern: 'org.apache.cassandra.metrics<type=(\S+), name=(\S+)><>Count'
+    name: cassandra_$1_$2_count
+    type: COUNTER
+  - pattern: 'org.apache.cassandra.metrics<type=(\S+), name=(\S+)><>(Mean|Max|99thPercentile)'
+    name: cassandra_$1_$2_$3
+    type: GAUGE
