@@ -26,6 +26,8 @@
 
 **P5 完成（2026-10-14）：** 全量检查（Linux 上 CI 命令全部通过、vet 与基线一致）、S14 新旧混部、`weed server` 一体化、docker-compose、运维手册、外部审核 4 项修复与 S13 性能（新旧版本差异均在噪声内）已完成，见 8.5–8.7；其间修复 goraft 全集群重启后对账卡死，补充宽限节点列表。发布仍需独立签发项目产出的生产信任根（7.3）。
 
+**第十五轮审核（2026-10-22，方案已定、代码未改）：** 对分支全部授权改动做了会话内审查，确认 12 项，均未改代码：5 项 P2（mount 截断到 0 后非隐藏类读失败残留、5 秒内 `EIO`；filer.backup 的 `backup.` 检查点键不在 `KvGet` 白名单，拒读期间回退到 1970；hashicorp raft 的 `GetConfiguration().Index()` 恒为 0，`RemoveMaster` 的 `MEMBERSHIP_CHANGED` 配置检查失效；对端地址校验的 DNS 解析失败无负缓存；leader 墙钟超前经 `SyncLicense` 推高 follower 水位）与 7 项 P3。逐项方案、提交顺序与两处待确认取舍见 8.22；2026-10-24 外部复核修正了其中方案 1、8、9 的缺陷（见 8.22 末尾）。
+
 本文是实施计划，不是功能已完成声明。第 9 节的取舍已于 2026-10-13 由用户确认（决策 2、4、9 改选备选），证书声明、原因码、线格式常量与源码挂点以 [P0 契约](license-p0-contract-20261013.md) 为准。
 
 ---
@@ -1046,6 +1048,48 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 | S19 | volume gRPC 原始读（v9） | 见 P0 契约 8.2 |
 | S20 | 隐藏正文的回写与复制（v9） | 见 P0 契约 8.2 |
 | S21 | 无证书准入与升级（v9） | 见 P0 契约 8.2 |
+
+### 8.22 第十五轮审核（2026-10-22，方案已定、代码未改）
+
+第十五轮审核基于 `41301715a`，在本仓库会话内完成，范围是分支相对上游 `5e4696065` 的全部非测试 Go 改动：`weed/license` 核心包逐行、master 集成（raft 适配、对端 RPC 地址校验、准入、HTTP/gRPC 管理接口、shell、`license.init`）、volume/filer 读守卫与内部令牌、mount 读失败与重取、Cassandra 哈希键存储。`CGO_ENABLED=0 go build ./...`、`go vet ./license/`、`go test -race ./license/` 通过。未发现丢数据或泄露正文的问题；确认 12 项，均未修改代码，方案与取舍记录如下。级别：P2 影响功能或可用性，P3 窄窗口、信息项或与上游一致的瑕疵。
+
+| # | 问题 |
+| --- | --- |
+| 1（P2） | mount：`weedfs_attr.go:117-126` 截断到 0 只经 `clearHiddenContent` 清隐藏类读失败；`SetEntry`（`filehandle.go:98-110`）记下的 manifest 解析失败（`readFailure.hidden=false`）原样保留，而 `readFromChunks`（`filehandle_read.go:63`）先查 `readError()` 再读脏页。无有效证书打开带 manifest 的大文件 → `O_TRUNC` 或 `truncate(0)` → 写入 → 读取，5 秒内返回 `EIO`，尽管条目里只剩刚上传的普通分块、脏页也有数据；读取晚于上次失败 5 秒才由 `maybeRetryRead → resolveChunksAgain` 清掉。部分截断同理：`SetChunks` 重新解析剩余 manifest 的结果（`filechunk_group.go:77`）被忽略。与"每条写路径都清隐藏标志"的规则不对称：导致失败的分块已经没了，标志却还在 |
+| 2（P2） | filer.backup：`filer_license.go:27-31` 的 `KvGet` 白名单只有 `Meta`、`sync.`、`remote.sync.`，`filer.backup` 的检查点键前缀 `backup.`（`filer_backup.go:90`）不在其中。拒读态 `getOffset` 得到 `PermissionDenied`，`filer_backup.go:119` 当作"无检查点"从 1970 开始；目录与删除事件此时仍成功，`AddOffsetFunc` 3 秒后经 `setOffset`（`KvPut` 不受限）用远古时间戳覆盖检查点；随后遇正文读 403 停流，`runFilerBackup` 每 1.7 秒重试并重复。续期后从该偏移续传，整段历史重新复制到 sink（localsink 重写每个文件，S3 sink 重传）。契约 5.3 的 `KvGet` 行与 S20 都要求 filer.backup"续期后从原偏移续传"，白名单在契约与代码里都漏了 `backup.` |
+| 3（P2） | master：hashicorp/raft v1.7.2 的 `GetConfiguration()`（库源码 `api.go:897-903`）只填 `latest` 不填 `latestIndex`，`Index()` 恒为 0，`master_license.go:89` 取到的 `Membership.Index` 始终为 0。`RemoveMaster` 的 `after.Index != mem.Index` 永远为假，只剩授权修订号比较；`LeaderInfo.ConfigIndex` 在线上也始终为 0（接收方忽略）。契约 138、198、412 行与计划 3.3 第 8 条"配置索引已变化则 `MEMBERSHIP_CHANGED`"在生产上不生效；`manager_test.go` 通过是因为假 raft 提供了真实索引。进程内 `opMu` 串行化成员变更、非 leader 的 `RemoveServer` 会被 raft 拒绝，实际窗口小，但设计依赖的不变量没有被执行 |
+| 4（P2） | master：`master_license_peers.go:152-170` 解析主机名失败时返回旧 IP 但不刷新 `at`，下一次调用再解析，每个名字付 2 秒超时；`checkLicensePeer`（88-98）的 hosts 把 `-peers` 与 raft 成员各列一遍不去重。用主机名互连时 DNS 不可用（k8s CoreDNS、docker 内置 DNS 故障）：每个 master 间 RPC 至少付两次 2 秒，超过 `peerRPCTimeout` 3 秒，导入 `PARTIAL_COMMIT`、账本每 5 秒"未确认"、此时选主的新 leader 卡在 `RECONCILING` 拒绝所有注册；raft 本身在既有连接上照常运行 |
+| 5（P2） | master 时钟：`ApplySync` 对相同 `repair_seq` 经 `ClockState.Merge`（`state.go:252-261`）取较大水位，而对账写回与 `pushPending` 推送的 `stateLocked()` 带的是 leader 当前墙钟。4.5 只在对账路径避免"一台时钟超前的 master 让新 leader 进入 `CLOCK_SUSPECT`"，`SyncLicense` 路径又把它带回来。leader 快 N 秒（N > 5）时每次推送后 follower 的 `refreshClock` 打 `CLOCK_SUSPECT` 错误日志、指标置位；若在 N−5 秒窗口内切主到它，新 leader 对全集群拒读到窗口结束。需 master 间时钟不同步才触发 |
+| 6（P3） | master：`master_grpc_server.go:73-101` 的 defer 先 `DisconnectNode` 再 `UnRegisterDataNode`；对账用的 `licenseConnected()`（`master_license.go:268`）读 Topo，且 `reconcileLocked` 在 `m.mu` 外取快照后再换账本。流恰在对账期间结束时账本项在线但无 `conns`，不进宽限，`DELETE /license/nodes/{addr}` 报 `NODE_ONLINE`，直到该节点重连再断开或下次切主。窗口很窄 |
+| 7（P3） | mount：`weedfs.go:168`（`invalidateHandle`）与 `filehandle_map.go:52`（`AcquireFileHandle`）调用 `SetEntry` 只持句柄锁或句柄表锁，不持 `entryLock`；`SetEntry` 写 `entryChunkGroup` 与 `entry`；`UploadPipeline.Shutdown()` 不等在飞上传，`addUploadedChunk` 只持 `entryLock` 读锁。8.18 列的三个替换点漏了这两处，`-race` 可见；上游本有同类竞争，后果限于分块加进即将丢弃的旧条目 |
+| 8（P3） | master：`master_server.go:380-389` `OnPeerUpdate` 把 nonvoter 也当"已在配置里"，`JoinMaster` 10 秒内未确认留下的 nonvoter 不再自动提升，需 `cluster.raft.add`。计划 3.3 第 7 条"任一步失败保持 nonvoter 并告警"已知，但比上游少了重连自愈 |
+| 9（P3） | filer：`filer.go:97-114` 引导只在对端隐藏正文时无限重试（每 5 秒全量 BFS），被配额拒绝的 filer 永远拿不到令牌；`setOrLoadFilerStoreSignature`（`filer.go:162-172`）在引导前已写 `filer.store.id`，中途杀掉后下次启动 `isFresh=false`，半份命名空间被当作已初始化 |
+| 10（P3） | filer：`filer_server_handlers.go:67` 对 `/?proxyChunkId=` 的 license 403 在 `maybeCheckJwtAuthorization`（82）之前；上游该分支本就不走 filer JWT（靠 volume 侧 JWT），配置 `jwt.filer_signing` 时未鉴权调用者能看到 403 里的 reason、cluster_id、expires_at |
+| 11（P3） | mount：`filehandle_license.go:252-256` 隐藏期间改过大小再取回正文时只裁剪或补零内联正文，`Attributes.Md5` 沿用旧值，flush 后 ETag 与内容不符（上游分块截断与 `SetAttr` 内联裁剪同样不改 md5）。另：无句柄截断仅远端文件（`weedfs_attr.go:68 → cacheRemoteEntry`）时，filer 的缓存事件与 `saveEntry` 的 meta cache 更新没有排序，`stat` 可能停在旧大小——中等置信度，待复现 |
+| 12（P3） | 契约与代码不一致：契约 5.2 元数据白名单含 `.cpx`，`volume_grpc_copy.go:425` 的 `isCopyFileMetadataExt` 没有；树内无调用方，无实际影响 |
+
+方案（待实施；每项独立提交，带单测，计划与契约按下列条目同步修订）：
+
+1. **截断后清除非隐藏类读失败。** `weedfs_attr.go` 截断分支：size 为 0 时无条件清掉 `readFailure`（新增不区分隐藏类的 `clearReadFailure`），旧内容一点不剩；`hiddenCut`、`ContentHidden`、`RemoteEntry` 的处理不变。部分截断时用 `entryChunkGroup.SetChunks` 的返回值更新非隐藏类失败：解析成功或剩余分块无 manifest 则清除，失败则记新错误与时间；隐藏类失败不受影响。**解析成功时必须同时调用 `noteChunks(chunks, entryChunkGroup)`（2026-10-24 复核修订）**：`weedfs_attr.go:109` 的 `SetChunks` 今天就不更新 `chunkTsNs`，首次打开解析失败、截断时才解析成功的 manifest，其内部分块的时间戳若领先本机，之后写入的时间戳比它们旧，flush 合并时写入被旧数据覆盖，与 8.17 的 `resolveChunksAgain` 同一类问题；清除读失败会让这条路径成为常态，所以一并修。单测加：内部分块时间戳领先 30 秒，部分截断后写入的时间戳晚于全部分块，按提交的元数据重新读取得到新内容。重试丢弃语义不变：`maybeRetryRead` 的 CAS 看到失败已被替换（含置 nil）即丢弃结果。单测：无证书打开带 manifest 的条目 → `SetAttr(0)` → 写 → 立即读到数据；部分截断使 manifest 全部消失后读成功；仍有 manifest 时继续 `EIO`。文档：1.6 补"截断掉导致失败的分块即清除失败状态"。
+2. **`backup.` 进白名单，`getOffset` 出错不再从 0 开始。** A：`filer_license.go` 的 `licenseKvOffsetPrefixes` 加 `"backup."` 字面量（与 `"sync."` 同样写法，server 包不引用 command 包）；值为 8 字节 int64，满足 `licenseKvMaxOffsetBytes`。B（防御层，改变上游行为）：`filer_backup.go` 的 `getOffset` 返回错误时直接返回，交给 `runFilerBackup` 的 1.7 秒重试循环；"未找到"本来就是无错误且时间戳为 0，不受影响。这同时修掉上游"任何瞬时错误都从 1970 重放"的隐患。单测：`filer_license_test.go` 拒读态 `backup.` 键可读、超 8 字节仍拒。文档：契约 5.3 `KvGet` 行与 S20 加 `backup.`（记 2026-10-22 修订），本节记录。
+3. **成员变更比较配置内容而非索引。** `manager.go` 给 `Membership` 加比较排序后 `Voters`、`Nonvoters` 的方法，`RemoveMaster` 以它代替 `after.Index != mem.Index`；`Index` 与 `LeaderInfo.ConfigIndex` 接收方本来就忽略，删掉以免误导（proto 字段保留、置 0）。goraft 与 hashicorp 同样适用。不采用从 `HashicorpRaft.Stats()["latest_configuration_index"]` 解析：`pushPending` 每秒调 `Membership()`，`Stats()` 代价高且是字符串解析。单测：现有 `MEMBERSHIP_CHANGED` 用例改为推送期间改变成员列表；假 raft 的 `Index` 固定 0 模拟生产。文档：契约三处"配置索引"改为"配置内容"，计划 3.3 第 8 条与 v5 说明同步。
+4. **DNS 负缓存与去重。** `master_license_peers.go` 的 `resolve` 失败时写回 `resolvedHost{ips: 旧值, at: now}`，TTL 内不再重试；`checkLicensePeer` 的 hosts 用 map 去重；可选把 `licensePeerResolveTimeout` 从 2 秒降到 1 秒。单测：注入可控 resolver，验证失败后 10 秒内只解析一次、仍按旧 IP 放行。文档：8.4 补一句。
+5. **采纳对端水位前钳位到本地 now。** `state.go` 的 `Merge` 增加 `now` 参数，`in.Watermark` 先取 `min(in.Watermark, now)`；`ApplySync`、`adoptAhead`、对账采纳 `best.clock` 三处都经钳位，`repair_seq` 三分支逻辑不变。理由：`CLOCK_SUSPECT` 针对本机时钟相对自己历史的回退，对端超前只是偏差。代价：新加入且时钟被回拨的 master 不再继承集群水位，该情形仍由节点侧"本地墙钟减 5 分钟"下限（4.3）兜底。不采用放宽 5 秒容差：会削弱回拨检测。单测：leader 快 30 秒推送后 follower 不进入 `CLOCK_SUSPECT`；修复降水位仍生效；S8 现有用例不变。文档：4.5 三分支规则加钳位修订。
+6. **对账以 `conns` 为准，defer 顺序调整。** A：`master_grpc_server.go` 把 `DisconnectNode` 放进更早注册的独立 defer（LIFO 使其在 `UnRegisterDataNode` 之后执行）。B（根治）：`reconcileLocked` 在 `m.mu` 内用 `m.conns` 的键标在线，取代锁外的 `connected()` 快照——`conns` 正是本 master 仍有活跃流的节点，与账本替换在同一把锁下完成；`ManagerOption.Connected` 与 `licenseConnected()` 随之删除。单测：对账期间 `DisconnectNode` 的节点在新账本中进入宽限。
+7. **两处 `SetEntry` 持 `entryLock` 写锁。** `invalidateHandle` 与 `AcquireFileHandle` 在 `fh.entryLock.Lock()` 下调用 `SetEntry`（锁序：句柄锁或句柄表锁 → `entryLock`，与现有一致）；`SetEntry` 内部不加锁，因三个替换点已持写锁。单测：`-race` 下并发 `addUploadedChunk` 与 `invalidateHandle`。文档：8.18 的替换点清单补这两处。
+8. **只重试"待提升"的 nonvoter（2026-10-24 复核修订）。** 不能把配置里所有 nonvoter 都提升：`cluster.raft.add -voter=false` 与 `RaftAddServer{Voter:false}` 是用户明确配置的角色，上游 `OnPeerUpdate` 把它们视为"已在配置里"而不动，照原方案提升会把 3 voter 变成 4 voter、多数派从 2 变 3。改为：manager 记录 `pendingVoters`（`JoinMaster(voter=true)` 已加为 nonvoter 但推送或提升未完成的 id），`OnPeerUpdate` 与 `tick`（每 `retryInterval`）只对这个集合重试提升；成功、`RemoveMaster`、或失去 leader 身份时清除（新 leader 没有这份记忆，留下的 nonvoter 仍按 3.3 第 7 条由运维 `cluster.raft.add` 处理）。`-voter=false` 加入的 id 永不进入集合。单测：用户 nonvoter 在重连后仍是 nonvoter；待提升 id 在重连后被提升。文档：3.3 第 7 条改为"任一步失败保持 nonvoter 并告警，同一 leader 任期内在该 master 重连或每 5 秒重试提升"。
+9. **引导有上限，`filer.store.id` 后写，引导切点持久化（2026-10-24 复核修订）。** `MaybeBootstrapFromOnePeer` 重试加上限（如 5 分钟）后返回错误，`filer_server.go` 的 `Fatalf` 带出原因；`OnLicenseReject` 已触发时立即失败。`SetStore` 只生成签名并返回 `isFresh`，不落库；引导成功（或非 fresh）后再 `KvPut`，半份命名空间不会被当作已初始化。只延后写标记还不够：失败的引导已经插入了部分条目，重启后的第二次 BFS 只插不删，源端在两次之间删除的文件在本地残留，而事件订阅从新的 `startFromTime`（`filer_server.go:213`，每次进程重算）开始，漏掉中间的删除事件。因此第一次引导前先把切点 `startFromTime` 写入存储（如键 `filer.bootstrap.since`），之后无论进程内重试还是 fresh 状态下重启，BFS 的 `snapshotTime` 与 `AggregateFromPeers` 的起点都用这个切点：切点之前的全量来自 BFS，之后的全部增删来自事件回放，两段拼接无缝；引导成功写入 `filer.store.id` 后删除该键。对端持久化日志若已不再覆盖切点（保留期过），引导明确失败并提示清空存储重来，不默默从新时间开始。签名值照常在内存生成，`AggregateFromPeers` 不受影响。单测：引导失败后重启仍为 fresh；第一次引导后源端删除的文件，第二次引导成功后本地不存在。
+10. **代理路径最小化 403。** 推荐：`/?proxyChunkId=` 的拒绝只返回状态码与 `X-MassDB-License-Reason`，不带 cluster_id 与 expires_at，改动最小。不推荐把分支挪到 JWT 之后：会让代理读新受 filer 读 JWT 约束，是行为变化。
+11. **重算 Md5；meta cache 先复现。** `takeContent` 第三分支裁剪或补零后以 `md5.Sum` 重算 `Attributes.Md5`（内联正文很小）。meta cache 旧大小一项先写复现用例，确认后再决定是否让无句柄的 `cacheRemoteEntry` 路径按路径做 `ownCacheEvent` 式标记。
+12. **契约删 `.cpx`。** 代码无调用方，改契约 5.2 与代码一致。
+
+建议顺序：1、2、3 各自独立先做；4、5 同属 master 时钟与对端层面，一起做；6–12 视情况。验证以 `CGO_ENABLED=0 go test -race` 跑 `license`、`server`、`mount`、`command` 包。契约只改 `KvGet` 白名单、"配置索引"措辞与 `.cpx`，其余记在本节。
+
+取舍待确认（2026-10-22）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
+
+**方案复核（2026-10-24）：** 外部对本节方案做了对照源码的隔离复现，确认原方案 3 处缺陷，已改入上文：方案 1 的部分截断分支漏了 `noteChunks`，新写入会被时间戳领先的旧分块覆盖（P1，复现 `Write/Flush` 成功但重读得旧内容，补 `noteChunks` 后通过）；方案 9 只延后写标记不能保证重启后一致，第二次引导不删除源端已删的残留条目且订阅起点漏事件（P1，复现已删除文件保留），改为持久化引导切点；方案 8 会把用户以 `-voter=false` 配置的 nonvoter 一并提升（P2，复现 3 voter 变 4 voter），改为只重试待提升集合。复核同时确认正常读热路径无性能问题（守卫微基准约 0.66 ns/op、零分配），未做集群长期压测。
+
+本轮核对无误的部分：七个 volume 数据 RPC 全部守卫，其余 35 个 RPC 不返回 needle 字节；内部令牌只出现在 `fetchWholeChunk`、`ChunkStreamReader`、`StreamContent` 与 filer/volume 之间，用户路径无泄漏；filer 六处隐藏点与 `KvGet` 一致，豁免按清理后的全路径判定；S3 CopyObject 的 403 不会变成对象内容；`Guard.AllowRead` 两次原子读无分配，心跳与 KeepConnected 只在 `state_version` 变化时下发；manager 不跨 RPC 持 `mu`，`persistMu → mu` 无反向获取；mount 锁序一致，写入时间戳单调；Cassandra 的 dirhash 布局、前缀上界与 session 清理正确。HTTP `/license/*` 只有白名单、gRPC `ImportLicense` 无鉴权、`/etc/` 整棵树豁免、master 主机上任意进程可读 `internal_read_key`，计划 1.3 与契约 5.3 均已接受，不计为问题。
 
 ---
 
