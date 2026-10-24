@@ -70,7 +70,7 @@ func (r masterRaft) Membership() (license.Membership, error) {
 	var m license.Membership
 	switch {
 	case t.RaftServer != nil:
-		// goraft has no nonvoters and no configuration index.
+		// goraft has no nonvoters.
 		m.Voters = append(m.Voters, t.RaftServer.Name())
 		for name := range t.RaftServer.Peers() {
 			m.Voters = append(m.Voters, name)
@@ -87,7 +87,6 @@ func (r masterRaft) Membership() (license.Membership, error) {
 				m.Nonvoters = append(m.Nonvoters, string(s.ID))
 			}
 		}
-		m.Index = f.Index()
 	default:
 		return m, errRaftNotReady
 	}
@@ -166,7 +165,6 @@ func (p masterPeers) SyncLicense(ctx context.Context, peer string, from license.
 		resp, err := client.SyncLicense(ctx, &master_pb.SyncLicenseRequest{
 			LeaderAddress: from.Address,
 			LeaderTerm:    from.Term,
-			ConfigIndex:   from.ConfigIndex,
 			State:         licenseStateToPb(s),
 		})
 		if err == nil {

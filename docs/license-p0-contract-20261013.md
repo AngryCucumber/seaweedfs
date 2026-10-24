@@ -135,7 +135,7 @@ HTTP body `{"error":"<码>","message":"<不含证书原文的说明>"}`；gRPC �
 | 409 | FailedPrecondition | `LICENSE_SEQUENCE_NOT_INCREASING` | `sequence` 低于 `newest` |
 | 409 | FailedPrecondition | `LICENSE_SEQUENCE_CONFLICT` | 同 `sequence` 不同字节 |
 | 409 | FailedPrecondition | `LICENSE_NODE_LIMIT_TOO_SMALL` | 新额度低于账本条目数 |
-| 409 | FailedPrecondition | `MEMBERSHIP_CHANGED` | 移除 voter 执行前授权版本或配置索引已变化，调用方重试 |
+| 409 | FailedPrecondition | `MEMBERSHIP_CHANGED` | 移除 voter 执行前授权版本或 raft 配置内容（排序后的 voter 与 nonvoter 集合）已变化，调用方重试（2026-10-25 修订：hashicorp v1.7.2 的 `GetConfiguration().Index()` 恒为 0，不再比较配置索引） |
 | 409 | FailedPrecondition | `NODE_ONLINE` | `DELETE /license/nodes/{addr}` 指向在线节点 |
 | 404 | NotFound | `NODE_NOT_FOUND` | 账本内无该地址 |
 | 429 | ResourceExhausted | `RATE_LIMITED` | `validate` 超过 10 次/分钟 |
@@ -195,7 +195,7 @@ P4 修订：
 | 变更提示（`changes`，1.5 第 8 条） | 数组，按以下顺序列出，每项为 `code` 加对应字段：`EXPIRY_SHORTENED`（`previous_expires_at`、`expires_at`）、`COVERAGE_GAP`（`gap_seconds`）、`MASTER_LIMIT_REDUCED` / `VOLUME_SERVER_LIMIT_REDUCED` / `FILER_LIMIT_REDUCED`（`previous_limit`、`limit`）、`PENDING_DISCARDED`（`license_id`、`sequence`）、`FEATURES_REMOVED`（`features`）。比较对象是导入时生效的证书（已到 `not_before` 的 `newest`，否则 `prev`）；`PENDING_DISCARDED` 指尚未生效、将被顶掉的 `newest`。代码与 MassDB SQL 相同，额度按三类节点分开 |
 | 指标 | `license_state{reason}`、`license_expires_at_seconds`、`license_denied_reads_total{server,path}`（`path` ∈ `volume_http/filer_http/filer_proxy/volume_grpc/filer_grpc_hidden`）、`license_nodes_online{type}`、`license_nodes_grace{type}`、`license_nodes_limit{type}` |
 | raft 任期 | hashicorp 用 `Raft.CurrentTerm()`（v1.7.2 提供，替代计划 v8 的 `Stats()["term"]` 解析）；goraft 用 `Server.Term()` |
-| raft 配置索引 | hashicorp `GetConfiguration().Index()`；goraft 无，记 0 |
+| raft 配置内容 | 比较排序后的 voter 与 nonvoter 集合（`Membership.sameServers`）；hashicorp v1.7.2 的 `GetConfiguration().Index()` 恒为 0、goraft 无索引，不用配置索引（2026-10-25 修订）；`SyncLicenseRequest.config_index` 字段保留、发送方置 0、接收方忽略 |
 
 P3 修订：`internal_read_key` 按第 7 节“key 分发”的规则只在 volume 心跳与 filer 的 KeepConnected 流里下发（P2 实现漏发给 volume，P3 修正）。指标在 P3 只实现 `license_denied_reads_total`，prometheus 名为 `SeaweedFS_license_denied_reads_total`（仓库统一前缀），其余随 P4/P5。
 
@@ -409,7 +409,7 @@ P3 修订：
 | 简化 | F1 前移到 `checkPreconditions` 之前并显式限 GET，拒绝路径不再清理对象头 |
 | 方法范围 | F2 的 `proxyChunkId` 代理按原方法转发写入，守卫限 GET |
 | key 分发 | master 对所有 KeepConnected 客户端广播同一流（不区分 `ClientType`）；计划 4.2 原文会把 `internal_read_key` 发给 shell/broker。改为只在 volume 心跳与 `ClientType=="filer"` 流里填 |
-| raft API | hashicorp v1.7.2 有 `AddNonvoter`、`CurrentTerm()`、`LastIndex()`、`GetConfiguration().Index()`；seaweedfs/raft v1.1.3 有 `Term()`、`Peers()`。任期改用 `CurrentTerm()` |
+| raft API | hashicorp v1.7.2 有 `AddNonvoter`、`CurrentTerm()`、`LastIndex()`、`GetConfiguration()`（其 `Index()` 在 v1.7.2 恒为 0，2026-10-25 起不用）；seaweedfs/raft v1.1.3 有 `Term()`、`Peers()`。任期改用 `CurrentTerm()` |
 | 静态 master 组建 | hashicorp 首次启动 `BootstrapCluster` 一次写入全部 `-peers`（`raft_hashicorp.go:179-186`），不经过加入入口；`updatePeers` 只在已有配置重启时运行（`:69`）。goraft 默认每次启动清空 raft 日志与配置（`raft_server.go:121-126`），由 `isTheFirstOne` 的 master 执行 `DoJoinCommand`（`command/master.go:226-228`）。两种模式都要在 raft 启动前加本地证书检查才能阻止无证书的多 master 组建（5.1） |
 | 心跳响应字段 | volume 侧 `Preallocate` 无条件比较（`volume_grpc_client_to_master.go:134`），带 license 的响应必须填 |
 | `-mdir` 默认 | `os.TempDir()`（`command/master.go:70`），状态可能随重启丢失 |

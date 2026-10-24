@@ -29,11 +29,34 @@ const (
 	commitRounds            = 3
 )
 
-// Membership is a raft configuration. Ids are master addresses.
+// Membership is a raft configuration. Ids are master addresses. It has no
+// configuration index: hashicorp/raft's GetConfiguration().Index() is
+// always 0 (v1.7.2) and goraft has none, so changes are detected by
+// comparing the servers (sameServers).
 type Membership struct {
 	Voters    []string
 	Nonvoters []string
-	Index     uint64
+}
+
+// sameServers reports whether o has the same voters and nonvoters, in any
+// order.
+func (ms Membership) sameServers(o Membership) bool {
+	return sameSet(ms.Voters, o.Voters) && sameSet(ms.Nonvoters, o.Nonvoters)
+}
+
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	a, b = append([]string{}, a...), append([]string{}, b...)
+	sort.Strings(a)
+	sort.Strings(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (ms Membership) all() []string {
@@ -92,9 +115,8 @@ type Raft interface {
 
 // LeaderInfo identifies the sender of SyncLicense and SyncLedger.
 type LeaderInfo struct {
-	Address     string
-	Term        uint64
-	ConfigIndex uint64
+	Address string
+	Term    uint64
 }
 
 // Peers sends license RPCs to other masters.
@@ -808,7 +830,7 @@ func (m *Manager) commit(ctx context.Context, term, rev uint64, st *State, led *
 		if len(targets) == 0 {
 			break
 		}
-		res := m.push(ctx, LeaderInfo{Address: m.self, Term: term, ConfigIndex: mem.Index}, targets, st, led)
+		res := m.push(ctx, LeaderInfo{Address: m.self, Term: term}, targets, st, led)
 		for p := range res.ok {
 			okSet[p] = true
 		}
@@ -947,7 +969,7 @@ func (m *Manager) pushPending(term uint64) {
 		defer m.pushRun.Store(false)
 		ctx, cancel := context.WithTimeout(context.Background(), peerRPCTimeout)
 		defer cancel()
-		res := m.push(ctx, LeaderInfo{Address: m.self, Term: term, ConfigIndex: mem.Index}, targets, &st, nil)
+		res := m.push(ctx, LeaderInfo{Address: m.self, Term: term}, targets, &st, nil)
 		if len(res.ahead) > 0 {
 			m.adoptAhead(res.ahead)
 		}
@@ -1300,11 +1322,10 @@ func (m *Manager) JoinMaster(ctx context.Context, id, address string, voter bool
 	led := m.ledgerForPushLocked(term)
 	m.mu.Unlock()
 	for {
-		mem, err := m.raft.Membership()
-		if err != nil {
+		if _, err := m.raft.Membership(); err != nil {
 			return err
 		}
-		res := m.push(ctx, LeaderInfo{Address: m.self, Term: term, ConfigIndex: mem.Index}, []string{id}, &st, &led)
+		res := m.push(ctx, LeaderInfo{Address: m.self, Term: term}, []string{id}, &st, &led)
 		if res.ok[id] {
 			break
 		}
@@ -1328,8 +1349,8 @@ func (m *Manager) JoinMaster(ctx context.Context, id, address string, voter bool
 
 // RemoveMaster removes a master. Before a voter is removed the license
 // state and ledger are committed to a majority of the remaining voters,
-// and remove runs only if neither the license state nor the raft
-// configuration changed meanwhile (plan 3.3 item 8).
+// and remove runs only if neither the license state nor the servers of
+// the raft configuration changed meanwhile (plan 3.3 item 8).
 func (m *Manager) RemoveMaster(ctx context.Context, id string, remove func() error) error {
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
@@ -1352,7 +1373,7 @@ func (m *Manager) RemoveMaster(ctx context.Context, id string, remove func() err
 
 	ctx, cancel := context.WithTimeout(ctx, lockedOpTimeout)
 	defer cancel()
-	res := m.push(ctx, LeaderInfo{Address: m.self, Term: term, ConfigIndex: mem.Index}, without(remaining, m.self), &st, &led)
+	res := m.push(ctx, LeaderInfo{Address: m.self, Term: term}, without(remaining, m.self), &st, &led)
 	// The leader counts only once state.json holds what it confirms, as
 	// in commit: the voters that did write it may be the ones removed.
 	if err := m.ensureDurable(); err != nil {
@@ -1376,7 +1397,7 @@ func (m *Manager) RemoveMaster(ctx context.Context, id string, remove func() err
 	m.mu.Lock()
 	sameRev := m.rev == rev
 	m.mu.Unlock()
-	if after.Index != mem.Index || !sameRev {
+	if !after.sameServers(mem) || !sameRev {
 		return errorf(CodeMembershipChanged, "license state or raft configuration changed while removing %s; retry", id)
 	}
 	if err := remove(); err != nil {

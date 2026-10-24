@@ -51,9 +51,8 @@ func (ms *MasterServer) SyncLicense(ctx context.Context, req *master_pb.SyncLice
 		return nil, err
 	}
 	st, err := ms.License.ApplySync(license.LeaderInfo{
-		Address:     req.LeaderAddress,
-		Term:        req.LeaderTerm,
-		ConfigIndex: req.ConfigIndex,
+		Address: req.LeaderAddress,
+		Term:    req.LeaderTerm,
 	}, licenseStateFromPb(req.State))
 	if err != nil {
 		return nil, licenseGrpcError(err)

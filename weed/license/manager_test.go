@@ -26,7 +26,6 @@ type fakeCluster struct {
 	term     uint64
 	voters   []string
 	nonvoter []string
-	index    uint64
 	down     map[string]bool
 	managers map[string]*Manager
 	dirs     map[string]string
@@ -37,7 +36,7 @@ type fakeCluster struct {
 }
 
 func newFakeCluster(t *testing.T, voters ...string) *fakeCluster {
-	c := &fakeCluster{t: t, trust: testTrust(t), voters: voters, index: 1,
+	c := &fakeCluster{t: t, trust: testTrust(t), voters: voters,
 		down: map[string]bool{}, managers: map[string]*Manager{}, dirs: map[string]string{}}
 	c.now.Store(t2026 + 10*86400)
 	return c
@@ -134,14 +133,13 @@ func (r *fakeRaft) Term() uint64 {
 func (r *fakeRaft) Membership() (Membership, error) {
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
-	return Membership{Voters: append([]string{}, r.c.voters...), Nonvoters: append([]string{}, r.c.nonvoter...), Index: r.c.index}, nil
+	return Membership{Voters: append([]string{}, r.c.voters...), Nonvoters: append([]string{}, r.c.nonvoter...)}, nil
 }
 
 func (r *fakeRaft) AddNonvoter(id, address string) error {
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
 	r.c.nonvoter = append(r.c.nonvoter, id)
-	r.c.index++
 	return nil
 }
 
@@ -150,7 +148,6 @@ func (r *fakeRaft) AddVoter(id, address string) error {
 	defer r.c.mu.Unlock()
 	r.c.nonvoter = without(r.c.nonvoter, id)
 	r.c.voters = append(r.c.voters, id)
-	r.c.index++
 	return nil
 }
 
@@ -158,7 +155,6 @@ func (r *fakeRaft) RemoveServer(id string) error {
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
 	r.c.voters, r.c.nonvoter = without(r.c.voters, id), without(r.c.nonvoter, id)
-	r.c.index++
 	return nil
 }
 
@@ -1237,21 +1233,34 @@ func TestManagerRemoveMasterRecommits(t *testing.T) {
 		t.Fatal("removal must wait for the recommit")
 	}
 
-	// The membership changes during the recommit.
+	// The servers of the configuration change during the recommit (a
+	// nonvoter joins); the configuration index is not available from
+	// hashicorp/raft, so the servers are compared.
 	c.setDown(false, "c")
 	c.onSync = func(string) {
 		c.mu.Lock()
-		c.index++
+		if !contains(c.nonvoter, "x") {
+			c.nonvoter = append(c.nonvoter, "x")
+		}
 		c.mu.Unlock()
 	}
 	wantCode(t, a.RemoveMaster(ctx, "b", remove("b")), CodeMembershipChanged)
 	c.onSync = nil
-
-	if err := a.RemoveMaster(ctx, "b", remove("b")); err != nil {
-		t.Fatal(err)
+	// The same servers in another order are the same configuration.
+	c.onSync = func(string) {
+		c.mu.Lock()
+		c.voters = []string{"c", "a", "b"}
+		c.mu.Unlock()
 	}
+	if err := a.RemoveMaster(ctx, "b", remove("b")); err != nil {
+		t.Fatalf("reordered configuration: %v", err)
+	}
+	c.onSync = nil
 	if removed != 1 || newestSeq(c.m("c")) != 11 {
 		t.Fatalf("removed=%d c=%d", removed, newestSeq(c.m("c")))
+	}
+	if mem, _ := a.raft.Membership(); strings.Join(mem.Voters, ",") != "c,a" || strings.Join(mem.Nonvoters, ",") != "x" {
+		t.Fatalf("membership %+v", mem)
 	}
 }
 

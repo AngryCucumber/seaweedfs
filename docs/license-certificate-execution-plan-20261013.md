@@ -6,11 +6,11 @@
 
 **v4 相对 v3 的变化（来自第四轮审核）：** 撤销 gRPC `Lookup/List` 的 `Content` 剥离（会导致 S3 IAM 配置读空、标签回写清空内联正文、mount 读到补零数据），改为只在 HTTP `?metadata=true` 与目录 JSON 两个只读接口隐藏并打 `X-MassDB-Content-Hidden` 标记，gRPC 面的内联正文列为边界；授权状态改为 `(newest, prev)` 两证书、生效证书由时间推导，不再有 pending 激活转换，排序只看 `newest.sequence`；选主对账选中的状态必须先写回 voter 多数派才退出 `RECONCILING`；任期校验改为与当前 raft 任期相等；时钟修复同步改为三分支；宽限账本改为“在线 + 宽限”的全量成员快照复制；内部通道补入 `StreamContent`（filer.conf、IAM 配置按 chunks 存储时的读取）并保留加密与重试；补 master/filer/volume 准入的原子预占；S12 拆冷启动与运行中；S13 补大目录、内联文件、加密 manifest/merge、日志回放负载。
 
-**v5 相对 v4 的变化（来自第五轮审核）：** 独立 mount 首次打开 manifest 文件时解析失败只打警告、随后按稀疏文件补零返回，必须让打开失败而不是返回伪造正文，因此 mount 需要约 5 行改动；voter 增删与授权状态转移定义顺序，提交与对账绑定 raft 配置索引；`RECONCILING` 期间冻结新地址准入；成员账本改为带确认的 RPC 复制并在选主时对账，撤销“最多丢 5 秒”的硬保证；切主只给原在线节点新宽限，已离线条目保留原截止时间；`StreamContent` 的令牌经私有中间函数传递，用户入口传空；补账本复制的后台成本与测量。
+**v5 相对 v4 的变化（来自第五轮审核）：** 独立 mount 首次打开 manifest 文件时解析失败只打警告、随后按稀疏文件补零返回，必须让打开失败而不是返回伪造正文，因此 mount 需要约 5 行改动；voter 增删与授权状态转移定义顺序，提交与对账绑定 raft 配置索引（2026-10-25 改为比较配置内容，8.22 方案 3）；`RECONCILING` 期间冻结新地址准入；成员账本改为带确认的 RPC 复制并在选主时对账，撤销“最多丢 5 秒”的硬保证；切主只给原在线节点新宽限，已离线条目保留原截止时间；`StreamContent` 的令牌经私有中间函数传递，用户入口传空；补账本复制的后台成本与测量。
 
 **v6 相对 v5 的变化（来自第六轮审核）：** master 成员变更改为完整的“加入两阶段（nonvoter 追平 → 同步授权与账本 → 提升 voter）”与“移除前先把已确认状态重提交到剩余 voter 多数派”，goraft 静态配置模式只能靠运维检查 `voters_acked`；账本版本改为 `(term, revision)` 跨任期可排序，定义同版本不同内容与迟到批次处理，在途批次至多一个；`RECONCILING` 期间所有注册（含旧地址重连）一律延后，对账与接管转换完成后再开放，避免恢复覆盖刚重连的节点；mount 的 manifest 错误改为在失败状态下限频重解析、成功即清错，并补“保留旧句柄续期恢复”验收。
 
-**v7 相对 v6 的变化（来自第七轮审核）：** 移除 voter 的整个流程（重提交确认到实际移除）与导入、其他成员变更共用 manager 临界区，并在执行前重新核对授权版本与配置索引；统一 `RECONCILING` 语义为“只延后注册与管理操作，节点保留现有授权快照”，撤销向节点下发 `RECONCILING` 拒读原因；S1b 的恢复时间改为“目标 volume 新证书生效后，下一次满足重试间隔的读取触发重解析”；补充 manager 锁内 RPC 截止时间与 mount 重解析并发协调的实现要点。
+**v7 相对 v6 的变化（来自第七轮审核）：** 移除 voter 的整个流程（重提交确认到实际移除）与导入、其他成员变更共用 manager 临界区，并在执行前重新核对授权版本与配置索引（2026-10-25 改为配置内容，8.22 方案 3）；统一 `RECONCILING` 语义为“只延后注册与管理操作，节点保留现有授权快照”，撤销向节点下发 `RECONCILING` 拒读原因；S1b 的恢复时间改为“目标 volume 新证书生效后，下一次满足重试间隔的读取触发重解析”；补充 manager 锁内 RPC 截止时间与 mount 重解析并发协调的实现要点。
 
 **v8 相对 v7 的变化（来自第八轮审核）：** 普通账本复制改为“锁内取快照、锁外发 RPC、回来带版本校验”，不在注册共用的 manager 锁内等待网络；只有导入、成员变更与选主对账保留锁内同步 RPC；S13 补“账本 RPC 慢响应或不可达时 200 节点集中重连”的注册延迟验收；1.6 的“5 秒内恢复”统一为 S1b 口径。
 
@@ -183,9 +183,9 @@ v3 的 `(active, pending)` 加“到点激活”转换被审核证明无法定�
 6. follower 启动或重连 leader 时经 KeepConnected 首帧和按流对账拿到当前状态（4.2），按 3.2 替换。**P2 实现：** 改为 leader 每 5 秒向尚未确认当前授权修订的成员重推 `SyncLicense`（带任期校验），follower master 不从 KeepConnected 应用授权状态；KeepConnected 的 `LicenseUpdate` 只给 volume/filer（P3）。
 7. **加入 voter 的两阶段流程（hashicorp）。** `SyncLicense` 要求接收方本地 raft 已认识当前 leader 且任期相同（第 3 条），全新节点在进入配置前拿不到这些状态，所以不能“先同步再加入”。顺序改为：(a) 三个加入入口先 `CheckMasterJoin()` 预占额度，然后以 **nonvoter** 加入（`AddNonvoter`）；(b) 等它的 raft 追平（`LastIndex` 接近 leader）并通过 KeepConnected 建流；(c) leader 在 manager 锁内向它 `SyncLicense` + `SyncLedger` 并等待确认，锁内同时排斥导入，因此“预同步完成到提升之间”不会漏掉新证书；(d) 确认后 `AddVoter` 提升。任一步失败保持 nonvoter 并告警，不计入 voter 多数派。`OnPeerUpdate` 与 `updatePeers` 的 `AddVoter` 改为走同一流程。
 8. **移除 voter 前先重提交。** `RaftRemoveServer`（[master_grpc_server_raft.go:87](../weed/server/master_grpc_server_raft.go:87)）、`updatePeers` 的 `RemoveServer`（[raft_hashicorp.go:107](../weed/server/raft_hashicorp.go:107)）、`OnPeerUpdate` 的远程移除（[master_server.go:383](../weed/server/master_server.go:383)）都先调 `License.BeforeRemoveVoter(target)`：计算移除后的 voter 集合，把当前已确认的 `LicenseState` 与账本重新推送到该集合并要求其多数派确认，成功才执行移除，否则拒绝并告警。审核反例（11 在 A/B 提交，C 仍为 10，先移 B 再移 A）在 v6 里移 B 时要先让 {A, C} 多数派持有 11，C 因此追平。
-   **临界区：** “重提交确认 → 实际移除完成”整个区间持有 manager 互斥锁，与导入、加入两阶段、其他移除串行（现有 `RaftRemoveServer` 只拿 `RaftServerAccessLock` 读锁，[master_grpc_server_raft.go:64](../weed/server/master_grpc_server_raft.go:64)，不能提供这项互斥）。执行移除前再次核对“授权状态版本与配置索引都等于准备时记录的值”，不等则放弃本次移除并返回 409 让调用方重试。审核交错（两个移除分别完成确认后、执行前提交了 11，再依次移除 B、A 只剩持 10 的 C）因此不会发生：第二个移除的准备阶段要等第一个移除执行完，而导入被锁排斥到移除之后。锁内每个 peer 的 RPC 截止 3 秒、整个流程截止 10 秒，超时视为失败。leader 把自己计入剩余 voter 的多数派前，同样要求 `state.json` 已持有当前状态（第 4 条；2026-10-15 修订，8.9：此前移除流程直接把 leader 计为已确认，leader 写盘失败时可以依次移除真正持有状态的 voter）。
+   **临界区：** “重提交确认 → 实际移除完成”整个区间持有 manager 互斥锁，与导入、加入两阶段、其他移除串行（现有 `RaftRemoveServer` 只拿 `RaftServerAccessLock` 读锁，[master_grpc_server_raft.go:64](../weed/server/master_grpc_server_raft.go:64)，不能提供这项互斥）。执行移除前再次核对“授权状态版本与 raft 配置内容（排序后的 voter 与 nonvoter 集合，`Membership.sameServers`）都等于准备时记录的值”，不等则放弃本次移除并返回 409 让调用方重试（2026-10-25 修订，8.22 方案 3：hashicorp v1.7.2 的 `GetConfiguration().Index()` 恒为 0，原来的配置索引比较从未生效）。审核交错（两个移除分别完成确认后、执行前提交了 11，再依次移除 B、A 只剩持 10 的 C）因此不会发生：第二个移除的准备阶段要等第一个移除执行完，而导入被锁排斥到移除之后。锁内每个 peer 的 RPC 截止 3 秒、整个流程截止 10 秒，超时视为失败。leader 把自己计入剩余 voter 的多数派前，同样要求 `state.json` 已持有当前状态（第 4 条；2026-10-15 修订，8.9：此前移除流程直接把 leader 计为已确认，leader 写盘失败时可以依次移除真正持有状态的 voter）。
 9. **goraft（静态 `-peers`）模式的边界。** 成员只能靠重启改 `-peers`（[raft_server.go:188](../weed/server/raft_server.go:188) 的 `DoJoinCommand` 在启动时执行），没有可挂钩的加入/移除入口。该模式下：新 master 启动后经 KeepConnected 首帧拿到状态；manager 对每个 voter 记录已确认的状态版本 `voters_acked`，`GET /license` 与 `weed shell license.show` 展示；运维缩容前必须确认保留的 voter 都已确认当前状态，否则可能回退。这是运维约束，不是代码保证。
-10. **绑定配置索引。** 导入提交与对账都记录开始时的 raft 配置索引（hashicorp `GetConfiguration().Index()`）；完成前配置变化则按新配置重新计算多数派并补推送，仍不足则 `PARTIAL_COMMIT`/继续 `RECONCILING`。
+10. **绑定配置内容（原“绑定配置索引”，2026-10-25 修订）。** 导入提交与对账都记录开始时的 raft 配置（voter 与 nonvoter 集合；hashicorp 的 `GetConfiguration().Index()` 恒为 0，不用索引）；完成前配置变化则按新配置重新计算多数派并补推送，仍不足则 `PARTIAL_COMMIT`/继续 `RECONCILING`。
 11. **`RECONCILING` 期间一律延后注册**（3.4）：授权状态与账本对账、接管转换完成前，`SendHeartbeat` 与 `KeepConnected` 对所有地址（含账本内旧地址）返回可重试错误，volume 按既有 `heartbeat()` 循环、filer 按既有重连循环在数秒后重试；对账完成后再开放。节点保留现有授权快照，授权层读写不变（证书在本地缓存并按本地时钟评估）；注册被延后的节点收不到首帧，也不需要收到任何拒读原因。这样恢复流程不会覆盖刚重连写入的 `online=true`，也避免落后的新 leader 按旧高额度接纳新地址。
 
 ### 3.4 计数口径与超额行为
@@ -1089,6 +1089,8 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 
 **方案 2 实施（2026-10-25）：** A：`filer_license.go` 的 `licenseKvOffsetPrefixes` 加 `"backup."`。B：`filer_backup.go` 的 `getOffset` 返回错误时 `doFilerBackup` 直接返回错误，由 `runFilerBackup` 的 1.7 秒循环重试，不再从 1970 开始；"未找到"仍是无错误、时间戳 0。单测 `TestLicenseKvGetCheck` 加 `backup.abc`；新增 `TestLicenseKvGetBackupOffset`：拒读态经真实 leveldb 存储，8 字节的 `backup.` 检查点可读、不存在的检查点返回空值、同前缀 16 字节的值与硬链接键返回 `PermissionDenied`。契约 5.3 `KvGet` 行与 S20、本计划 1.5 的旁路说明已加 `backup.`。B 的取舍按 2026-10-22 方案执行（用户 2026-10-25 确认）。
 
+**方案 3 实施（2026-10-25）：** `Membership` 去掉 `Index`，新增 `sameServers`（复制排序后比较 `Voters`、`Nonvoters`）；`RemoveMaster` 以 `!after.sameServers(mem)` 代替 `after.Index != mem.Index`；`LeaderInfo` 去掉 `ConfigIndex`，`masterRaft.Membership` 不再读 `f.Index()`，`SyncLicense` 收发两端不再填写或读取 `config_index`（proto 字段保留、置 0）。单测 `TestManagerRemoveMasterRecommits` 改为推送期间加入 nonvoter `x` 得 `MEMBERSHIP_CHANGED`、同一集合换序后移除成功；假 raft 不再有索引。去掉比较则该用例失败。契约 138、198、412 行与本计划 3.3 第 8、10 条、v5/v7 说明已同步。
+
 取舍待确认（2026-10-22）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
 
 **方案复核（2026-10-24）：** 外部对本节方案做了对照源码的隔离复现，确认原方案 3 处缺陷，已改入上文：方案 1 的部分截断分支漏了 `noteChunks`，新写入会被时间戳领先的旧分块覆盖（P1，复现 `Write/Flush` 成功但重读得旧内容，补 `noteChunks` 后通过）；方案 9 只延后写标记不能保证重启后一致，第二次引导不删除源端已删的残留条目且订阅起点漏事件（P1，复现已删除文件保留），改为持久化引导切点；方案 8 会把用户以 `-voter=false` 配置的 nonvoter 一并提升（P2，复现 3 voter 变 4 voter），改为只重试待提升集合。复核同时确认正常读热路径无性能问题（守卫微基准约 0.66 ns/op、零分配），未做集群长期压测。
@@ -1123,7 +1125,7 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 - **两证书状态与时间推导生效**（3.2），取消激活转换。
 - **voter 多数派、当前任期校验、选主对账写回、幂等重试**（3.3）。
 - **成员账本经确认 RPC 复制、选主对账、原子预占与对账期间准入冻结**（3.3/3.4），切主后原在线节点有宽限保护，已离线节点不被延长。
-- **voter 加入两阶段、移除前重提交并与导入共用临界区、goraft 模式的 `voters_acked` 运维检查，提交与对账绑定 raft 配置索引**（3.3）。
+- **voter 加入两阶段、移除前重提交并与导入共用临界区、goraft 模式的 `voters_acked` 运维检查，提交与对账绑定 raft 配置索引**（3.3；2026-10-25 改为配置内容）。
 - **`RECONCILING` 只延后注册与管理操作，不向节点下发拒读**（3.3）。
 - **账本版本 `(term, revision)` 跨任期可排序，在途批次至多一个，复制 RPC 在锁外进行**（3.4）。
 - **独立 mount 对 manifest 文件的错误传播与限频恢复**（1.6），避免返回伪造的全零正文，续期后旧句柄自动恢复。
