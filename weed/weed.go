@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	flag "github.com/seaweedfs/seaweedfs/weed/util/fla9"
 
@@ -51,6 +52,7 @@ func main() {
 	glog.MaxSize = 1024 * 1024 * 10
 	glog.MaxFileCount = 5
 	flag.Usage = usage
+	stats.SetBuildInfo(util.VERSION_NUMBER, util.COMMIT, util.SizeLimit())
 
 	err := sentry.Init(sentry.ClientOptions{
 		SampleRate:       0.1,

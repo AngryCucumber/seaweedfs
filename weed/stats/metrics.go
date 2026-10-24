@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -188,6 +189,17 @@ var (
 			Name:      "request_total",
 			Help:      "Counter of volume server requests.",
 		}, []string{"type", "code"})
+
+	// BuildInfoGauge carries the build this process runs, in the same form as upstream SeaweedFS 4.x
+	// (SeaweedFS_build_info{version,commit,sizelimit,goos,goarch} 1), so MassDB Manager reads every
+	// process's version from its own /metrics. Set by SetBuildInfo at startup.
+	BuildInfoGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: "build",
+			Name:      "info",
+			Help:      "A metric with a constant '1' value labeled by version, commit, sizelimit, goos and goarch from which SeaweedFS was built.",
+		}, []string{"version", "commit", "sizelimit", "goos", "goarch"})
 
 	LicenseDeniedReadsCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -426,6 +438,7 @@ func init() {
 
 	Gather.MustRegister(VolumeServerRequestCounter)
 	Gather.MustRegister(VolumeServerHandlerCounter)
+	Gather.MustRegister(BuildInfoGauge)
 	Gather.MustRegister(LicenseDeniedReadsCounter)
 	Gather.MustRegister(LicenseStateGauge)
 	Gather.MustRegister(LicenseExpiresAtGauge)
@@ -454,6 +467,13 @@ func init() {
 	Gather.MustRegister(S3UploadedObjectsCounter)
 
 	go bucketMetricTTLControl()
+}
+
+// SetBuildInfo publishes the version (e.g. "3.84"), commit and volume size limit of this binary.
+// weed/stats cannot import weed/util (util imports stats), so the main package passes them in.
+func SetBuildInfo(version, commit, sizeLimit string) {
+	BuildInfoGauge.Reset()
+	BuildInfoGauge.WithLabelValues(version, commit, sizeLimit, runtime.GOOS, runtime.GOARCH).Set(1)
 }
 
 func LoopPushingMetric(name, instance, addr string, intervalSeconds int) {

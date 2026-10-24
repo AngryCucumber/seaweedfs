@@ -17,3 +17,8 @@ var (
 func Version() string {
 	return VERSION + " " + COMMIT
 }
+
+// SizeLimit is the volume size limit of this build: "30GB", or "8000GB" when built with 5BytesOffset.
+func SizeLimit() string {
+	return sizeLimit
+}
