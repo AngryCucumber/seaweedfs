@@ -59,6 +59,38 @@ func (fh *FileHandle) readError() error {
 	return nil
 }
 
+// clearReadFailure is called when a truncation to 0 drops every chunk and
+// inline byte of the entry: whatever made reads fail is gone with them.
+func (fh *FileHandle) clearReadFailure() {
+	fh.readFailure.Store(nil)
+}
+
+// setTruncatedChunks installs the chunks a truncation left in the chunk
+// group and records whether their manifests resolve, in place of a failure
+// to resolve the manifests the truncation cut: the chunks that failed are
+// gone, and reads of the remaining ones succeed or fail on their own.
+// Hidden content is not affected. The chunks of a manifest resolved only
+// now become visible to writeTsNs (noteChunks). Called under entryLock.
+func (fh *FileHandle) setTruncatedChunks(chunks []*filer_pb.FileChunk) {
+	err := fh.entryChunkGroup.SetChunks(chunks)
+	if err == nil {
+		fh.noteChunks(chunks, fh.entryChunkGroup)
+	}
+	for {
+		f := fh.readFailure.Load()
+		if f != nil && f.hidden {
+			return
+		}
+		var next *readFailure
+		if err != nil {
+			next = &readFailure{err: err, at: time.Now()}
+		}
+		if fh.readFailure.CompareAndSwap(f, next) {
+			return
+		}
+	}
+}
+
 // clearHiddenContent is called when a write drops the inline content, as
 // mount writes always do: nothing is hidden from this handle any more.
 func (fh *FileHandle) clearHiddenContent(entry *filer_pb.Entry) {

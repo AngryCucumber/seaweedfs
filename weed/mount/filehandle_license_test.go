@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -654,8 +655,19 @@ func (s *flushFiler) entry() *filer_pb.Entry {
 // HTTP stub that reports 5 bytes stored.
 func testFlushWFS(t *testing.T) (*WFS, *flushFiler) {
 	t.Helper()
+	return testFlushWFSWith(t, nil)
+}
+
+// testFlushWFSWith is testFlushWFS with reads of the HTTP stub (chunks
+// proxied through the filer, VolumeServerAccess "filerProxy") served by get.
+func testFlushWFSWith(t *testing.T, get http.HandlerFunc) (*WFS, *flushFiler) {
+	t.Helper()
 	util_http.InitGlobalHttpClient()
 	upload := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && get != nil {
+			get(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"name":"a","size":5}`)
 	}))
@@ -1029,5 +1041,170 @@ func TestSetAttrOrderedWithDownload(t *testing.T) {
 	e = fh.entry.GetEntry()
 	if got := readHandle(t, fh, 8); got != "" || e.Attributes.FileSize != 0 || e.RemoteEntry != nil || len(e.Chunks) != 0 {
 		t.Fatalf("after the event: read %q, entry %+v", got, e)
+	}
+}
+
+// manifestOf returns the serialized manifest of chunks, as a volume server
+// stores it.
+func manifestOf(t *testing.T, chunks ...*filer_pb.FileChunk) []byte {
+	t.Helper()
+	filer_pb.BeforeEntrySerialization(chunks)
+	manifest, err := proto.Marshal(&filer_pb.FileChunkManifest{Chunks: chunks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest
+}
+
+// manifestProxy serves manifest for the manifest chunk 3,0f637037d6 proxied
+// through the filer, refusing it with NO_LICENSE while licensed is false.
+func manifestProxy(manifest []byte, licensed *atomic.Bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Query().Get("proxyChunkId"), "3,0f637037d6") { // the reader appends ?readDeleted=true
+			http.NotFound(w, r)
+			return
+		}
+		if !licensed.Load() {
+			http.Error(w, "NO_LICENSE", http.StatusForbidden)
+			return
+		}
+		w.Write(manifest)
+	}
+}
+
+// A truncation that cuts the chunks whose manifest could not be resolved
+// clears the read failure: nothing of them is left to fail on. Chunks
+// whose manifest remains keep failing.
+func TestTruncateClearsManifestFailure(t *testing.T) {
+	util_http.InitGlobalHttpClient()
+	manifest := manifestOf(t, &filer_pb.FileChunk{FileId: "3,01637037d6", Size: 5, ModifiedTsNs: 1})
+	var licensed atomic.Bool
+	server := httptest.NewServer(manifestProxy(manifest, &licensed))
+	t.Cleanup(server.Close)
+	open := func(chunks ...*filer_pb.FileChunk) (*WFS, *FileHandle) {
+		wfs := testWFS(t)
+		wfs.option.VolumeServerAccess = "filerProxy"
+		wfs.option.FilerAddresses = []pb.ServerAddress{pb.ServerAddress(strings.TrimPrefix(server.URL, "http://"))}
+		wfs.chunkCache = chunk_cache.NewTieredChunkCache(16, t.TempDir(), 64, 1024)
+		wfs.chunkCache.SetChunk("3,02637037d6", []byte("hello"))
+		var size uint64
+		for _, chunk := range chunks {
+			if end := uint64(chunk.Offset) + chunk.Size; end > size {
+				size = end
+			}
+		}
+		fh := wfs.testOpen("/d/a", &filer_pb.Entry{Name: "a", Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: size}, Chunks: chunks})
+		if fh.readError() == nil {
+			t.Fatal("manifest resolved without a certificate")
+		}
+		return wfs, fh
+	}
+	manifestChunk := func(offset int64) *filer_pb.FileChunk {
+		return &filer_pb.FileChunk{FileId: "3,0f637037d6", Offset: offset, Size: 5, IsChunkManifest: true}
+	}
+	plainChunk := func(offset int64) *filer_pb.FileChunk {
+		return &filer_pb.FileChunk{FileId: "3,02637037d6", Offset: offset, Size: 5, ModifiedTsNs: 2}
+	}
+
+	// O_TRUNC, then a write: the data is read back at once.
+	wfs, fh := open(manifestChunk(0))
+	setSize(t, wfs, fh, 0)
+	if err := fh.readError(); err != nil {
+		t.Fatalf("read error after truncating to 0: %v", err)
+	}
+	if _, code := wfs.Write(nil, &fuse.WriteIn{Fh: uint64(fh.fh), Size: 5}, []byte("world")); code != fuse.OK {
+		t.Fatalf("write: %v", code)
+	}
+	if got := readHandle(t, fh, 8); got != "world" {
+		t.Fatalf("read %q after truncating to 0 and writing", got)
+	}
+
+	// A partial truncation that drops the manifest chunk: the remaining
+	// plain chunk is read.
+	wfs, fh = open(plainChunk(0), manifestChunk(5))
+	setSize(t, wfs, fh, 5)
+	if got := readHandle(t, fh, 8); got != "hello" || fh.readError() != nil {
+		t.Fatalf("read %q, error %v after cutting the manifest chunk", got, fh.readError())
+	}
+
+	// A partial truncation that keeps the manifest chunk: still EIO, and
+	// the failure is fresh, so the retry waits the interval again.
+	wfs, fh = open(manifestChunk(0), plainChunk(5))
+	before := fh.readFailure.Load()
+	time.Sleep(time.Millisecond)
+	setSize(t, wfs, fh, 7)
+	f := fh.readFailure.Load()
+	if f == nil || f.hidden || !f.at.After(before.at) {
+		t.Fatalf("read failure %+v after cutting past the manifest chunk, was %+v", f, before)
+	}
+	if _, err := readDataByFileHandle(make([]byte, 8), fh, 0); err == nil {
+		t.Fatal("read succeeded with an unresolved manifest")
+	}
+
+	// A hidden content failure is not touched by a partial truncation.
+	wfs, fh = open(manifestChunk(0), plainChunk(5))
+	entry := fh.entry.GetEntry()
+	entry.ContentHidden = true
+	fh.setEntryReadFailure(entry, nil)
+	setSize(t, wfs, fh, 5)
+	if f := fh.readFailure.Load(); f == nil || !f.hidden {
+		t.Fatalf("hidden failure %+v after a partial truncation", f)
+	}
+	setSize(t, wfs, fh, 0)
+	if f := fh.readFailure.Load(); f != nil {
+		t.Fatalf("read failure %+v after truncating to 0", f)
+	}
+}
+
+// A manifest that failed to resolve when the handle opened and resolves at
+// a partial truncation brings the timestamps of its chunks then: a write
+// after that is later than them, and the flushed entry reads the write.
+func TestWriteAfterTruncateResolvesManifest(t *testing.T) {
+	ahead := time.Now().Add(30 * time.Second).UnixNano()
+	manifest := manifestOf(t, &filer_pb.FileChunk{FileId: "3,01637037d6", Size: 5, ModifiedTsNs: ahead})
+	var licensed atomic.Bool
+	wfs, stub := testFlushWFSWith(t, manifestProxy(manifest, &licensed))
+	wfs.option.VolumeServerAccess = "filerProxy"
+	wfs.chunkCache.SetChunk("3,01637037d6", []byte("world"))
+	fh := wfs.testOpen("/d/a", &filer_pb.Entry{Name: "a", Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 5},
+		Chunks: []*filer_pb.FileChunk{{FileId: "3,0f637037d6", Size: 5, IsChunkManifest: true}}})
+	if fh.readError() == nil {
+		t.Fatal("manifest resolved without a certificate")
+	}
+
+	licensed.Store(true)
+	setSize(t, wfs, fh, 3)
+	if err := fh.readError(); err != nil {
+		t.Fatalf("read error after the manifest resolved at the truncation: %v", err)
+	}
+	// (The chunk group does not cut a chunk to the file size; the kernel
+	// bounds reads by the size it was told.)
+	if got := readHandle(t, fh, 8); !strings.HasPrefix(got, "wor") {
+		t.Fatalf("read %q after truncating to 3", got)
+	}
+	if _, code := wfs.Write(nil, &fuse.WriteIn{Fh: uint64(fh.fh), Size: 5}, []byte("newer")); code != fuse.OK {
+		t.Fatalf("write: %v", code)
+	}
+	if fh.lastWriteTsNs <= ahead {
+		t.Fatalf("write at %d, resolved chunk at %d", fh.lastWriteTsNs, ahead)
+	}
+	if code := wfs.Flush(nil, &fuse.FlushIn{Fh: uint64(fh.fh)}); code != fuse.OK {
+		t.Fatalf("flush: %v", code)
+	}
+
+	// The stored metadata, read by a fresh chunk group as another client
+	// would, gives the write, not the older chunk the manifest holds.
+	stored := stub.entry()
+	group, err := filer.NewChunkGroup(wfs.LookupFn(), wfs.chunkCache, stored.Chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 8)
+	n, _, err := group.ReadDataAt(int64(filer.FileSize(stored)), buf, 0)
+	if err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "newer" {
+		t.Fatalf("stored entry reads %q, chunks %v", got, stored.Chunks)
 	}
 }

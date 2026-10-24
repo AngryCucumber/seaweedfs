@@ -106,7 +106,7 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 			// set the new chunks and reset entry cache
 			entry.Chunks = chunks
 			if fh != nil {
-				fh.entryChunkGroup.SetChunks(chunks)
+				fh.setTruncatedChunks(chunks)
 			}
 		}
 		// Inline content has no chunks to cut; truncate it as well, or the
@@ -118,9 +118,11 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 			// Nothing of a remote object remains either: without this the
 			// file would read as remote-only again and be fetched back.
 			entry.RemoteEntry = nil
-			// Nothing of a hidden inline content remains.
+			// Nothing of a hidden inline content remains, nor any chunk
+			// whose manifest failed to resolve.
 			if fh != nil {
 				fh.clearHiddenContent(entry)
+				fh.clearReadFailure()
 			} else {
 				entry.ContentHidden = false
 			}
