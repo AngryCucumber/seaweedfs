@@ -1338,6 +1338,55 @@ func TestManagerRemoveMasterWaitsForLeaderDisk(t *testing.T) {
 	}
 }
 
+// A leader whose wall clock runs ahead pushes its watermark with every
+// sync; a follower takes it only up to its own now, so the skew does not
+// put the follower, or the leader it may become, into CLOCK_SUSPECT. A
+// repair that lowers the watermark still applies.
+func TestManagerLeaderClockAheadDoesNotSuspectFollower(t *testing.T) {
+	c := newFakeCluster(t, "a", "b", "c")
+	const behind = 30
+	c.start("a", nil)
+	c.start("c", nil)
+	b := c.start("b", func(o *ManagerOption) {
+		o.Now = func() time.Time { return time.Unix(c.now.Load()-behind, 0) }
+	})
+	c.elect("a")
+	a := c.m("a")
+	if _, err := a.Import(certRaw(t, 1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	// The leader's watermark follows its clock after the import; the next
+	// sync (the ledger push, a recommit) carries it.
+	a.refreshClock(c.now.Load())
+	if _, err := b.ApplySync(LeaderInfo{Address: "a", Term: c.term}, a.State()); err != nil {
+		t.Fatal(err)
+	}
+	bNow := c.now.Load() - behind
+	b.refreshClock(bNow)
+	if s := b.Status(); s.Status != ReasonValid || s.Watermark > bNow {
+		t.Fatalf("follower %d behind the leader: status %s, watermark %d, now %d", behind, s.Status, s.Watermark, bNow)
+	}
+
+	// The follower becomes leader: its reconcile does not take the
+	// leader's watermark either (same repair), and it stays VALID.
+	c.elect("b")
+	b.refreshClock(bNow)
+	if s := b.Status(); s.Status != ReasonValid || s.Watermark > bNow {
+		t.Fatalf("new leader: status %s, watermark %d, now %d", s.Status, s.Watermark, bNow)
+	}
+
+	// A repair from a peer ahead of this clock lowers the watermark to the
+	// certificate's issue time, which is before this clock's now.
+	c.elect("a")
+	issued := c.now.Load() - 100
+	if _, err := a.Import(certRaw(t, 2, func(m map[string]interface{}) { m["issued_at"] = issued })); err != nil {
+		t.Fatal(err)
+	}
+	if st := b.State(); st.Clock.RepairSeq != 2 || st.Clock.Watermark != issued {
+		t.Fatalf("follower clock after the repair %+v", st.Clock)
+	}
+}
+
 func TestManagerClockSuspectAndRepair(t *testing.T) {
 	c := newFakeCluster(t, "a", "b", "c")
 	c.startAll()

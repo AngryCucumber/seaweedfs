@@ -287,7 +287,7 @@ P2 实现说明：`status_json`、`result_json` 与 HTTP 的 `GET /license`、`P
 - 发现 `now < watermark - 5s`：`CLOCK_SUSPECT`，下发 `master_deny_reason`，节点拒读；墙钟重新超过水位后自动恢复。
 - 选主对账只采纳更高 `repair_seq` 的 `(watermark, repair_seq)`；同序号时 leader 保留自己的水位，不取各 peer 的最大值，避免一台时钟超前的 master 让新 leader 进入 `CLOCK_SUSPECT`（P2）。
 - 采纳其他 master 的较新状态（`adoptAhead`）时同时按三分支规则合并其时钟修复；重复导入同一张证书时若本地尚未应用它的修复，也会应用（2026-10-15 修订，8.8：此前采纳的证书不带修复，leader 仍为 `CLOCK_SUSPECT`，且重复导入被判为“未变化”而无法修复）。
-- 修复是带序号的显式操作：导入 `sequence` 更高且 `issued_at <= now` 的新证书时，leader 把 `watermark = issued_at`、`repair_seq = sequence` 持久化并经 `SyncLicense` 同步。**follower 三分支：** `repair_seq > 本地` 则无条件采用（允许降低水位）；`repair_seq == 本地` 则 `watermark = max`；`repair_seq < 本地` 忽略该请求的水位（v3 的“否则取 max”会让同任期迟到的低序号请求重新抬高水位）。重复导入现有证书不重置水位。
+- 修复是带序号的显式操作：导入 `sequence` 更高且 `issued_at <= now` 的新证书时，leader 把 `watermark = issued_at`、`repair_seq = sequence` 持久化并经 `SyncLicense` 同步。**follower 三分支：** `repair_seq > 本地` 则无条件采用（允许降低水位）；`repair_seq == 本地` 则 `watermark = max`；`repair_seq < 本地` 忽略该请求的水位（v3 的“否则取 max”会让同任期迟到的低序号请求重新抬高水位）。重复导入现有证书不重置水位。**采纳对端水位前先钳位到本地 now（2026-10-25 修订，8.22 方案 5）：** 三分支以 `min(对端 watermark, 本地 now)` 代入，`SyncLicense`、`adoptAhead` 与对账采纳三处同样处理。理由：`CLOCK_SUSPECT` 针对本机时钟相对自己历史的回退，对端超前只是偏差；此前对账路径避免了“一台时钟超前的 master 让新 leader 进入 `CLOCK_SUSPECT`”，`SyncLicense` 路径却把 leader 的当前墙钟原样推给 follower，leader 快 N 秒（N > 5）时 follower 每次推送后都报 `CLOCK_SUSPECT`。代价：新加入且时钟被回拨的 master 不再继承集群水位，该情形仍由节点侧“本地墙钟减 5 分钟”下限（4.3）兜底。
 - volume/filer 重启不缓存 `master_deny_reason`，到首帧前按缓存证书放行，秒级窗口，接受。
 
 ### 4.6 热路径性能约束（硬性）
@@ -1095,7 +1095,9 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 
 **方案 4 实施（2026-10-25）：** `master_license_peers.go` 的 `resolve` 失败时写回 `resolvedHost{ips: 旧值, at: now}`，TTL 内不再解析；去重放在 `allows` 收集名字处（同一入口，覆盖 `-peers` 与 raft 成员重复），不在 `checkLicensePeer`；`licensePeerResolveTimeout` 降到 1 秒；解析经可替换的 `licensePeerLookupIP`。单测 `TestLicensePeerGuardResolveFailure`：重复名字只解析一次，DNS 失败后 TTL 内零次解析、仍按旧 IP 放行，TTL 过后每个名字只失败一次且再过 TTL 前不重试，从未解析成功的名字被拒。8.4 已补说明。
 
-取舍待确认（2026-10-22）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
+**方案 5 实施（2026-10-25）：** `state.go` 的 `Merge` 增加 `now` 参数，`in.Watermark` 先取 `min(in.Watermark, now)` 再走三分支；`ApplySync`、`adoptAhead`、对账采纳 `best.clock` 三处都经钳位（后两处仍只在对端 `repair_seq` 更高时采纳）。单测：`TestClockState` 加三条钳位用例（同序号与更高序号的超前水位都只到 now，低于对端 now 的本地水位不被拉低）；新增 `TestManagerLeaderClockAheadDoesNotSuspectFollower`：follower 时钟落后 leader 30 秒，leader 导入后墙钟前进再推送，follower 保持 `VALID`、水位不超过本地 now，随后当选 leader 仍 `VALID`，再由 leader 导入更高序号证书时水位降到 `issued_at`；去掉钳位则该用例在第一步报 `CLOCK_SUSPECT`。`TestManagerClockSuspectAndRepair`（S8）与 `TestManagerAdoptsClockRepair` 不变。4.5 已同步。license 包 `-race` 通过。
+
+取舍（2026-10-22 提出，用户 2026-10-25 确认按原方案执行）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
 
 **方案复核（2026-10-24）：** 外部对本节方案做了对照源码的隔离复现，确认原方案 3 处缺陷，已改入上文：方案 1 的部分截断分支漏了 `noteChunks`，新写入会被时间戳领先的旧分块覆盖（P1，复现 `Write/Flush` 成功但重读得旧内容，补 `noteChunks` 后通过）；方案 9 只延后写标记不能保证重启后一致，第二次引导不删除源端已删的残留条目且订阅起点漏事件（P1，复现已删除文件保留），改为持久化引导切点；方案 8 会把用户以 `-voter=false` 配置的 nonvoter 一并提升（P2，复现 3 voter 变 4 voter），改为只重试待提升集合。复核同时确认正常读热路径无性能问题（守卫微基准约 0.66 ns/op、零分配），未做集群长期压测。
 

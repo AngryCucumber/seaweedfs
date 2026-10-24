@@ -176,14 +176,25 @@ func TestClockState(t *testing.T) {
 	}
 
 	local := ClockState{Watermark: 5000, RepairSeq: 7}
-	if got := local.Merge(ClockState{Watermark: 100, RepairSeq: 8}); got.Watermark != 100 || got.RepairSeq != 8 {
+	now := int64(7000)
+	if got := local.Merge(ClockState{Watermark: 100, RepairSeq: 8}, now); got.Watermark != 100 || got.RepairSeq != 8 {
 		t.Errorf("newer repair wins even when it lowers the watermark: %+v", got)
 	}
-	if got := local.Merge(ClockState{Watermark: 6000, RepairSeq: 7}); got.Watermark != 6000 {
+	if got := local.Merge(ClockState{Watermark: 6000, RepairSeq: 7}, now); got.Watermark != 6000 {
 		t.Errorf("same repair keeps the higher watermark: %+v", got)
 	}
-	if got := local.Merge(ClockState{Watermark: 9000, RepairSeq: 6}); got != local {
+	if got := local.Merge(ClockState{Watermark: 9000, RepairSeq: 6}, now); got != local {
 		t.Errorf("late older repair must not raise the watermark: %+v", got)
+	}
+	// A peer ahead of this clock raises the watermark only to now.
+	if got := local.Merge(ClockState{Watermark: 9000, RepairSeq: 7}, now); got.Watermark != now || got.Suspect(now) {
+		t.Errorf("peer watermark ahead of now must be clamped: %+v", got)
+	}
+	if got := local.Merge(ClockState{Watermark: 9000, RepairSeq: 8}, now); got.Watermark != now || got.RepairSeq != 8 {
+		t.Errorf("newer repair ahead of now must be clamped: %+v", got)
+	}
+	if got := local.Merge(ClockState{Watermark: 6000, RepairSeq: 7}, 4000); got != local {
+		t.Errorf("a peer watermark above now never lowers the local one: %+v", got)
 	}
 }
 

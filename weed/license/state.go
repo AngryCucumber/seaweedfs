@@ -248,8 +248,14 @@ func (c ClockState) RepairOnImport(imported *Certificate, now int64) ClockState 
 // Merge applies a peer's clock state: a newer repair wins outright, even
 // when it lowers the watermark; the same repair keeps the higher
 // watermark; an older repair is ignored so a late request cannot raise the
-// watermark again.
-func (c ClockState) Merge(in ClockState) ClockState {
+// watermark again. The peer's watermark counts at most as this master's
+// now first: CLOCK_SUSPECT is about this master's clock falling behind its
+// own past, and a peer whose clock runs ahead is a skew, not a rollback
+// (plan 4.5, revised 2026-10-25).
+func (c ClockState) Merge(in ClockState, now int64) ClockState {
+	if in.Watermark > now {
+		in.Watermark = now
+	}
 	switch {
 	case in.RepairSeq > c.RepairSeq:
 		return in

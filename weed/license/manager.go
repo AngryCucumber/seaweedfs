@@ -616,7 +616,7 @@ func (m *Manager) reconcileLocked(ctx context.Context, term uint64) error {
 		m.bumpLocked()
 	}
 	if best.clock.RepairSeq > m.clock.RepairSeq {
-		m.clock = best.clock
+		m.clock = m.clock.Merge(best.clock, now)
 	}
 	m.ledger = recovered
 	seen := maxVersion(m.ledgerVer, bestLedger.LedgerVersion)
@@ -891,7 +891,7 @@ func (m *Manager) adoptAhead(states []State) {
 		}
 		// The peer's clock repair belongs to the certificate it imported.
 		if m.clusterID == s.ClusterID && s.Clock.RepairSeq > m.clock.RepairSeq {
-			m.clock = m.clock.Merge(s.Clock)
+			m.clock = m.clock.Merge(s.Clock, m.now())
 			changed = true
 		}
 		m.mu.Unlock()
@@ -1194,7 +1194,7 @@ func (m *Manager) ApplySync(from LeaderInfo, in State) (State, error) {
 		m.key = append([]byte(nil), in.InternalReadKey...)
 		changed = true
 	}
-	clock := m.clock.Merge(in.Clock)
+	clock := m.clock.Merge(in.Clock, m.now())
 	repaired := clock.RepairSeq != m.clock.RepairSeq
 	m.clock = clock
 	if changed {
