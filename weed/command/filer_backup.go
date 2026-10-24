@@ -116,13 +116,15 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 	startFrom := time.Unix(0, 0)
 	sinkId := util.HashStringToLong(dataSink.GetName() + dataSink.GetSinkToDirectory())
 	if timeAgo.Milliseconds() == 0 {
+		// A checkpoint that cannot be read is not a missing one: starting
+		// from 0 would copy everything again and, with the first offset
+		// saved, lose the checkpoint. Let the caller retry.
 		lastOffsetTsNs, err := getOffset(grpcDialOption, sourceFiler, BackupKeyPrefix, int32(sinkId))
 		if err != nil {
-			glog.V(0).Infof("starting from %v", startFrom)
-		} else {
-			startFrom = time.Unix(0, lastOffsetTsNs)
-			glog.V(0).Infof("resuming from %v", startFrom)
+			return fmt.Errorf("read the backup checkpoint from %s: %v", sourceFiler, err)
 		}
+		startFrom = time.Unix(0, lastOffsetTsNs)
+		glog.V(0).Infof("resuming from %v", startFrom)
 	} else {
 		startFrom = time.Now().Add(-timeAgo)
 		glog.V(0).Infof("start time is set to %v", startFrom)

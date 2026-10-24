@@ -22,11 +22,14 @@ import (
 // returns while the license denies reads.
 const licenseKvMaxOffsetBytes = 8
 
-// licenseKvOffsetPrefixes are the KvGet keys of filer.sync, remote sync and
-// peer metadata offsets (contract 5.3).
+// licenseKvOffsetPrefixes are the KvGet keys of filer.sync, filer.backup,
+// remote sync and peer metadata offsets (contract 5.3). "sync." and
+// "backup." are command.SyncKeyPrefix and command.BackupKeyPrefix, which
+// this package cannot import.
 var licenseKvOffsetPrefixes = [][]byte{
 	[]byte(filer.MetaOffsetPrefix),
 	[]byte("sync."),
+	[]byte("backup."),
 	[]byte(remote_storage.SyncKeyPrefix),
 }
 

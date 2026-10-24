@@ -118,7 +118,7 @@ v4 处理：只在只读 HTTP 接口（M1）隐藏，gRPC 面列为边界。部�
 - **回写不丢正文：** `filer.proto` 的 `Entry` 加 `content_hidden = 13`。隐藏时出站副本 `Content` 置空并置标志；`CreateEntry/UpdateEntry` 收到带标志、正文为空且 chunks 与 `FileSize` 未变的条目时保留已有正文（S3 标签、`touch`、mount chmod/xattr/硬链接），无法确定字节的返回 `license: CONTENT_HIDDEN`，存储与事件日志里标志恒为 false。
 - **不返回伪造数据：** mount 对隐藏条目返回 `EIO` 并按 1.6 的节流重取；`ReadEntry`/`ReadInsideFiler`、`fs.cat`、`filer.cat` 报错而不是补零；`filer.sync`/`backup`/`meta.backup`/`remote.sync`/`remote.gateway` 经订阅选项 `FailOnHiddenContent` 停在事件处，`fs.meta.save`/`notify` 报错。
 - **filer 之间不隐藏：** 元数据聚合订阅（含自身）与新 filer 引导携带内部令牌；Replay 与引导遇到隐藏条目报错重试，不入库。
-- **`KvGet` 旁路：** 拒读态只放行 `Meta`、`sync.`、`remote.sync.` 前缀的同步偏移键。
+- **`KvGet` 旁路：** 拒读态只放行 `Meta`、`sync.`、`backup.`、`remote.sync.` 前缀的同步偏移键（`backup.` 为 2026-10-25 补入，8.22 方案 2）。
 
 ### 1.6 独立 mount 对 manifest 文件的错误传播（v5 新增）
 
@@ -1086,6 +1086,8 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 建议顺序：1、2、3 各自独立先做；4、5 同属 master 时钟与对端层面，一起做；6–12 视情况。验证以 `CGO_ENABLED=0 go test -race` 跑 `license`、`server`、`mount`、`command` 包。契约只改 `KvGet` 白名单、"配置索引"措辞与 `.cpx`，其余记在本节。
 
 **方案 1 实施（2026-10-25）：** `weedfs_attr.go` 截断分支：size 为 0 时经 `clearReadFailure` 无条件清除 `readFailure`；部分截断经 `setTruncatedChunks` 用 `SetChunks` 的返回值更新非隐藏类失败（成功清除并 `noteChunks`，失败记新错误与时间，隐藏类失败不动），仍在 `entryLock` 写锁内，`maybeRetryRead` 的 CAS 看到失败被替换即丢弃结果。单测 `TestTruncateClearsManifestFailure`（无证书打开带 manifest 的条目 → `SetAttr(0)` → 写 → 立即读到数据；截掉 manifest 块后读到剩余分块；仍有 manifest 时继续 `EIO` 且失败时间刷新；隐藏类失败不受部分截断影响）与 `TestWriteAfterTruncateResolvesManifest`（内部分块时间戳领先 30 秒，截断到 3 时解析成功，写入时间戳晚于全部分块，flush 后按提交的元数据重新读取得到新内容）；去掉修复或去掉 `noteChunks` 分别失败。mount 全包 `-race` 通过。1.6 已同步。
+
+**方案 2 实施（2026-10-25）：** A：`filer_license.go` 的 `licenseKvOffsetPrefixes` 加 `"backup."`。B：`filer_backup.go` 的 `getOffset` 返回错误时 `doFilerBackup` 直接返回错误，由 `runFilerBackup` 的 1.7 秒循环重试，不再从 1970 开始；"未找到"仍是无错误、时间戳 0。单测 `TestLicenseKvGetCheck` 加 `backup.abc`；新增 `TestLicenseKvGetBackupOffset`：拒读态经真实 leveldb 存储，8 字节的 `backup.` 检查点可读、不存在的检查点返回空值、同前缀 16 字节的值与硬链接键返回 `PermissionDenied`。契约 5.3 `KvGet` 行与 S20、本计划 1.5 的旁路说明已加 `backup.`。B 的取舍按 2026-10-22 方案执行（用户 2026-10-25 确认）。
 
 取舍待确认（2026-10-22）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
 

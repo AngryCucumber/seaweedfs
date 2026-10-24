@@ -1,6 +1,7 @@
 package weed_server
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -203,7 +204,7 @@ func TestMergeHiddenContent(t *testing.T) {
 
 func TestLicenseKvGetCheck(t *testing.T) {
 	denied := &FilerServer{license: licensetest.DeniedNode(t)}
-	for _, key := range []string{"Meta\x00\x00\x00\x01", "sync.abc", "remote.sync.xyz"} {
+	for _, key := range []string{"Meta\x00\x00\x00\x01", "sync.abc", "backup.abc", "remote.sync.xyz"} {
 		if offsetOnly, err := denied.licenseKvGetCheck(context.Background(), []byte(key)); err != nil || !offsetOnly {
 			t.Errorf("%q: %v %v", key, offsetOnly, err)
 		}
@@ -218,6 +219,49 @@ func TestLicenseKvGetCheck(t *testing.T) {
 	valid := &FilerServer{license: licensetest.ValidNode(t)}
 	if offsetOnly, err := valid.licenseKvGetCheck(context.Background(), []byte("hardlink")); err != nil || offsetOnly {
 		t.Errorf("valid: %v %v", offsetOnly, err)
+	}
+}
+
+// The checkpoint of filer.backup (command.BackupKeyPrefix plus the sink id)
+// is an 8 byte timestamp that stays readable while reads are denied, so the
+// backup resumes where it stopped once the license is renewed; a longer
+// value under the prefix is not an offset and is refused like any other key.
+func TestLicenseKvGetBackupOffset(t *testing.T) {
+	testFiler := filer.NewFiler(pb.ServerDiscovery{}, nil, "", "", "", "", "", 255, nil)
+	store := &leveldb.LevelDBStore{}
+	if err := store.Initialize(testStoreDir(t.TempDir()), ""); err != nil {
+		t.Fatal(err)
+	}
+	testFiler.SetStore(store)
+	fs := &FilerServer{filer: testFiler, license: licensetest.DeniedNode(t)}
+	ctx := context.Background()
+
+	checkpoint := []byte("backup.\x00\x00\x00\x01")
+	offset := make([]byte, 8)
+	util.Uint64toBytes(offset, 1761350400000000000)
+	if _, err := fs.KvPut(ctx, &filer_pb.KvPutRequest{Key: checkpoint, Value: offset}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.KvPut(ctx, &filer_pb.KvPutRequest{Key: []byte("backup.blob"), Value: util.RandomBytes(16)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.KvPut(ctx, &filer_pb.KvPutRequest{Key: []byte("hardlink"), Value: offset}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := fs.KvGet(ctx, &filer_pb.KvGetRequest{Key: checkpoint})
+	if err != nil || resp.Error != "" || !bytes.Equal(resp.Value, offset) {
+		t.Fatalf("checkpoint: %+v %v", resp, err)
+	}
+	resp, err = fs.KvGet(ctx, &filer_pb.KvGetRequest{Key: []byte("backup.\x00\x00\x00\x02")})
+	if err != nil || resp.Error != "" || len(resp.Value) != 0 {
+		t.Fatalf("missing checkpoint: %+v %v", resp, err)
+	}
+	if _, err := fs.KvGet(ctx, &filer_pb.KvGetRequest{Key: []byte("backup.blob")}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("16 byte value under the prefix: %v", err)
+	}
+	if _, err := fs.KvGet(ctx, &filer_pb.KvGetRequest{Key: []byte("hardlink")}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("other key: %v", err)
 	}
 }
 
