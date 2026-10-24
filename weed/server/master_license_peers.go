@@ -17,10 +17,13 @@ import (
 )
 
 const (
-	// licensePeerResolveTTL is how long resolved master host names are reused.
+	// licensePeerResolveTTL is how long resolved master host names are
+	// reused, and how long a failed lookup is not repeated.
 	licensePeerResolveTTL = 10 * time.Second
-	// licensePeerResolveTimeout bounds one host name lookup.
-	licensePeerResolveTimeout = 2 * time.Second
+	// licensePeerResolveTimeout bounds one host name lookup. A few names
+	// failing in a row must stay under the 3 second deadline of a
+	// master-to-master RPC (license.peerRPCTimeout).
+	licensePeerResolveTimeout = time.Second
 	// licensePeerDenyLogInterval rate-limits the refusal log.
 	licensePeerDenyLogInterval = time.Minute
 )
@@ -73,6 +76,11 @@ func newLicensePeerGuard(self pb.ServerAddress, peers map[string]pb.ServerAddres
 	return g
 }
 
+// licensePeerLookupIP resolves a master host name; tests replace it.
+var licensePeerLookupIP = func(ctx context.Context, host string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
 // licensePeerHost returns the host of a master address or raft server id,
 // which may carry a gRPC port as host:port.grpcPort.
 func licensePeerHost(addr string) string {
@@ -120,7 +128,8 @@ func licenseCallerIP(ctx context.Context) net.IP {
 
 // allows reports whether ip is in master.license.peer_ips or is an address
 // of one of hosts. IP literals are compared first; names are resolved only
-// when no literal matches.
+// when no literal matches, each once (hosts lists -peers and raft members,
+// which usually name the same masters).
 func (g *licensePeerGuard) allows(ctx context.Context, ip net.IP, hosts []string) bool {
 	for _, n := range g.extra {
 		if n.Contains(ip) {
@@ -128,7 +137,12 @@ func (g *licensePeerGuard) allows(ctx context.Context, ip net.IP, hosts []string
 		}
 	}
 	var names []string
+	seen := make(map[string]bool, len(hosts))
 	for _, h := range hosts {
+		if seen[h] {
+			continue
+		}
+		seen[h] = true
 		if hip := net.ParseIP(h); hip != nil {
 			if hip.Equal(ip) {
 				return true
@@ -147,8 +161,10 @@ func (g *licensePeerGuard) allows(ctx context.Context, ip net.IP, hosts []string
 	return false
 }
 
-// resolve looks up a master host name, reusing a recent result; on a
-// lookup failure it keeps the previous result.
+// resolve looks up a master host name, reusing a recent result. A failed
+// lookup keeps the previous result and is not repeated for the TTL either:
+// without DNS every master-to-master RPC would otherwise wait for the
+// lookup timeout per name and miss its deadline.
 func (g *licensePeerGuard) resolve(ctx context.Context, host string) []net.IP {
 	g.mu.Lock()
 	r, ok := g.resolved[host]
@@ -158,10 +174,10 @@ func (g *licensePeerGuard) resolve(ctx context.Context, host string) []net.IP {
 	}
 	ctx, cancel := context.WithTimeout(ctx, licensePeerResolveTimeout)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	ips, err := licensePeerLookupIP(ctx, host)
 	if err != nil {
-		glog.V(1).Infof("license: resolve master %s: %v", host, err)
-		return r.ips
+		glog.V(1).Infof("license: resolve master %s: %v; keeping %v for %v", host, err, r.ips, licensePeerResolveTTL)
+		ips = r.ips
 	}
 	g.mu.Lock()
 	g.resolved[host] = resolvedHost{ips: ips, at: time.Now()}

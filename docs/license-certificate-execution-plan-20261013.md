@@ -621,6 +621,8 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 | `peer_ips` | 配置 `127.0.0.1` 的 master 放行回环调用，未配置的 master 仍拒绝；`peer_ips = "not-an-ip"` 启动即报错退出 |
 | 测试 | `go test -race ./weed/license/`；`CGO_ENABLED=0 go test` server、command、wdclient、shell；CI 标签构建 |
 
+**2026-10-25 修订（8.22 方案 4）：** 主机名解析失败时把旧地址连同当前时间写回缓存，TTL（10 秒）内不再重试，从未解析成功的名字在 TTL 内直接拒绝；`-peers` 与 raft 成员重复列出的名字只解析一次；单次解析超时由 2 秒降到 1 秒，几个名字连续失败仍在 master 间 RPC 的 3 秒截止内。
+
 **未覆盖：** 节点时钟下限只有单测（真实进程需要伪造 master）。主机名形式的 `-peers` 只以 `localhost` 做了单测（P5 docker-compose 中 3 个 master 经容器主机名互连已验证，见 8.5），NAT、多网卡与 Kubernetes 非 headless 服务地址未测，这类部署须在 `peer_ips` 中补地址，否则选主对账拿不到多数派、注册一直延后，升级说明须写明。goraft 多 master 未测（校验不区分 raft 实现；P5 docker-compose 已验证，见 8.5）。
 
 **环境记录：** 本机 macOS 上 `weed/server` 等包的测试二进制在依赖 `github.com/shoenig/go-m1cpu` 的 cgo 初始化时崩溃，与改动无关，以 `CGO_ENABLED=0` 运行。
@@ -1090,6 +1092,8 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 **方案 2 实施（2026-10-25）：** A：`filer_license.go` 的 `licenseKvOffsetPrefixes` 加 `"backup."`。B：`filer_backup.go` 的 `getOffset` 返回错误时 `doFilerBackup` 直接返回错误，由 `runFilerBackup` 的 1.7 秒循环重试，不再从 1970 开始；"未找到"仍是无错误、时间戳 0。单测 `TestLicenseKvGetCheck` 加 `backup.abc`；新增 `TestLicenseKvGetBackupOffset`：拒读态经真实 leveldb 存储，8 字节的 `backup.` 检查点可读、不存在的检查点返回空值、同前缀 16 字节的值与硬链接键返回 `PermissionDenied`。契约 5.3 `KvGet` 行与 S20、本计划 1.5 的旁路说明已加 `backup.`。B 的取舍按 2026-10-22 方案执行（用户 2026-10-25 确认）。
 
 **方案 3 实施（2026-10-25）：** `Membership` 去掉 `Index`，新增 `sameServers`（复制排序后比较 `Voters`、`Nonvoters`）；`RemoveMaster` 以 `!after.sameServers(mem)` 代替 `after.Index != mem.Index`；`LeaderInfo` 去掉 `ConfigIndex`，`masterRaft.Membership` 不再读 `f.Index()`，`SyncLicense` 收发两端不再填写或读取 `config_index`（proto 字段保留、置 0）。单测 `TestManagerRemoveMasterRecommits` 改为推送期间加入 nonvoter `x` 得 `MEMBERSHIP_CHANGED`、同一集合换序后移除成功；假 raft 不再有索引。去掉比较则该用例失败。契约 138、198、412 行与本计划 3.3 第 8、10 条、v5/v7 说明已同步。
+
+**方案 4 实施（2026-10-25）：** `master_license_peers.go` 的 `resolve` 失败时写回 `resolvedHost{ips: 旧值, at: now}`，TTL 内不再解析；去重放在 `allows` 收集名字处（同一入口，覆盖 `-peers` 与 raft 成员重复），不在 `checkLicensePeer`；`licensePeerResolveTimeout` 降到 1 秒；解析经可替换的 `licensePeerLookupIP`。单测 `TestLicensePeerGuardResolveFailure`：重复名字只解析一次，DNS 失败后 TTL 内零次解析、仍按旧 IP 放行，TTL 过后每个名字只失败一次且再过 TTL 前不重试，从未解析成功的名字被拒。8.4 已补说明。
 
 取舍待确认（2026-10-22）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
 
