@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -151,17 +152,89 @@ func (wfs *WFS) cacheRemoteEntry(path util.FullPath, entry *filer_pb.Entry) erro
 		return nil
 	}
 	dir, name := path.DirAndName()
+	// Marked before the filer is asked: its event for the download may
+	// arrive before the reply.
+	wfs.markRemoteDownload(path, entry.RemoteEntry)
 	resp, err := cacheRemoteObject(wfs, &filer_pb.CacheRemoteObjectToLocalClusterRequest{Directory: dir, Name: name})
 	if err != nil {
+		wfs.unmarkRemoteDownload(path)
 		return fmt.Errorf("CacheRemoteObjectToLocalCluster file %s: %v", path, err)
 	}
 	if resp.GetEntry() == nil {
+		wfs.unmarkRemoteDownload(path)
 		return fmt.Errorf("CacheRemoteObjectToLocalCluster file %s: no longer a remote object", path)
 	}
 	cached := resp.Entry
 	wfs.metaCache.InsertEntry(context.Background(), wfs.localEntryFromFiler(dir, cached))
 	takeCachedContent(entry, cached)
 	return nil
+}
+
+// remoteDownloadMarkTTL bounds how long a download without a handle waits
+// for the filer's event; a download the filer did not announce (the file
+// was cached already) leaves no mark behind after it.
+const remoteDownloadMarkTTL = time.Minute
+
+type remoteDownload struct {
+	remote *filer_pb.RemoteEntry
+	at     time.Time
+}
+
+func (wfs *WFS) markRemoteDownload(path util.FullPath, remote *filer_pb.RemoteEntry) {
+	wfs.remoteDownloadsMu.Lock()
+	defer wfs.remoteDownloadsMu.Unlock()
+	now := time.Now()
+	if wfs.remoteDownloads == nil {
+		wfs.remoteDownloads = make(map[util.FullPath]remoteDownload)
+	}
+	for p, d := range wfs.remoteDownloads {
+		if now.Sub(d.at) > remoteDownloadMarkTTL {
+			delete(wfs.remoteDownloads, p)
+		}
+	}
+	wfs.remoteDownloads[path] = remoteDownload{remote: proto.Clone(remote).(*filer_pb.RemoteEntry), at: now}
+}
+
+func (wfs *WFS) unmarkRemoteDownload(path util.FullPath) {
+	wfs.remoteDownloadsMu.Lock()
+	defer wfs.remoteDownloadsMu.Unlock()
+	delete(wfs.remoteDownloads, path)
+}
+
+// ownMetaEvent reports whether an update event is the filer caching a
+// remote object at this mount's request without an open handle
+// (cacheRemoteEntry): the mount inserts the cached entry itself and may
+// have saved a change on top of it since, so the event must not put the
+// cached entry back (meta_cache.ApplyEvent). Events of files with an open
+// handle are left to invalidateHandle, which orders them with the
+// handle's download (ownCacheEvent).
+func (wfs *WFS) ownMetaEvent(path util.FullPath, oldEntry, newEntry *filer_pb.Entry) bool {
+	if inode, found := wfs.inodeToPath.GetInode(path); found {
+		if _, open := wfs.fhMap.FindFileHandle(inode); open {
+			return false
+		}
+	}
+	wfs.remoteDownloadsMu.Lock()
+	defer wfs.remoteDownloadsMu.Unlock()
+	d, ok := wfs.remoteDownloads[path]
+	if !ok || !isRemoteDownload(d.remote, oldEntry, newEntry) {
+		return false
+	}
+	delete(wfs.remoteDownloads, path)
+	return true
+}
+
+// isRemoteDownload reports whether an update from oldEntry to newEntry is
+// the filer caching the remote object remote: the file had no chunks and
+// now has some, and the remote object is the same one apart from the time
+// of the download (LastLocalSyncTsNs).
+func isRemoteDownload(remote *filer_pb.RemoteEntry, oldEntry, newEntry *filer_pb.Entry) bool {
+	if remote == nil || len(oldEntry.GetChunks()) != 0 || oldEntry.GetRemoteEntry() == nil || len(newEntry.GetChunks()) == 0 {
+		return false
+	}
+	got := newEntry.GetRemoteEntry()
+	return got != nil && got.StorageName == remote.StorageName && got.RemoteSize == remote.RemoteSize &&
+		got.RemoteETag == remote.RemoteETag && got.RemoteMtime == remote.RemoteMtime
 }
 
 // takeCachedEntry installs the entry of a remote-only file just cached in

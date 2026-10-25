@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -83,6 +84,12 @@ type WFS struct {
 	IsOverQuota       bool
 	fhLockTable       *util.LockTable[FileHandleId]
 	FilerConf         *filer.FilerConf
+	// remoteDownloads marks the remote-only files this mount is caching
+	// into the cluster without an open handle (cacheRemoteEntry), so the
+	// filer's event for the download does not put the entry it announces
+	// over the one the mount saved since (ownMetaEvent).
+	remoteDownloadsMu sync.Mutex
+	remoteDownloads   map[util.FullPath]remoteDownload
 }
 
 func NewSeaweedFileSystem(option *Option) *WFS {
@@ -108,7 +115,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 			wfs.inodeToPath.MarkChildrenCached(path)
 		}, func(path util.FullPath) bool {
 			return wfs.inodeToPath.IsChildrenCached(path)
-		}, wfs.invalidateHandle)
+		}, wfs.invalidateHandle, wfs.ownMetaEvent)
 	grace.OnInterrupt(func() {
 		wfs.metaCache.Shutdown()
 		os.RemoveAll(option.getUniqueCacheDirForWrite())

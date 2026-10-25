@@ -24,10 +24,15 @@ type MetaCache struct {
 	markCachedFn   func(fullpath util.FullPath)
 	isCachedFn     func(fullpath util.FullPath) bool
 	invalidateFunc func(fullpath util.FullPath, entry *filer_pb.Entry)
+	// ownEventFn reports whether an update event of path from oldEntry to
+	// newEntry is one this mount caused and already holds; the cache then
+	// ignores it (ApplyEvent). May be nil.
+	ownEventFn func(path util.FullPath, oldEntry, newEntry *filer_pb.Entry) bool
 }
 
 func NewMetaCache(dbFolder string, uidGidMapper *UidGidMapper, root util.FullPath,
-	markCachedFn func(path util.FullPath), isCachedFn func(path util.FullPath) bool, invalidateFunc func(util.FullPath, *filer_pb.Entry)) *MetaCache {
+	markCachedFn func(path util.FullPath), isCachedFn func(path util.FullPath) bool, invalidateFunc func(util.FullPath, *filer_pb.Entry),
+	ownEventFn func(path util.FullPath, oldEntry, newEntry *filer_pb.Entry) bool) *MetaCache {
 	return &MetaCache{
 		root:         root,
 		localStore:   openMetaStore(dbFolder),
@@ -37,6 +42,7 @@ func NewMetaCache(dbFolder string, uidGidMapper *UidGidMapper, root util.FullPat
 		invalidateFunc: func(fullpath util.FullPath, entry *filer_pb.Entry) {
 			invalidateFunc(fullpath, entry)
 		},
+		ownEventFn: ownEventFn,
 	}
 }
 

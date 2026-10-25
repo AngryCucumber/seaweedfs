@@ -868,7 +868,7 @@ Linux 虚拟机上用真实 FUSE 跑了以下场景：
 - **修改前先缓存**：写入、`copy_file_range` 的目标、截断或扩长到非 0 之前，先把仅远端存储的文件缓存到集群（`cacheRemoteBeforeChange`；没有打开句柄的截断用 `cacheRemoteEntry` 缓存到要保存的条目里）；缓存失败返回 `EIO`。此后修改与普通分块文件相同：写入的数据比缓存分块新，截断裁剪缓存分块。写入的时间戳改在缓存之后取。
 - **截断到 0 去掉远端描述**：文件成为本地空文件，不再按仅远端存储取回；`filer.remote.sync` 若在运行，会把空文件上传。
 - **读取时缓存**：缓存请求在读锁外进行，同一句柄一次只运行一个，已缓存则不再请求。结果在写锁内与新的分块组一起装入（`takeCachedEntry`）：无未提交修改时整体替换；有未提交修改时（此时只可能是 chmod 等属性修改），只取正文、分块、远端描述、大小与 MD5，其余保留本地。filer 返回空条目时报错，不装入；处于读失败状态的句柄不触发缓存。
-- **自身事件**：每次装入都记下这次缓存的分块与远端描述。失效处理先从 meta cache 取新条目（更新事件传入的是旧条目），与记录一致即认作句柄自己的缓存事件，只认一次，不替换句柄、不丢弃待写数据；其他事件照旧按上游处理。读写在缓存期间持有句柄锁，事件总在装入之后处理。
+- **自身事件**：每次装入都记下这次缓存的分块与远端描述。失效处理先从 meta cache 取新条目（更新事件传入的是旧条目），与记录一致即认作句柄自己的缓存事件，只认一次，不替换句柄、不丢弃待写数据；其他事件照旧按上游处理。读写在缓存期间持有句柄锁，事件总在装入之后处理。**无句柄的缓存（2026-10-25 修订，8.22 方案 11）：** `cacheRemoteEntry` 在向 filer 发请求前按路径记下远端描述，meta cache 应用更新事件前先问 mount（`ownMetaEvent`）：路径无打开句柄、事件是"无分块 → 有分块且远端描述相同（忽略 `last_local_sync_ts_ns`）"即认作这次下载的事件，整条忽略并消费标记；否则照旧。原因：无句柄的截断在缓存后立即 `saveEntry`，其自身事件按签名被跳过，而 filer 的下载事件带回全尺寸条目，meta cache 会停在旧大小且没有后续事件纠正。标记一分钟过期（filer 已缓存过的文件不发事件）；有句柄的文件仍由 `invalidateHandle` 处理，保持与下载装入的顺序。
 
 单测 `TestDownloadRemoteEntry`：替换缓存请求，预置分块缓存，覆盖以下情况：
 - 并发两次首次读取只请求一次，读到 `world`；
@@ -1104,6 +1104,8 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 **方案 12 实施（2026-10-25）：** 契约 5.2 `CopyFile` 行的元数据白名单删去 `.cpx`，与 `isCopyFileMetadataExt` 一致；代码不变，既有单测 `TestIsCopyFileMetadataExt` 已断言 `.cpx` 受守卫。
 
 **方案 10 实施（2026-10-25）：** `Guard.WriteDeniedStatus` 只写 403 与 `X-MassDB-License-Reason`；filer 代理分支改用 `licenseHttpProxyReadAllowed`（不接受内部令牌，与此前相同），不再带 `cluster_id`、`expires_at` 与 JSON body。未把分支挪到 JWT 之后。单测 `TestWriteDeniedStatus`、`TestLicenseHttpProxyReadAllowed`。契约 5.2 的 403 响应表拆出 F2 一行，计划 1.2 F2 行同步。
+
+**方案 11 实施（2026-10-25）：** （a）`takeContent` 第三分支裁剪或补零后以 `md5.Sum` 重算 `Attributes.Md5`，`TestTruncateHiddenContent` 断言取回后的 md5 为 `hel\0\0` 的 md5。（b）meta cache 旧大小一项已复现并修复：把订阅的事件处理抽成 `MetaCache.ApplyEvent` 供单测直接调用，`NewMetaCache` 增加 `ownEventFn`；mount 在 `cacheRemoteEntry` 请求前按路径记标记（`markRemoteDownload`，RPC 失败即清除，一分钟过期），`ownMetaEvent` 对无句柄路径、形如"无分块 → 有分块且远端描述相同"的更新事件返回 true 并消费标记，meta cache 整条忽略；有句柄的路径一律交给 `invalidateHandle`。单测 `TestTruncateWithoutHandleKeepsMetaCacheSize`：经 gRPC 存根 filer 无句柄截断远端文件到 3，下载事件在 RPC 之后或之前到达两种顺序下 meta cache 都保持 3，标记只消费一次（之后别的客户端的 chmod 事件、未标记的下载事件都照常应用）；去掉钩子则 meta cache 回到 5。mount 全包 `-race` 通过。1.6 之后的远端缓存一节已补说明。
 
 取舍（2026-10-22 提出，用户 2026-10-25 确认按原方案执行）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
 

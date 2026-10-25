@@ -2,6 +2,7 @@ package mount
 
 import (
 	"context"
+	"crypto/md5"
 	"fmt"
 	"time"
 
@@ -285,6 +286,9 @@ func (fh *FileHandle) takeContent(e, fresh *filer_pb.Entry) error {
 		return fmt.Errorf("size changed on this handle while the content, now in chunks or a remote object, was hidden: %w", filer_pb.ErrContentHidden)
 	} else {
 		e.Content, e.Chunks, e.RemoteEntry = keptContent(fresh.Content, e.Attributes.FileSize, cut), nil, nil
+		// The content differs from the filer's, so its md5 does too.
+		sum := md5.Sum(e.Content)
+		e.Attributes.Md5 = sum[:]
 	}
 	e.ContentHidden = false
 	return nil

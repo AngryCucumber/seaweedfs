@@ -1,7 +1,9 @@
 package mount
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
@@ -230,7 +232,7 @@ func testWFS(t testing.TB) *WFS {
 	}
 	// Metadata events reach handles as in a mount (invalidateHandle), but
 	// only when a test delivers one.
-	wfs.metaCache = meta_cache.NewMetaCache(t.TempDir(), mapper, "/", func(util.FullPath) {}, func(util.FullPath) bool { return true }, wfs.invalidateHandle)
+	wfs.metaCache = meta_cache.NewMetaCache(t.TempDir(), mapper, "/", func(util.FullPath) {}, func(util.FullPath) bool { return true }, wfs.invalidateHandle, wfs.ownMetaEvent)
 	t.Cleanup(wfs.metaCache.Shutdown)
 	return wfs
 }
@@ -306,6 +308,10 @@ func TestTruncateHiddenContent(t *testing.T) {
 	fh.setReadFailure(nil) // as maybeRetryRead does after the refetch
 	if e := fh.entry.GetEntry(); string(e.Content) != "hel\x00\x00" || e.Attributes.FileSize != 5 || e.ContentHidden {
 		t.Fatalf("content %q, size %d, hidden %v", e.Content, e.Attributes.FileSize, e.ContentHidden)
+	}
+	// The content is not the filer's any more, nor is its md5.
+	if want := md5.Sum([]byte("hel\x00\x00")); !bytes.Equal(fh.entry.GetEntry().Attributes.Md5, want[:]) {
+		t.Fatalf("md5 %x, want %x", fh.entry.GetEntry().Attributes.Md5, want)
 	}
 	if got := readHandle(t, fh, 8); got != "hel\x00\x00" {
 		t.Fatalf("read %q", got)
@@ -643,6 +649,13 @@ func (s *flushFiler) CreateEntry(_ context.Context, r *filer_pb.CreateEntryReque
 	defer s.mu.Unlock()
 	s.saved = proto.Clone(r.Entry).(*filer_pb.Entry)
 	return &filer_pb.CreateEntryResponse{}, nil
+}
+
+func (s *flushFiler) UpdateEntry(_ context.Context, r *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saved = proto.Clone(r.Entry).(*filer_pb.Entry)
+	return &filer_pb.UpdateEntryResponse{}, nil
 }
 
 func (s *flushFiler) entry() *filer_pb.Entry {
@@ -1245,5 +1258,70 @@ func TestSetEntryDuringUploads(t *testing.T) {
 	uploads.Wait()
 	if fh.entryChunkGroup == nil || fh.entry.GetEntry() == nil {
 		t.Fatal("handle lost its entry")
+	}
+}
+
+// A size change of a remote-only file without an open handle caches the
+// file, then saves the changed entry. The filer's event for the download,
+// which carries the cached entry at its full size, arrives later (or before
+// the download replies) and must not put that entry over the saved one in
+// the meta cache: the mount's own save is skipped by signature, so nothing
+// would correct the size.
+func TestTruncateWithoutHandleKeepsMetaCacheSize(t *testing.T) {
+	saved := cacheRemoteObject
+	defer func() { cacheRemoteObject = saved }()
+	downloadEvent := func() *filer_pb.SubscribeMetadataResponse {
+		return &filer_pb.SubscribeMetadataResponse{Directory: "/d", EventNotification: &filer_pb.EventNotification{OldEntry: remoteOnlyEntry(), NewEntry: cachedRemoteEntry(1)}}
+	}
+	for _, eventFirst := range []bool{false, true} {
+		wfs, stub := testFlushWFS(t)
+		ctx := context.Background()
+		if err := wfs.metaCache.InsertEntry(ctx, filer.FromPbEntry("/d", remoteOnlyEntry())); err != nil {
+			t.Fatal(err)
+		}
+		inode := wfs.inodeToPath.Lookup("/d/a", time.Now().Unix(), false, false, 0, true)
+		cacheRemoteObject = func(*WFS, *filer_pb.CacheRemoteObjectToLocalClusterRequest) (*filer_pb.CacheRemoteObjectToLocalClusterResponse, error) {
+			if eventFirst {
+				if err := wfs.metaCache.ApplyEvent(downloadEvent(), wfs.signature); err != nil {
+					t.Error(err)
+				}
+			}
+			return &filer_pb.CacheRemoteObjectToLocalClusterResponse{Entry: cachedRemoteEntry(1)}, nil
+		}
+		in := &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: fuse.InHeader{NodeId: inode}, Valid: fuse.FATTR_SIZE, Size: 3}}
+		if code := wfs.SetAttr(nil, in, &fuse.AttrOut{}); code != fuse.OK {
+			t.Fatalf("truncate without a handle: %v", code)
+		}
+		if e := stub.entry(); e == nil || e.Attributes.FileSize != 3 || len(e.Chunks) != 1 {
+			t.Fatalf("event first %v: saved %+v", eventFirst, e)
+		}
+		if !eventFirst {
+			if err := wfs.metaCache.ApplyEvent(downloadEvent(), wfs.signature); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cached, err := wfs.metaCache.FindEntry(ctx, "/d/a")
+		if err != nil || cached.FileSize != 3 {
+			t.Fatalf("event first %v: meta cache %+v %v after the download event", eventFirst, cached, err)
+		}
+
+		// The mark is consumed: a later change by another client applies.
+		changed := cachedRemoteEntry(1)
+		changed.Attributes.FileSize = 3
+		changed.Attributes.FileMode = 0600
+		if err := wfs.metaCache.ApplyEvent(&filer_pb.SubscribeMetadataResponse{Directory: "/d", EventNotification: &filer_pb.EventNotification{OldEntry: cachedRemoteEntry(1), NewEntry: changed}}, wfs.signature); err != nil {
+			t.Fatal(err)
+		}
+		if cached, err = wfs.metaCache.FindEntry(ctx, "/d/a"); err != nil || cached.Mode&0777 != 0600 {
+			t.Fatalf("event first %v: a later event was ignored: %+v %v", eventFirst, cached, err)
+		}
+		// A download event with nothing marked is a download by someone
+		// else and applies.
+		if err := wfs.metaCache.ApplyEvent(downloadEvent(), wfs.signature); err != nil {
+			t.Fatal(err)
+		}
+		if cached, err = wfs.metaCache.FindEntry(ctx, "/d/a"); err != nil || cached.FileSize != 5 {
+			t.Fatalf("event first %v: an unmarked download event was ignored: %+v %v", eventFirst, cached, err)
+		}
 	}
 }
