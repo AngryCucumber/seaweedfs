@@ -139,3 +139,18 @@ func BenchmarkGuardAllowRead(b *testing.B) {
 		}
 	})
 }
+
+// WriteDeniedStatus gives an unauthenticated caller the reason only.
+func TestWriteDeniedStatus(t *testing.T) {
+	cert := certWith(t, 1, t2026, t2027, FeatureDataRead)
+	g := guardWith("", cert, t2027)
+	_, s := g.AllowRead()
+	w := httptest.NewRecorder()
+	g.WriteDeniedStatus(w, s)
+	if w.Code != 403 || w.Header().Get(ReasonHeader) != string(ReasonExpired) {
+		t.Fatalf("status %d headers %v", w.Code, w.Header())
+	}
+	if w.Body.Len() != 0 || w.Header().Get("Content-Type") != "" || w.Header().Get("Content-Length") != "" {
+		t.Fatalf("body %q headers %v", w.Body.String(), w.Header())
+	}
+}

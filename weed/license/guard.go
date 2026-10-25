@@ -143,6 +143,15 @@ func (g *Guard) WriteDenied(w http.ResponseWriter, s *Snapshot) {
 	_, _ = w.Write(body)
 }
 
+// WriteDeniedStatus writes a 403 with only the reason header, for entry
+// points that run before the server's own authentication: the filer's
+// chunk proxy (F2) sits before its JWT check, so an unauthenticated caller
+// learns the reason but not cluster_id or expires_at.
+func (g *Guard) WriteDeniedStatus(w http.ResponseWriter, s *Snapshot) {
+	w.Header().Set(ReasonHeader, string(s.Reason(g.Now())))
+	w.WriteHeader(http.StatusForbidden)
+}
+
 func (g *Guard) setKey(key []byte) {
 	if len(key) != InternalKeySize {
 		g.key.Store(nil)

@@ -111,7 +111,8 @@ P0 只交付契约与核对记录，不含实现与运行测试。
 
 | 出口 | 表现 |
 | --- | --- |
-| volume HTTP GET（V1）、filer HTTP GET（F1）、`?proxyChunkId=`（F2） | HTTP 403，`Content-Type: application/json`，头 `X-MassDB-License-Reason: <码>`，body 精确为 `{"error":"license_denied","reason":"<码>","expires_at":<生效证书 expires_at，无则 0>,"cluster_id":"<id，未知则空串>"}`，body 按快照预序列化 |
+| volume HTTP GET（V1）、filer HTTP GET（F1） | HTTP 403，`Content-Type: application/json`，头 `X-MassDB-License-Reason: <码>`，body 精确为 `{"error":"license_denied","reason":"<码>","expires_at":<生效证书 expires_at，无则 0>,"cluster_id":"<id，未知则空串>"}`，body 按快照预序列化 |
+| `?proxyChunkId=`（F2） | HTTP 403，头 `X-MassDB-License-Reason: <码>`，无 body（2026-10-25 修订：该分支在 filer JWT 鉴权之前，不向未鉴权调用者暴露 `cluster_id` 与 `expires_at`；此前与 V1/F1 相同） |
 | S3 `GetObject` | 标准 S3 `AccessDenied`（403 XML），保留 `X-MassDB-License-Reason` 头 |
 | S3 `CopyObject` 源读取 | `InvalidCopySource` |
 | volume gRPC 数据 RPC（G2，5.2） | `codes.PermissionDenied`，消息 `license: <码>` |

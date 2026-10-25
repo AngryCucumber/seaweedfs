@@ -70,6 +70,21 @@ func licenseHttpReadAllowed(n *license.Node, w http.ResponseWriter, r *http.Requ
 	return false
 }
 
+// licenseHttpProxyReadAllowed guards a GET of the filer's chunk proxy
+// (/?proxyChunkId=, plan 1.2 F2). It runs before the filer's JWT check, so
+// a denial carries only the status and the reason header. The proxy never
+// accepts the internal read token: filers reach volumes directly.
+func licenseHttpProxyReadAllowed(n *license.Node, w http.ResponseWriter) bool {
+	guard := n.Guard()
+	ok, snap := guard.AllowRead()
+	if ok {
+		return true
+	}
+	guard.WriteDeniedStatus(w, snap)
+	licenseNoteDenied(n, snap, "filer", licensePathFilerProxy)
+	return false
+}
+
 // licenseGrpcReadAllowed guards a volume gRPC RPC that returns data
 // (plan 1.2 G2). Streams are checked once, when they start.
 func licenseGrpcReadAllowed(n *license.Node, ctx context.Context) error {

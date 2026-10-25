@@ -90,6 +90,25 @@ func TestLicenseGrpcReadAllowed(t *testing.T) {
 	}
 }
 
+// The chunk proxy denial, which precedes the filer's JWT check, carries no
+// cluster_id or expires_at; the token is not accepted there.
+func TestLicenseHttpProxyReadAllowed(t *testing.T) {
+	w := httptest.NewRecorder()
+	if !licenseHttpProxyReadAllowed(licensetest.ValidNode(t), w) || w.Code != http.StatusOK || w.Body.Len() != 0 {
+		t.Fatalf("valid: %d %q", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	if licenseHttpProxyReadAllowed(licensetest.DeniedNode(t), w) {
+		t.Fatal("denied node allowed the proxy read")
+	}
+	if w.Code != http.StatusForbidden || w.Header().Get(license.ReasonHeader) != string(license.ReasonNoLicense) {
+		t.Fatalf("denial: %d %v", w.Code, w.Header())
+	}
+	if w.Body.Len() != 0 || w.Header().Get("Content-Type") != "" {
+		t.Fatalf("denial leaked a body: %q %v", w.Body.String(), w.Header())
+	}
+}
+
 func TestIsCopyFileMetadataExt(t *testing.T) {
 	for _, ext := range []string{".idx", ".ecx", ".ecj", ".vif"} {
 		if !isCopyFileMetadataExt(ext) {

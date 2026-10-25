@@ -64,7 +64,7 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if fileId != "" {
 		// The proxy forwards the request method; only GETs read data (F2).
-		if r.Method == http.MethodGet && !licenseHttpReadAllowed(fs.license, w, r, "filer", licensePathFilerProxy, false) {
+		if r.Method == http.MethodGet && !licenseHttpProxyReadAllowed(fs.license, w) {
 			return
 		}
 		fs.proxyToVolumeServer(w, r, fileId)

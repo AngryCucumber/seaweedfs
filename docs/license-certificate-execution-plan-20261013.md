@@ -51,7 +51,7 @@
 | --- | --- | --- |
 | V1. volume server HTTP GET 文件内容 | [GetOrHeadHandler](../weed/server/volume_server_handlers_read.go:53) 在 JWT 检查之后、`needle.NewVolumeId(vid)` 之前；仅 `r.Method == GET`；带有效内部令牌（1.4）的请求放行。两个 HTTP handler 都经过此处，`ReadMode=proxy/redirect`、Range、`?readDeleted`、图片缩放裁剪全部覆盖 | mount 读、webdav 读（含 `weed server -webdav` 同进程）、`weed download`、`weed filer.cat`、`fs.cat`、filer 流式读的 chunk 拉取、`filer.backup`/`filer.sync`/`filer.remote.sync` 的数据拉取 |
 | F1. filer HTTP GET 文件内容 | [GetOrHeadHandler](../weed/server/filer_server_handlers_read.go:161) 在文件 `?metadata=true` 分支之后、`checkPreconditions` 之前；仅 `r.Method == GET`（v9 前移：v8 放在 HEAD 返回之后，需要先清空已设置的对象头；前移后对象头尚未设置，只有 S3 目录对象可能已设 `X-Seaweedfs-Is-Directory-Key`，拒绝时删除即可）。覆盖 `entry.Content` 内联小文件、分片、分段读、`SeaweedFSPartNumber`、图片缩放（`filer.ReadAll`） | S3 `GetObject`（经 5.2 转换为标准 `AccessDenied`）、S3 `CopyObject` 的源读取、filer 页面下载、`readonlyFilerHandler` |
-| F2. filer `/?proxyChunkId=` | [filerHandler](../weed/server/filer_server_handlers.go:66) 调 `proxyToVolumeServer` 前；仅 `r.Method == GET`（该代理按原方法转发，写入与 HEAD 不拦） | 明确 403 |
+| F2. filer `/?proxyChunkId=` | [filerHandler](../weed/server/filer_server_handlers.go:66) 调 `proxyToVolumeServer` 前；仅 `r.Method == GET`（该代理按原方法转发，写入与 HEAD 不拦） | 明确 403；只带状态码与原因头、无 body（2026-10-25 修订，8.22 方案 10：该分支在 filer JWT 之前） |
 | M1. 三处只读 HTTP 元数据出口隐藏内联正文 | 目录条目 `?metadata=true`（[filer_server_handlers_read.go:124](../weed/server/filer_server_handlers_read.go:124)，v9 补：S3 尾斜杠目录标记对象的 `Content` 从这里返回）、文件条目 `?metadata=true`（[filer_server_handlers_read.go:147](../weed/server/filer_server_handlers_read.go:147)）、目录 JSON（[filer_server_handlers_read_dir.go:63](../weed/server/filer_server_handlers_read_dir.go:63)）：当 `!AllowRead()` 且 `len(Content) > 0` 且不在系统目录豁免内（1.5）时，序列化的副本里 `Content` 置空、`ContentHidden=true`，响应头加 `X-MassDB-Content-Hidden: true`，`FileSize` 保留 | 浏览器、curl 直接查 metadata |
 | G1. filer gRPC 返回的内联正文（v9，决策 9） | `LookupDirectoryEntry`、`ListEntries`、`TraverseBfsMetadata`、`SubscribeMetadata/SubscribeLocalMetadata`、`StreamRenameEntry`、`CacheRemoteObjectToLocalCluster` 的出站 Entry，及 `KvGet`；规则见 1.5，挂点见 P0 契约 5.3 | 任意 gRPC 客户端、mount、S3 列表、订阅类命令 |
 | G2. volume gRPC 数据 RPC（v9，决策 4） | `CopyFile`（非元数据扩展名）、`ReadNeedleBlob`、`ReadAllNeedles`、`VolumeTailSender`、`VolumeIncrementalCopy`、`VolumeEcShardRead`、`Query` 的 handler 入口；拒读态校验 gRPC 元数据 `x-massdb-internal-read`；volume↔volume 的 3 个出站调用点附加令牌（P0 契约 5.2）。不加拦截器 | `weed shell volume.check.disk`、`weed backup`、直连 gRPC 读取 |
@@ -1102,6 +1102,8 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 **方案 7 实施（2026-10-25）：** `weedfs.go` 的 `invalidateHandle` 与 `filehandle_map.go` 的 `AcquireFileHandle` 在 `fh.entryLock.Lock()` 下调用 `SetEntry`（锁序：句柄锁或句柄表锁 → `entryLock`，与现有一致；`SetEntry` 内部不加锁）。单测 `TestSetEntryDuringUploads`：一个 goroutine 持续 `addUploadedChunk`，主 goroutine 交替触发 200 次元数据事件与重新打开；去掉两处锁则 `-race` 报告近 400 条竞争。mount 全包 `-race` 通过。8.18 的替换点清单已补这两处。
 
 **方案 12 实施（2026-10-25）：** 契约 5.2 `CopyFile` 行的元数据白名单删去 `.cpx`，与 `isCopyFileMetadataExt` 一致；代码不变，既有单测 `TestIsCopyFileMetadataExt` 已断言 `.cpx` 受守卫。
+
+**方案 10 实施（2026-10-25）：** `Guard.WriteDeniedStatus` 只写 403 与 `X-MassDB-License-Reason`；filer 代理分支改用 `licenseHttpProxyReadAllowed`（不接受内部令牌，与此前相同），不再带 `cluster_id`、`expires_at` 与 JSON body。未把分支挪到 JWT 之后。单测 `TestWriteDeniedStatus`、`TestLicenseHttpProxyReadAllowed`。契约 5.2 的 403 响应表拆出 F2 一行，计划 1.2 F2 行同步。
 
 取舍（2026-10-22 提出，用户 2026-10-25 确认按原方案执行）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
 
