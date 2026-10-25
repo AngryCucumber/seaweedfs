@@ -1101,6 +1101,8 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 
 **方案 7 实施（2026-10-25）：** `weedfs.go` 的 `invalidateHandle` 与 `filehandle_map.go` 的 `AcquireFileHandle` 在 `fh.entryLock.Lock()` 下调用 `SetEntry`（锁序：句柄锁或句柄表锁 → `entryLock`，与现有一致；`SetEntry` 内部不加锁）。单测 `TestSetEntryDuringUploads`：一个 goroutine 持续 `addUploadedChunk`，主 goroutine 交替触发 200 次元数据事件与重新打开；去掉两处锁则 `-race` 报告近 400 条竞争。mount 全包 `-race` 通过。8.18 的替换点清单已补这两处。
 
+**方案 12 实施（2026-10-25）：** 契约 5.2 `CopyFile` 行的元数据白名单删去 `.cpx`，与 `isCopyFileMetadataExt` 一致；代码不变，既有单测 `TestIsCopyFileMetadataExt` 已断言 `.cpx` 受守卫。
+
 取舍（2026-10-22 提出，用户 2026-10-25 确认按原方案执行）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
 
 **方案复核（2026-10-24）：** 外部对本节方案做了对照源码的隔离复现，确认原方案 3 处缺陷，已改入上文：方案 1 的部分截断分支漏了 `noteChunks`，新写入会被时间戳领先的旧分块覆盖（P1，复现 `Write/Flush` 成功但重读得旧内容，补 `noteChunks` 后通过）；方案 9 只延后写标记不能保证重启后一致，第二次引导不删除源端已删的残留条目且订阅起点漏事件（P1，复现已删除文件保留），改为持久化引导切点；方案 8 会把用户以 `-voter=false` 配置的 nonvoter 一并提升（P2，复现 3 voter 变 4 voter），改为只重试待提升集合。复核同时确认正常读热路径无性能问题（守卫微基准约 0.66 ns/op、零分配），未做集群长期压测。

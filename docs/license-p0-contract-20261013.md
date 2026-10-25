@@ -288,7 +288,7 @@ P2 修订：每个 master 在 raft 启动前把 `-license.file` 按 1.5 第 1–
 
 | RPC | 实现 | 守卫条件 | 被拦后的影响（证书无效时） |
 | --- | --- | --- | --- |
-| `CopyFile` | `volume_grpc_copy.go:319` | `req.Ext` **不在**元数据白名单 `{".idx",".ecx",".ecj",".vif",".cpx"}`（精确匹配）时检查 | 无影响：`.dat`/`.ec00–.ec13` 只由 volume→volume 拉取，带令牌；shell `volume.fsck`、`volume.check.disk` 只取 `.idx`/`.ecx` |
+| `CopyFile` | `volume_grpc_copy.go:319` | `req.Ext` **不在**元数据白名单 `{".idx",".ecx",".ecj",".vif"}`（精确匹配；2026-10-25 修订删去 `.cpx`，与 `isCopyFileMetadataExt` 一致，树内无调用方传该扩展名）时检查 | 无影响：`.dat`/`.ec00–.ec13` 只由 volume→volume 拉取，带令牌；shell `volume.fsck`、`volume.check.disk` 只取 `.idx`/`.ecx` |
 | `ReadNeedleBlob` | `volume_grpc_read_write.go:11` | 总是检查 | shell `volume.check.disk` 失败（字节经过 shell 进程） |
 | `ReadAllNeedles` | `volume_grpc_read_all.go:10` | 总是检查 | 构建内无调用方 |
 | `VolumeTailSender` | `volume_grpc_tail.go:17` | 总是检查 | 无影响：只由 `VolumeTailReceiver`（volume→volume，`operation/tail_volume.go:35`）调用，带令牌 |
