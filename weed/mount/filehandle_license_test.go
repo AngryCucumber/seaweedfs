@@ -1208,3 +1208,42 @@ func TestWriteAfterTruncateResolvesManifest(t *testing.T) {
 		t.Fatalf("stored entry reads %q, chunks %v", got, stored.Chunks)
 	}
 }
+
+// A metadata event (invalidateHandle) or a new open of the same inode
+// (AcquireFileHandle) replaces the handle's entry and chunk group while
+// uploads of the handle add chunks to them: both take the entry lock.
+func TestSetEntryDuringUploads(t *testing.T) {
+	wfs := testWFS(t)
+	fh := wfs.testOpen("/d/a", &filer_pb.Entry{Name: "a", Attributes: &filer_pb.FuseAttributes{FileMode: 0644}})
+	var uploads sync.WaitGroup
+	stop := make(chan struct{})
+	uploads.Add(1)
+	go func() {
+		defer uploads.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			fh.addUploadedChunk(&filer_pb.FileChunk{FileId: fmt.Sprintf("3,%x637037d6", i+1), Offset: int64(i) * 4096, Size: 4096, ModifiedTsNs: int64(i + 1)})
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		fresh := &filer_pb.Entry{Name: "a", Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 5}, Content: []byte("hello")}
+		if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/d", fresh)); err != nil {
+			t.Fatal(err)
+		}
+		wfs.invalidateHandle("/d/a", fresh)
+		again := wfs.fhMap.AcquireFileHandle(wfs, fh.inode, &filer_pb.Entry{Name: "a", Attributes: &filer_pb.FuseAttributes{FileMode: 0644}})
+		if again != fh {
+			t.Fatal("a new open of the inode must reuse the handle")
+		}
+		wfs.fhMap.ReleaseByInode(fh.inode)
+	}
+	close(stop)
+	uploads.Wait()
+	if fh.entryChunkGroup == nil || fh.entry.GetEntry() == nil {
+		t.Fatal("handle lost its entry")
+	}
+}

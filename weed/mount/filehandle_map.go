@@ -48,9 +48,14 @@ func (i *FileHandleToInode) AcquireFileHandle(wfs *WFS, inode uint64, entry *fil
 	} else {
 		fh.counter++
 	}
+	// A handle reused by a new open takes the new entry under the entry
+	// lock: uploads of the handle add chunks to the entry and its chunk
+	// group under the read lock (addUploadedChunk).
+	fh.entryLock.Lock()
 	if fh.GetEntry().GetEntry() != entry {
 		fh.SetEntry(entry)
 	}
+	fh.entryLock.Unlock()
 	return fh
 }
 

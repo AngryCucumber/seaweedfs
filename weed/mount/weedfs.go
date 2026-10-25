@@ -162,11 +162,15 @@ func (wfs *WFS) invalidateHandle(filePath util.FullPath, entry *filer_pb.Entry) 
 			fh.dirtyPages.Destroy()
 			fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
 
-			// Update handle entry
+			// Update handle entry. SetEntry replaces the entry and its
+			// chunk group, which uploads add to under the read lock
+			// (addUploadedChunk).
 			if status == fuse.OK {
+				fh.entryLock.Lock()
 				if fh.GetEntry().GetEntry() != newEntry {
 					fh.SetEntry(newEntry)
 				}
+				fh.entryLock.Unlock()
 			}
 		}
 	}

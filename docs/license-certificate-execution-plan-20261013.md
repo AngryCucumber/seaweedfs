@@ -946,7 +946,7 @@ e 的 filer 读取是上游另一个问题：普通分块文件经 mount 截断�
 
 ### 8.18 外部第十三轮审核修复（2026-10-15）
 
-第十三轮审核基于 `64539d29c`，排除上游原有问题后确认 1 项（P2）：后台上传完成的回调（`saveChunkedFileIntervalToStorage`）追加分块后直接读 `entryChunkGroup` 指针并 `AddChunk`，不持 `entryLock`；`resolveChunksAgain`（P3 引入）在 `entryLock` 写锁内取当前分块、替换分块组。上传若在取当前分块之后、替换之前完成，分块会加进即将丢弃的旧分块组，当前句柄漏读这段数据（flush 的元数据仍含它）。`-race` 稳定报告，未复现持久化丢失。续期重取与缓存远端对象的装入（`takeRefetchedEntry`、`takeCachedEntry`）同样在写锁内替换分块组，也受影响。
+第十三轮审核基于 `64539d29c`，排除上游原有问题后确认 1 项（P2）：后台上传完成的回调（`saveChunkedFileIntervalToStorage`）追加分块后直接读 `entryChunkGroup` 指针并 `AddChunk`，不持 `entryLock`；`resolveChunksAgain`（P3 引入）在 `entryLock` 写锁内取当前分块、替换分块组。上传若在取当前分块之后、替换之前完成，分块会加进即将丢弃的旧分块组，当前句柄漏读这段数据（flush 的元数据仍含它）。`-race` 稳定报告，未复现持久化丢失。续期重取与缓存远端对象的装入（`takeRefetchedEntry`、`takeCachedEntry`）同样在写锁内替换分块组，也受影响。**2026-10-25 补充（8.22 方案 7）：** 替换点还有 `invalidateHandle`（元数据事件）与 `AcquireFileHandle`（同一 inode 再次打开）里的 `SetEntry`，此前只持句柄锁或句柄表锁，现同样在 `entryLock` 写锁内调用。
 
 锁序：`doFlush` 等待上传完成时不持 `entryLock`；`entryLock` 的写锁持有者（重试解析、重取装入、缓存装入、截断、xattr）都不等待上传。因此上传回调可以在 `entryLock` 读锁内完成“追加分块 + 加入分块组”（`addUploadedChunk`）：要么在替换前完成，分块在替换时取到的当前分块里，被加进新分块组；要么在替换后完成，加进新分块组。
 
@@ -1098,6 +1098,8 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 **方案 5 实施（2026-10-25）：** `state.go` 的 `Merge` 增加 `now` 参数，`in.Watermark` 先取 `min(in.Watermark, now)` 再走三分支；`ApplySync`、`adoptAhead`、对账采纳 `best.clock` 三处都经钳位（后两处仍只在对端 `repair_seq` 更高时采纳）。单测：`TestClockState` 加三条钳位用例（同序号与更高序号的超前水位都只到 now，低于对端 now 的本地水位不被拉低）；新增 `TestManagerLeaderClockAheadDoesNotSuspectFollower`：follower 时钟落后 leader 30 秒，leader 导入后墙钟前进再推送，follower 保持 `VALID`、水位不超过本地 now，随后当选 leader 仍 `VALID`，再由 leader 导入更高序号证书时水位降到 `issued_at`；去掉钳位则该用例在第一步报 `CLOCK_SUSPECT`。`TestManagerClockSuspectAndRepair`（S8）与 `TestManagerAdoptsClockRepair` 不变。4.5 已同步。license 包 `-race` 通过。
 
 **方案 6 实施（2026-10-25）：** A：`SendHeartbeat` 的 `DisconnectNode` 放进更早注册的独立 defer，在 `UnRegisterDataNode` 之后执行。B：`reconcileLocked` 在 `m.mu` 内用 `m.conns` 的键把仍持有流的节点置为在线，与账本替换同锁完成；`ManagerOption.Connected`、`m.connected` 与 `licenseConnected()` 删除。单测：`TestManagerLedgerReplicationAndTakeOver` 改为直接给 c 的 `conns` 放入 v2 模拟存活的流；新增 `TestManagerReconcileDisconnectDuringReconcile`：leader 重新当选、对账收集期间（`onCollect` 钩子）v1 的最后一条流断开，新账本中 v1 离线、`last_seen` 为对账时间并可 `ReleaseNode`，v2 仍在线且 `ReleaseNode` 报 `NODE_ONLINE`，`conns` 只剩 v2。license、server `-race` 通过。8.1 第 4 条已加修订说明。
+
+**方案 7 实施（2026-10-25）：** `weedfs.go` 的 `invalidateHandle` 与 `filehandle_map.go` 的 `AcquireFileHandle` 在 `fh.entryLock.Lock()` 下调用 `SetEntry`（锁序：句柄锁或句柄表锁 → `entryLock`，与现有一致；`SetEntry` 内部不加锁）。单测 `TestSetEntryDuringUploads`：一个 goroutine 持续 `addUploadedChunk`，主 goroutine 交替触发 200 次元数据事件与重新打开；去掉两处锁则 `-race` 报告近 400 条竞争。mount 全包 `-race` 通过。8.18 的替换点清单已补这两处。
 
 取舍（2026-10-22 提出，用户 2026-10-25 确认按原方案执行）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
 
