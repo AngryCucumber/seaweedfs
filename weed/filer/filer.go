@@ -80,7 +80,17 @@ func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerH
 	return f
 }
 
-func (f *Filer) MaybeBootstrapFromOnePeer(self pb.ServerAddress, existingNodes []*master_pb.ClusterNodeUpdate, snapshotTime time.Time) (err error) {
+// MaybeBootstrapFromOnePeer copies the namespace of the earliest peer into
+// a fresh store (plan 1.5, 8.22 item 9). The peer may hide inline content
+// until this filer holds the internal read token; such entries are never
+// stored and the copy is retried every BootstrapRetryInterval, for at most
+// BootstrapRetryLimit, or until ctx is cancelled (the master refused this
+// filer: context.Cause). since is the bootstrap cut (BootstrapSince): the
+// copy gives the namespace as of now, the metadata events from since give
+// every change after the cut, so a copy interrupted and resumed later, or
+// repeated after a restart, still ends complete once the events are
+// replayed. The peer must still hold its persisted log from since on.
+func (f *Filer) MaybeBootstrapFromOnePeer(ctx context.Context, self pb.ServerAddress, existingNodes []*master_pb.ClusterNodeUpdate, since time.Time) (err error) {
 	if len(existingNodes) == 0 {
 		return
 	}
@@ -92,31 +102,107 @@ func (f *Filer) MaybeBootstrapFromOnePeer(self pb.ServerAddress, existingNodes [
 		return
 	}
 
-	glog.V(0).Infof("bootstrap from %v clientId:%d", earliestNode.Address, f.UniqueFilerId)
+	glog.V(0).Infof("bootstrap from %v clientId:%d, cut at %v", earliestNode.Address, f.UniqueFilerId, since)
 
+	deadline := time.Now().Add(BootstrapRetryLimit)
 	for {
-		// Filers read each other's inline content with the internal read
-		// token. Until it arrives from the master the peer may hide
-		// content; such entries are never stored, the bootstrap retries.
 		err = pb.WithFilerClient(false, f.UniqueFilerId, pb.ServerAddress(earliestNode.Address), f.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-			return filer_pb.StreamBfsWithContext(WithInternalReadToken(context.Background()), client, "/", snapshotTime.UnixNano(), func(parentPath util.FullPath, entry *filer_pb.Entry) error {
+			if err := checkBootstrapLogCoverage(ctx, client, since); err != nil {
+				return err
+			}
+			return filer_pb.StreamBfsWithContext(WithInternalReadToken(ctx), client, "/", since.UnixNano(), func(parentPath util.FullPath, entry *filer_pb.Entry) error {
 				if entry.ContentHidden {
 					return fmt.Errorf("%s: %w", parentPath.Child(entry.Name), filer_pb.ErrContentHidden)
 				}
-				return f.Store.InsertEntry(context.Background(), FromPbEntry(string(parentPath), entry))
+				return f.Store.InsertEntry(ctx, FromPbEntry(string(parentPath), entry))
 			})
 		})
+		if ctx.Err() != nil {
+			return fmt.Errorf("bootstrap from %v stopped: %w", earliestNode.Address, context.Cause(ctx))
+		}
 		if !errors.Is(err, filer_pb.ErrContentHidden) {
 			return err
 		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("bootstrap from %v: %v; the peer still hides content after %v (no internal read token from the master; is this filer admitted?)", earliestNode.Address, err, BootstrapRetryLimit)
+		}
 		glog.Warningf("bootstrap from %v: %v; retrying", earliestNode.Address, err)
-		time.Sleep(bootstrapRetryInterval)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("bootstrap from %v stopped: %w", earliestNode.Address, context.Cause(ctx))
+		case <-time.After(BootstrapRetryInterval):
+		}
 	}
 }
 
-// bootstrapRetryInterval is how long a bootstrap waits before retrying
-// when the peer hid inline content.
-const bootstrapRetryInterval = 5 * time.Second
+var (
+	// BootstrapRetryInterval is how long a bootstrap waits before retrying
+	// when the peer hid inline content; BootstrapRetryLimit bounds the
+	// retries.
+	BootstrapRetryInterval = 5 * time.Second
+	BootstrapRetryLimit    = 5 * time.Minute
+)
+
+// FilerBootstrapSince is the store key holding the bootstrap cut of a store
+// whose bootstrap has not completed (unix nanoseconds).
+const FilerBootstrapSince = "filer.bootstrap.since"
+
+// BootstrapSince returns the bootstrap cut of this store: the one an
+// earlier, unfinished bootstrap persisted, or startFrom, persisted now.
+// The metadata subscriptions start from it (AggregateFromPeers) so that
+// nothing between the first attempt and the completed copy is missed.
+func (f *Filer) BootstrapSince(startFrom time.Time) (time.Time, error) {
+	ctx := context.Background()
+	value, err := f.Store.KvGet(ctx, []byte(FilerBootstrapSince))
+	switch {
+	case err == nil && len(value) == 8:
+		return time.Unix(0, int64(util.BytesToUint64(value))), nil
+	case err == nil && len(value) != 0:
+		return time.Time{}, fmt.Errorf("read %s: unexpected value %x", FilerBootstrapSince, value)
+	case err != nil && err != ErrKvNotFound:
+		return time.Time{}, fmt.Errorf("read %s: %v", FilerBootstrapSince, err)
+	}
+	value = make([]byte, 8)
+	util.Uint64toBytes(value, uint64(startFrom.UnixNano()))
+	if err := f.Store.KvPut(ctx, []byte(FilerBootstrapSince), value); err != nil {
+		return time.Time{}, fmt.Errorf("write %s: %v", FilerBootstrapSince, err)
+	}
+	return startFrom, nil
+}
+
+// FinishBootstrap marks the store initialized: the bootstrap cut is dropped
+// and the store signature written (SetStore generated it). Until then a
+// restart finds the store fresh and bootstraps again from the same cut.
+func (f *Filer) FinishBootstrap() error {
+	ctx := context.Background()
+	if err := f.Store.KvDelete(ctx, []byte(FilerBootstrapSince)); err != nil && err != ErrKvNotFound {
+		return fmt.Errorf("delete %s: %v", FilerBootstrapSince, err)
+	}
+	return f.PersistStoreSignature()
+}
+
+// checkBootstrapLogCoverage refuses a bootstrap whose cut the peer's
+// persisted metadata log no longer reaches back to: the events from the cut
+// would silently start later and deletions made meanwhile would stay in
+// this store. The log is kept in UTC day directories; a peer without any
+// has nothing to replay.
+func checkBootstrapLogCoverage(ctx context.Context, client filer_pb.SeaweedFilerClient, since time.Time) error {
+	var earliest string
+	err := filer_pb.SeaweedList(client, SystemLogDir, "", func(entry *filer_pb.Entry, isLast bool) error {
+		if entry.IsDirectory && (earliest == "" || entry.Name < earliest) {
+			earliest = entry.Name
+		}
+		return nil
+	}, "", false, 1)
+	if err != nil && !strings.Contains(err.Error(), filer_pb.ErrNotFound.Error()) {
+		return fmt.Errorf("list the peer's metadata log %s: %v", SystemLogDir, err)
+	}
+	cutDay := since.UTC().Format("2006-01-02")
+	if earliest != "" && earliest > cutDay {
+		return fmt.Errorf("the peer's metadata log starts on %s, after the bootstrap cut %v of an earlier attempt; changes since then cannot be replayed: empty this filer's store and start again", earliest, since.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
 
 func (f *Filer) AggregateFromPeers(self pb.ServerAddress, existingNodes []*master_pb.ClusterNodeUpdate, startFrom time.Time) {
 
@@ -153,6 +239,10 @@ func (f *Filer) ListExistingPeerUpdates(ctx context.Context) (existingNodes []*m
 	return cluster.ListExistingPeerUpdates(f.GetMaster(ctx), f.GrpcDialOption, f.MasterClient.FilerGroup, cluster.FilerType)
 }
 
+// SetStore installs the store. A store without a signature is fresh: a
+// signature is generated but written only when the store is initialized
+// (FinishBootstrap), so a bootstrap cut short by a restart leaves the store
+// fresh instead of half a namespace that passes for a complete one.
 func (f *Filer) SetStore(store FilerStore) (isFresh bool) {
 	f.Store = NewFilerStoreWrapper(store)
 
@@ -163,12 +253,7 @@ func (f *Filer) setOrLoadFilerStoreSignature(store FilerStore) (isFresh bool) {
 	storeIdBytes, err := store.KvGet(context.Background(), []byte(FilerStoreId))
 	if err == ErrKvNotFound || err == nil && len(storeIdBytes) == 0 {
 		f.Signature = util.RandomInt32()
-		storeIdBytes = make([]byte, 4)
-		util.Uint32toBytes(storeIdBytes, uint32(f.Signature))
-		if err = store.KvPut(context.Background(), []byte(FilerStoreId), storeIdBytes); err != nil {
-			glog.Fatalf("set %s=%d : %v", FilerStoreId, f.Signature, err)
-		}
-		glog.V(0).Infof("create %s to %d", FilerStoreId, f.Signature)
+		glog.V(0).Infof("fresh store, %s will be %d once initialized", FilerStoreId, f.Signature)
 		return true
 	} else if err == nil && len(storeIdBytes) == 4 {
 		f.Signature = int32(util.BytesToUint32(storeIdBytes))
@@ -177,6 +262,18 @@ func (f *Filer) setOrLoadFilerStoreSignature(store FilerStore) (isFresh bool) {
 		glog.Fatalf("read %v=%v : %v", FilerStoreId, string(storeIdBytes), err)
 	}
 	return false
+}
+
+// PersistStoreSignature writes the signature SetStore generated for a fresh
+// store; peers read it (filer.store.id) to follow this filer.
+func (f *Filer) PersistStoreSignature() error {
+	storeIdBytes := make([]byte, 4)
+	util.Uint32toBytes(storeIdBytes, uint32(f.Signature))
+	if err := f.Store.KvPut(context.Background(), []byte(FilerStoreId), storeIdBytes); err != nil {
+		return fmt.Errorf("set %s=%d : %v", FilerStoreId, f.Signature, err)
+	}
+	glog.V(0).Infof("create %s to %d", FilerStoreId, f.Signature)
+	return nil
 }
 
 func (f *Filer) GetStore() (store FilerStore) {

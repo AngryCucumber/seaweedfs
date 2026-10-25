@@ -117,7 +117,7 @@ v4 处理：只在只读 HTTP 接口（M1）隐藏，gRPC 面列为边界。部�
 - **配置不受影响：** `/etc/` 全部条目与 `/topics/` 下的 `topic.conf`、`*.offset` 豁免，IAM、熔断、filer.conf、远端映射、MQ 配置照常经 gRPC 读取。
 - **回写不丢正文：** `filer.proto` 的 `Entry` 加 `content_hidden = 13`。隐藏时出站副本 `Content` 置空并置标志；`CreateEntry/UpdateEntry` 收到带标志、正文为空且 chunks 与 `FileSize` 未变的条目时保留已有正文（S3 标签、`touch`、mount chmod/xattr/硬链接），无法确定字节的返回 `license: CONTENT_HIDDEN`，存储与事件日志里标志恒为 false。
 - **不返回伪造数据：** mount 对隐藏条目返回 `EIO` 并按 1.6 的节流重取；`ReadEntry`/`ReadInsideFiler`、`fs.cat`、`filer.cat` 报错而不是补零；`filer.sync`/`backup`/`meta.backup`/`remote.sync`/`remote.gateway` 经订阅选项 `FailOnHiddenContent` 停在事件处，`fs.meta.save`/`notify` 报错。
-- **filer 之间不隐藏：** 元数据聚合订阅（含自身）与新 filer 引导携带内部令牌；Replay 与引导遇到隐藏条目报错重试，不入库。
+- **filer 之间不隐藏：** 元数据聚合订阅（含自身）与新 filer 引导携带内部令牌；Replay 与引导遇到隐藏条目报错重试，不入库。引导的重试最多 5 分钟，master 拒绝本 filer 时立即失败；`filer.store.id` 在引导成功后才写入，引导切点 `filer.bootstrap.since` 先持久化、成功后删除，重启后从同一切点继续；对端日志已不覆盖切点时明确失败（2026-10-25 修订，8.22 方案 9）。
 - **`KvGet` 旁路：** 拒读态只放行 `Meta`、`sync.`、`backup.`、`remote.sync.` 前缀的同步偏移键（`backup.` 为 2026-10-25 补入，8.22 方案 2）。
 
 ### 1.6 独立 mount 对 manifest 文件的错误传播（v5 新增）
@@ -553,7 +553,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 1. KeepConnected 首帧：授权帧先于卷位置单独发送，所有客户端（含 shell）都能收到首帧，顺带消除了 8.1 记录的“无 volume 时 shell 一直等待”。volume 心跳中带授权的响应不填 `Leader`：leader 自己的响应在上游从不带 `Leader`，填了会让以别名地址连接的 volume 多一次重定向。
 2. webdav 读入口对 `ContentHidden` 返回错误（2 行；计划原写“不改 webdav”），避免返回全零。上游 webdav 本身不读 `Entry.Content`，内联文件在证书有效时也返回全零，属上游缺陷，未改。
 3. mount：来自 meta cache 的隐藏条目在新打开的句柄上首次读取时立即向 filer 重取一次，之后仍 ≥ 5 秒一次，避免续期后每个新打开的文件都先失败 5 秒；mount 写入会丢弃内联正文（上游行为），写入后清除隐藏标志。
-4. 新 filer 引导遇到隐藏条目时每 5 秒重试，直到拿到令牌；元数据聚合在事件进入聚合日志与回放之前检查，遇到隐藏条目断开并从该事件重新订阅（不只在 Replay 内拒收）。
+4. 新 filer 引导遇到隐藏条目时每 5 秒重试，直到拿到令牌（2026-10-25 起最多 5 分钟，被拒即停，8.22 方案 9）；元数据聚合在事件进入聚合日志与回放之前检查，遇到隐藏条目断开并从该事件重新订阅（不只在 Replay 内拒收）。
 5. 指标只实现了 `license_denied_reads_total{server,path}`（prometheus 名带仓库统一前缀，为 `SeaweedFS_license_denied_reads_total`），`license_state`、`license_expires_at_seconds` 与节点数量类指标随 P4/P5。
 6. `filer.Entry.ContentHidden` 在 HTTP JSON 里的字段名是 `ContentHidden`（与该结构其它字段一样为大驼峰）。
 
@@ -1108,6 +1108,8 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 **方案 11 实施（2026-10-25）：** （a）`takeContent` 第三分支裁剪或补零后以 `md5.Sum` 重算 `Attributes.Md5`，`TestTruncateHiddenContent` 断言取回后的 md5 为 `hel\0\0` 的 md5。（b）meta cache 旧大小一项已复现并修复：把订阅的事件处理抽成 `MetaCache.ApplyEvent` 供单测直接调用，`NewMetaCache` 增加 `ownEventFn`；mount 在 `cacheRemoteEntry` 请求前按路径记标记（`markRemoteDownload`，RPC 失败即清除，一分钟过期），`ownMetaEvent` 对无句柄路径、形如"无分块 → 有分块且远端描述相同"的更新事件返回 true 并消费标记，meta cache 整条忽略；有句柄的路径一律交给 `invalidateHandle`。单测 `TestTruncateWithoutHandleKeepsMetaCacheSize`：经 gRPC 存根 filer 无句柄截断远端文件到 3，下载事件在 RPC 之后或之前到达两种顺序下 meta cache 都保持 3，标记只消费一次（之后别的客户端的 chmod 事件、未标记的下载事件都照常应用）；去掉钩子则 meta cache 回到 5。mount 全包 `-race` 通过。1.6 之后的远端缓存一节已补说明。
 
 **方案 8 实施（2026-10-25）：** `Manager` 加 `pendingVoters`（id → 地址）：`JoinMaster(voter=true)` 在推送前记入、`AddVoter` 成功后删除；`RetryPromotion(ctx, id)` 只对集合内的 id 重跑 `JoinMaster`，`OnPeerUpdate` 对已在配置里的 master 调它（经 `licenseRetryPromotion`）；`tick` 在 leader 且对账完成时每 `retryInterval` 单飞一轮重试；`RemoveMaster`、非 leader 的 `tick`、新任期对账完成都清空集合。单测 `TestManagerPromotesPendingVoters`：`-voter=false` 加入的 n 重连后仍是 nonvoter；d、e 因不可达留为 nonvoter 并待提升，d 重连经 `RetryPromotion` 提升，e 由 `tick` 提升；移除 e 与 a 失去 leader 后集合清空。license、server `-race` 通过。3.3 第 7 条已同步。
+
+**方案 9 实施（2026-10-25）：** `MaybeBootstrapFromOnePeer(ctx, …, since)`：对端隐藏正文时每 `BootstrapRetryInterval`（5 秒）重试，总计不超过 `BootstrapRetryLimit`（5 分钟）后带原因返回；`filer_server.go` 用 `context.WithCancelCause` 建引导上下文，`OnLicenseReject` 触发即取消，错误带 "master refused this filer"，`Fatalf` 带出。`SetStore` 对无签名的存储只在内存生成签名并返回 `isFresh`，不再写 `filer.store.id`；新增 `PersistStoreSignature`、`BootstrapSince(startFrom)`（读持久化切点 `filer.bootstrap.since`，没有则写入 `startFrom`）、`FinishBootstrap`（先删切点再写 `filer.store.id`，中途崩溃则重启仍为 fresh）。`filer_server.go` 在 fresh 时以切点作为 BFS 与 `AggregateFromPeers` 的起点：切点之前的全量来自 BFS（BFS 本就是对端当前状态，`olderThanTsNs` 只用于日志），之后的增删来自事件回放，两段拼接无缝。覆盖检查 `checkBootstrapLogCoverage`：引导前列对端 `/topics/.system/log` 最早的（UTC）天目录，晚于切点所在天则失败并提示清空本 filer 存储重来；对端无日志目录视为无事可回放。与方案原文的差别：对端日志"保留期"在 filer 里不存在（日志只会被运维删除），所以覆盖检查按天目录判定而非保留期；`filer.store.id` 未写入期间对端 `GetFilerConfiguration` 仍返回内存里的签名。单测（`filer_test` 包，gRPC 存根 filer）`TestBootstrapFreshStoreUntilFinished`：新存储不写签名；隐藏正文重试后超限返回 "still hides content"；被拒的上下文立即返回带 `NODE_LIMIT_EXCEEDED` 的原因；重启仍为 fresh 且切点不变；对端日志最早天晚于切点时拒绝并提示；覆盖后复制成功，`FinishBootstrap` 后切点删除、再启动不再 fresh 且签名一致。`TestBootstrapReplaysFromCut`：第一次引导复制的 `/d/x` 在源端删除后，第二次引导完成时本地仍在，`AggregateFromPeers` 从持久化切点订阅（存根记录 `SinceNs` 等于切点）回放删除事件后本地不存在，新建的 `/d/y` 在。filer、server、command `-race` 通过。1.5、8.2 已同步，运维手册第 12 节补排查项。
 
 取舍（2026-10-22 提出，用户 2026-10-25 确认按原方案执行）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
 

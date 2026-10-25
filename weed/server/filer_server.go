@@ -158,10 +158,14 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	fs.filer.Cipher = option.Cipher
 	fs.license = newLicenseNode(option.DefaultStoreDir)
 	fs.filer.MasterClient.OnLicenseUpdate = fs.applyLicenseUpdate
+	// A bootstrap waiting for the internal read token stops when the
+	// master refuses this filer: the token will not come.
+	bootstrapCtx, abortBootstrap := context.WithCancelCause(context.Background())
 	fs.filer.MasterClient.OnLicenseReject = func(message string) {
 		if fs.license.Reject() {
 			glog.Errorf("license: master refused this filer: %s; reads are denied until it registers", strings.TrimPrefix(message, "license: "))
 		}
+		abortBootstrap(fmt.Errorf("master refused this filer: %s", strings.TrimPrefix(message, "license: ")))
 	}
 	if option.SaveToFilerLimit > 0 {
 		glog.Warningf("license: -saveToFilerLimit=%d stores small files inline in the filer store; their content is hidden from metadata reads while the license denies reads", option.SaveToFilerLimit)
@@ -212,11 +216,26 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 	existingNodes := fs.filer.ListExistingPeerUpdates(context.Background())
 	startFromTime := time.Now().Add(-filer.LogFlushInterval)
 	if isFresh {
+		// The cut of an earlier, unfinished bootstrap is kept: the copy
+		// resumes from the peer as it is now and the events from the cut
+		// bring every change since, deletions included.
+		since, err := fs.filer.BootstrapSince(startFromTime)
+		if err != nil {
+			glog.Fatalf("%s bootstrap: %v", option.Host, err)
+		}
+		if !since.Equal(startFromTime) {
+			glog.V(0).Infof("%s resumes an earlier bootstrap cut at %v", option.Host, since)
+		}
 		glog.V(0).Infof("%s bootstrap from peers %+v", option.Host, existingNodes)
-		if err := fs.filer.MaybeBootstrapFromOnePeer(option.Host, existingNodes, startFromTime); err != nil {
+		if err := fs.filer.MaybeBootstrapFromOnePeer(bootstrapCtx, option.Host, existingNodes, since); err != nil {
 			glog.Fatalf("%s bootstrap from %+v: %v", option.Host, existingNodes, err)
 		}
+		if err := fs.filer.FinishBootstrap(); err != nil {
+			glog.Fatalf("%s bootstrap: %v", option.Host, err)
+		}
+		startFromTime = since
 	}
+	abortBootstrap(nil)
 	fs.filer.AggregateFromPeers(option.Host, existingNodes, startFromTime)
 
 	fs.filer.LoadFilerConf()

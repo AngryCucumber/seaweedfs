@@ -222,6 +222,8 @@ echo "license.show" | weed shell -master=<master>:9333
 | `GET /license` 长时间为 `RECONCILING`，volume 与 filer 注册不上 | leader 联系不到多数派 master。看 leader 日志 `license: reconcile ...`；若对端日志有 `refused a master-to-master license RPC from <ip>`，把该 IP 加入对端的 `[master.license] peer_ips`（第 3 节第 4 条）。构建早于 `79aa9b1d1` 的 goraft 多 master 在全部重启后会一直停在这里，须升级 |
 | volume 日志 `license: master ... refused this volume server: NODE_LIMIT_EXCEEDED`，或 master 日志 `license: refused volume_server <addr>: NODE_LIMIT_EXCEEDED volume_server <n>/<m>` | 名额用尽（含宽限中的节点）。按 `GET /license` 的 `grace_nodes` 释放已下线节点的名额（第 7 节），或签发更高额度；消息含 `no license imported` 时先导入证书 |
 | filer 启动后 HTTP 端口一直不监听 | 冷启动即被拒，卡在等待 master；看 filer 日志 `license: master refused this filer`，处理同上 |
+| 新 filer 启动即退出：`bootstrap from <peer> stopped: master refused this filer`，或 `the peer still hides content after 5m0s` | 新 filer 从已有 filer 复制命名空间时拿不到内部读令牌：前者是名额用尽被拒（处理同上），后者是 5 分钟内没从 master 收到令牌（master 不可达或仍是旧版）。排除后直接重启即可，复制从上次的切点继续，存储不必清空（2026-10-25 起） |
+| 新 filer 启动即退出：`the peer's metadata log starts on <日期>, after the bootstrap cut ... empty this filer's store and start again` | 上次未完成的复制距今太久，对端 `/topics/.system/log` 里切点那天及之前的目录已被删除，期间的删除无法回放。清空本 filer 的存储（leveldb 目录或库表）后重启，重新复制 |
 | 读取 403，原因 `NO_LICENSE` | 从未导入证书，导入即可 |
 | 读取 403，原因 `EXPIRED` | 证书到期，导入续期证书 |
 | 读取 403，原因 `NOT_YET_VALID` | 证书尚未生效且没有可用的旧证书；等到 `not_before` 或签发立即生效的证书 |
