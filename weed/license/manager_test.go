@@ -1213,6 +1213,115 @@ func TestManagerJoinMasterStaysNonvoter(t *testing.T) {
 	}
 }
 
+// A master JoinMaster could not promote is promoted when it comes back,
+// by its reconnect (RetryPromotion) or by the ticker; a master added as a
+// nonvoter on purpose stays one. Removing the master or losing leadership
+// drops the pending promotion.
+func TestManagerPromotesPendingVoters(t *testing.T) {
+	c := newFakeCluster(t, "a")
+	a := c.start("a", nil)
+	c.start("d", nil)
+	c.start("e", nil)
+	c.start("n", nil)
+	c.elect("a")
+	if _, err := a.Import(certRaw(t, 1, withLimits(4, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	pending := func() []string {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		var ids []string
+		for id := range a.pendingVoters {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		return ids
+	}
+	shortCtx := func() context.Context {
+		ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+		t.Cleanup(cancel)
+		return ctx
+	}
+
+	// n joins as a nonvoter on purpose: never pending.
+	if err := a.JoinMaster(context.Background(), "n", "n:19333", false); err != nil {
+		t.Fatal(err)
+	}
+	// d and e cannot confirm the state: both stay nonvoters, pending.
+	c.setDown(true, "d", "e")
+	if err := a.JoinMaster(shortCtx(), "d", "d:19333", true); err == nil {
+		t.Fatal("d confirmed while down")
+	}
+	if err := a.JoinMaster(shortCtx(), "e", "e:19333", true); err == nil {
+		t.Fatal("e confirmed while down")
+	}
+	if mem, _ := a.raft.Membership(); strings.Join(mem.Voters, ",") != "a" || strings.Join(mem.Nonvoters, ",") != "n,d,e" {
+		t.Fatalf("membership %+v", mem)
+	}
+	if got := pending(); strings.Join(got, ",") != "d,e" {
+		t.Fatalf("pending %v", got)
+	}
+
+	// n reconnects: nothing to do. d reconnects: promoted.
+	if err := a.RetryPromotion(context.Background(), "n"); err != nil {
+		t.Fatal(err)
+	}
+	c.setDown(false, "d")
+	if err := a.RetryPromotion(context.Background(), "d"); err != nil {
+		t.Fatal(err)
+	}
+	if mem, _ := a.raft.Membership(); strings.Join(mem.Voters, ",") != "a,d" || strings.Join(mem.Nonvoters, ",") != "n,e" {
+		t.Fatalf("membership after d came back %+v", mem)
+	}
+	if got := pending(); strings.Join(got, ",") != "e" {
+		t.Fatalf("pending %v", got)
+	}
+
+	// e comes back without an event: the ticker promotes it.
+	c.setDown(false, "e")
+	a.tick()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mem, _ := a.raft.Membership()
+		if strings.Join(mem.Voters, ",") == "a,d,e" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ticker did not promote e: %+v", mem)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if mem, _ := a.raft.Membership(); strings.Join(mem.Nonvoters, ",") != "n" || len(pending()) != 0 {
+		t.Fatalf("membership %+v, pending %v", mem, pending())
+	}
+
+	// A pending promotion is dropped with the master, and with leadership.
+	c.setDown(true, "e")
+	c.m("a").raft.RemoveServer("e")
+	if err := a.JoinMaster(shortCtx(), "e", "e:19333", true); err == nil {
+		t.Fatal("e confirmed while down")
+	}
+	if err := a.RemoveMaster(context.Background(), "e", func() error { return a.raft.RemoveServer("e") }); err != nil {
+		t.Fatal(err)
+	}
+	if len(pending()) != 0 {
+		t.Fatalf("pending after removal %v", pending())
+	}
+	c.start("f", nil)
+	c.setDown(true, "f")
+	if err := a.JoinMaster(shortCtx(), "f", "f:19333", true); err == nil {
+		t.Fatal("f confirmed while down")
+	}
+	if got := pending(); strings.Join(got, ",") != "f" {
+		t.Fatalf("pending %v", got)
+	}
+	c.elect("n") // a lost leadership
+	a.tick()
+	if len(pending()) != 0 {
+		t.Fatalf("pending after losing leadership %v", pending())
+	}
+}
+
 func TestManagerRemoveMasterRecommits(t *testing.T) {
 	c := newFakeCluster(t, "a", "b", "c")
 	c.startAll()

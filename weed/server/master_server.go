@@ -387,6 +387,10 @@ func (ms *MasterServer) OnPeerUpdate(update *master_pb.ClusterNodeUpdate, startF
 		if !raftServerFound {
 			glog.V(0).Infof("adding new raft server: %s", peerName)
 			go ms.licenseJoinMaster(peerName, peerAddress.ToGrpcAddress())
+		} else {
+			// A nonvoter whose promotion failed is promoted when it comes
+			// back; one added as a nonvoter on purpose is left alone.
+			go ms.licenseRetryPromotion(peerName)
 		}
 	} else {
 		pb.WithMasterClient(false, peerAddress, ms.grpcDialOption, true, func(client master_pb.SeaweedClient) error {

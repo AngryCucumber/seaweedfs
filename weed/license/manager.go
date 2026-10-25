@@ -185,9 +185,17 @@ type Manager struct {
 	// rev changes with the cluster id, certificates or key.
 	rev uint64
 	// acked maps a peer to the rev it confirmed during ackedTerm (leader only).
-	acked      map[string]uint64
-	ackedTerm  uint64
-	denyReason Reason
+	acked     map[string]uint64
+	ackedTerm uint64
+	// pendingVoters maps the masters JoinMaster added as nonvoters to be
+	// promoted to their addresses while the promotion has not succeeded
+	// (plan 3.3 item 7). The leader retries it when the master reconnects
+	// (RetryPromotion) and every retryInterval (tick); the set is dropped
+	// with leadership. Masters added as nonvoters on purpose are not in it.
+	pendingVoters map[string]string
+	lastPromote   time.Time
+	promoteRun    atomic.Bool
+	denyReason    Reason
 	// ledgerDirty: changes without a version yet; ledgerPending: the
 	// latest version is not confirmed by a voter majority.
 	ledgerDirty    bool
@@ -447,6 +455,9 @@ func (m *Manager) tick() {
 	}
 
 	if !m.raft.IsLeader() {
+		m.mu.Lock()
+		m.pendingVoters = nil
+		m.mu.Unlock()
 		return
 	}
 	term := m.raft.Term()
@@ -469,6 +480,48 @@ func (m *Manager) tick() {
 	m.mu.Unlock()
 	m.replicateLedger(term)
 	m.pushPending(term)
+	m.retryPromotions()
+}
+
+// retryPromotions promotes the pending voters again, at most once per
+// retryInterval and one round at a time, off the ticker.
+func (m *Manager) retryPromotions() {
+	m.mu.Lock()
+	due := len(m.pendingVoters) > 0 && m.timeNow().Sub(m.lastPromote) >= retryInterval
+	pending := make(map[string]string, len(m.pendingVoters))
+	for id, addr := range m.pendingVoters {
+		pending[id] = addr
+	}
+	if due {
+		m.lastPromote = m.timeNow()
+	}
+	m.mu.Unlock()
+	if !due || !m.promoteRun.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer m.promoteRun.Store(false)
+		for id, addr := range pending {
+			ctx, cancel := context.WithTimeout(context.Background(), retryInterval)
+			if err := m.JoinMaster(ctx, id, addr, true); err != nil {
+				glog.V(1).Infof("license: promoting master %s again: %v", id, err)
+			}
+			cancel()
+		}
+	}()
+}
+
+// RetryPromotion promotes id again if JoinMaster left it a nonvoter to be
+// promoted, typically when the master reconnects (OnPeerUpdate). A master
+// added as a nonvoter on purpose is left alone.
+func (m *Manager) RetryPromotion(ctx context.Context, id string) error {
+	m.mu.Lock()
+	addr, pending := m.pendingVoters[id]
+	m.mu.Unlock()
+	if !pending {
+		return nil
+	}
+	return m.JoinMaster(ctx, id, addr, true)
 }
 
 // refreshClock advances the watermark and switches CLOCK_SUSPECT.
@@ -545,6 +598,9 @@ func (m *Manager) reconcile(term uint64) {
 		glog.Warningf("license: reconcile for term %d: %v; retry in %v", term, err, retryInterval)
 		return
 	}
+	m.mu.Lock()
+	m.pendingVoters = nil // a new term starts without promotions to retry
+	m.mu.Unlock()
 	m.reconciled.Store(term + 1)
 	glog.V(0).Infof("license: reconciled for term %d, registrations are open", term)
 }
@@ -1311,6 +1367,14 @@ func (m *Manager) JoinMaster(ctx context.Context, id, address string, voter bool
 	if !voter {
 		return nil
 	}
+	// Until the promotion succeeds the master is a nonvoter to be promoted
+	// again (tick, RetryPromotion).
+	m.mu.Lock()
+	if m.pendingVoters == nil {
+		m.pendingVoters = make(map[string]string)
+	}
+	m.pendingVoters[id] = address
+	m.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(ctx, lockedOpTimeout)
 	defer cancel()
@@ -1340,6 +1404,9 @@ func (m *Manager) JoinMaster(ctx context.Context, id, address string, voter bool
 	if err := m.raft.AddVoter(id, address); err != nil {
 		return err
 	}
+	m.mu.Lock()
+	delete(m.pendingVoters, id)
+	m.mu.Unlock()
 	glog.V(0).Infof("license: promoted master %s to voter", id)
 	return nil
 }
@@ -1359,6 +1426,9 @@ func (m *Manager) RemoveMaster(ctx context.Context, id string, remove func() err
 	if err != nil {
 		return err
 	}
+	m.mu.Lock()
+	delete(m.pendingVoters, id)
+	m.mu.Unlock()
 	if !mem.isVoter(id) {
 		return remove()
 	}

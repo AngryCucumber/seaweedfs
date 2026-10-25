@@ -273,6 +273,16 @@ func (ms *MasterServer) licenseJoinMaster(id, address string) {
 	}
 }
 
+// licenseRetryPromotion promotes a reconnected master that JoinMaster left
+// a nonvoter (plan 3.3 item 7).
+func (ms *MasterServer) licenseRetryPromotion(id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), licenseJoinWait)
+	defer cancel()
+	if err := ms.License.RetryPromotion(ctx, id); err != nil {
+		glog.Warningf("license: promoting master %s: %v", id, err)
+	}
+}
+
 func newLicenseManager(ms *MasterServer) *license.Manager {
 	trust, err := license.DefaultTrustStore()
 	if err != nil {
