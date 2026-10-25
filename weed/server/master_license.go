@@ -10,13 +10,11 @@ import (
 	hashicorpRaft "github.com/hashicorp/raft"
 	"google.golang.org/grpc/status"
 
-	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/license"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
-	"github.com/seaweedfs/seaweedfs/weed/topology"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
@@ -261,24 +259,6 @@ func licenseGrpcError(err error) error {
 	return err
 }
 
-// licenseConnected lists the volume servers and filers registered on this
-// master, for the reconcile after a leadership change.
-func (ms *MasterServer) licenseConnected() (out []license.LedgerEntry) {
-	for _, dc := range ms.Topo.Children() {
-		for _, rack := range dc.Children() {
-			for _, n := range rack.Children() {
-				if dn, ok := n.(*topology.DataNode); ok {
-					out = append(out, license.LedgerEntry{Address: dn.Url(), Type: license.NodeVolumeServer})
-				}
-			}
-		}
-	}
-	for _, addr := range ms.Cluster.ListAllClusterNodes(cluster.FilerType) {
-		out = append(out, license.LedgerEntry{Address: string(addr), Type: license.NodeFiler})
-	}
-	return out
-}
-
 // licenseJoinMaster adds a master found by OnPeerUpdate or -peers once the
 // license reconcile is done; failures only warn.
 func (ms *MasterServer) licenseJoinMaster(id, address string) {
@@ -309,7 +289,6 @@ func newLicenseManager(ms *MasterServer) *license.Manager {
 		Raft:        masterRaft{ms},
 		Peers:       masterPeers{ms},
 		LicenseFile: ms.option.LicenseFile,
-		Connected:   ms.licenseConnected,
 	})
 	if err != nil {
 		glog.Fatalf("license: %v", err)

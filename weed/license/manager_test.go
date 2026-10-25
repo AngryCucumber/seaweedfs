@@ -33,6 +33,8 @@ type fakeCluster struct {
 	onSync func(peer string)
 	// onLedgerSync runs before every SyncLedger delivery.
 	onLedgerSync func(peer string)
+	// onCollect runs before every GetLedger reply (the reconcile's collect).
+	onCollect func(peer string)
 }
 
 func newFakeCluster(t *testing.T, voters ...string) *fakeCluster {
@@ -181,6 +183,9 @@ func (p *fakePeers) GetLicense(ctx context.Context, peer string) (State, error) 
 }
 
 func (p *fakePeers) GetLedger(ctx context.Context, peer string) (LedgerSnapshot, error) {
+	if p.c.onCollect != nil {
+		p.c.onCollect(peer)
+	}
 	m, err := p.target(peer)
 	if err != nil {
 		return LedgerSnapshot{}, err
@@ -521,9 +526,7 @@ func TestManagerLedgerReplicationAndTakeOver(t *testing.T) {
 	// B takes over: v1 was online, so it gets a full grace period from
 	// now; v2 keeps its deadline. v1 is still connected to nobody.
 	c.now.Add(60)
-	c.start("b", func(o *ManagerOption) {
-		o.Connected = func() []LedgerEntry { return nil }
-	})
+	c.start("b", nil)
 	newTerm := c.elect("b")
 	l := c.m("b").Ledger()
 	if l.Term != newTerm || l.Revision != 1 {
@@ -549,10 +552,12 @@ func TestManagerLedgerReplicationAndTakeOver(t *testing.T) {
 		t.Fatal("a ledger address re-registers:", err)
 	}
 
-	// A leader that keeps streams across terms keeps them online.
-	c.start("c", func(o *ManagerOption) {
-		o.Connected = func() []LedgerEntry { return []LedgerEntry{{Address: "v2:8080", Type: NodeVolumeServer}} }
-	})
+	// A leader that keeps streams across terms keeps them online: v2's
+	// stream survived on c.
+	c.start("c", nil)
+	c.m("c").mu.Lock()
+	c.m("c").conns[ledgerKey{NodeVolumeServer, "v2:8080"}] = 1
+	c.m("c").mu.Unlock()
 	c.elect("c")
 	for _, e := range c.m("c").Ledger().Entries {
 		if e.Online != (e.Address == "v2:8080") {
@@ -1615,5 +1620,56 @@ func TestManagerReportsChanges(t *testing.T) {
 	}
 	if got, _ := json.Marshal(out); !strings.Contains(string(got), `"changes":[]`) {
 		t.Errorf("retry outcome %s", got)
+	}
+}
+
+// A node whose last stream ends while the leader reconciles is offline in
+// the new ledger, with its grace period running, and can be released: the
+// reconcile marks online the streams the manager holds at the moment it
+// installs the ledger, under the same lock DisconnectNode takes.
+func TestManagerReconcileDisconnectDuringReconcile(t *testing.T) {
+	c := newFakeCluster(t, "a", "b", "c")
+	c.startAll()
+	a := c.m("a")
+	c.elect("a")
+	if _, err := a.Import(certRaw(t, 1, withLimits(3, 2, 1))); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.AdmitNode(NodeVolumeServer, "v1:8080"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.AdmitNode(NodeVolumeServer, "v2:8080"); err != nil {
+		t.Fatal(err)
+	}
+
+	// a is re-elected; v1's stream ends while a collects the peers' copies.
+	var disconnected sync.Once
+	c.onCollect = func(string) {
+		disconnected.Do(func() { a.DisconnectNode(NodeVolumeServer, "v1:8080") })
+	}
+	c.now.Add(10)
+	c.elect("a")
+	c.onCollect = nil
+	for _, e := range a.Ledger().Entries {
+		switch e.Address {
+		case "v1:8080":
+			if e.Online || e.LastSeen != c.now.Load() {
+				t.Fatalf("v1 after disconnecting during the reconcile: %+v", e)
+			}
+		case "v2:8080":
+			if !e.Online {
+				t.Fatalf("v2, still connected: %+v", e)
+			}
+		}
+	}
+	if err := a.ReleaseNode("v1:8080"); err != nil {
+		t.Fatalf("release v1: %v", err)
+	}
+	wantCode(t, a.ReleaseNode("v2:8080"), CodeNodeOnline)
+	a.mu.Lock()
+	n := len(a.conns)
+	a.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d streams held, want v2 only", n)
 	}
 }

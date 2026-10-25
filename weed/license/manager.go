@@ -139,10 +139,6 @@ type ManagerOption struct {
 	Peers Peers
 	// LicenseFile is -license.file; it is applied to the local state on start.
 	LicenseFile string
-	// Connected lists the volume servers and filers registered on this
-	// master right now. A reconcile keeps them online: streams that
-	// survived a leadership change do not register again.
-	Connected func() []LedgerEntry
 	// Now replaces the wall clock in tests.
 	Now func() time.Time
 }
@@ -163,7 +159,6 @@ type Manager struct {
 	trust     *TrustStore
 	raft      Raft
 	peers     Peers
-	connected func() []LedgerEntry
 	timeNow   func() time.Time
 
 	opMu      sync.Mutex
@@ -229,7 +224,6 @@ func NewManager(opt ManagerOption) (*Manager, error) {
 		trust:          opt.Trust,
 		raft:           opt.Raft,
 		peers:          opt.Peers,
-		connected:      opt.Connected,
 		timeNow:        opt.Now,
 		ledger:         NewLedger(nil),
 		acked:          map[string]uint64{},
@@ -603,13 +597,16 @@ func (m *Manager) reconcileLocked(ctx context.Context, term uint64) error {
 	}
 	recovered := NewLedger(bestLedger.Entries)
 	recovered.TakeOver(now)
-	if m.connected != nil {
-		for _, e := range m.connected() {
-			recovered.markOnline(e.Type, e.Address, now)
-		}
-	}
 
 	m.mu.Lock()
+	// The nodes whose registration streams this master still holds stay
+	// online: they registered here before the term changed and do not
+	// register again. conns and the ledger change under the same lock, so
+	// a stream that ended meanwhile (DisconnectNode) is offline in the new
+	// ledger and its grace period runs.
+	for key := range m.conns {
+		recovered.markOnline(key.t, key.addr, now)
+	}
 	if best.clusterID != m.clusterID || rawOf(best.certs.Newest) != rawOf(m.certs.Newest) ||
 		rawOf(best.certs.Prev) != rawOf(m.certs.Prev) || !bytes.Equal(best.key, m.key) {
 		m.clusterID, m.certs, m.key = best.clusterID, best.certs, best.key

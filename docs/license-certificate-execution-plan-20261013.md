@@ -494,7 +494,7 @@ func (g *Guard) AllowRead() (ok bool, deny *Snapshot) {
 1. follower master 追平改为 leader 每 5 秒重推（3.3 第 6 条），不依赖 KeepConnected。
 2. `SyncLicense` 的接收方若持有更高序号的状态，不报错而是返回自己的状态，leader 按 3.2 规则采纳并重推；只有返回状态与所推状态相同的 voter 才计入多数派。
 3. 选主对账只采纳更高 `repair_seq` 的时钟状态（4.5）。
-4. 对账的接管转换之后，把当前仍连在本 leader 上的 volume 与 filer 重新置为在线（`Connected` 回调），覆盖“同一 master 失去又重获 leader、流未断开”时连接不会重新注册的情况。
+4. 对账的接管转换之后，把当前仍连在本 leader 上的 volume 与 filer 重新置为在线（`Connected` 回调），覆盖“同一 master 失去又重获 leader、流未断开”时连接不会重新注册的情况。（2026-10-25 修订，8.22 方案 6：改为在 `m.mu` 内按 manager 自己的 `conns` 置为在线，`Connected` 回调与 `licenseConnected()` 删除。）
 5. 每个 master 在 raft 启动前把 `-license.file` 应用到自己的本地状态（不只是 leader）；leader 的对账取多数派中的最高状态并写回后才开放注册，满足 3.4 “开放注册之前提交” 的要求。
 6. 推送前若账本有未发出的变更，先分配新版本，保证同一版本号只对应一份内容。
 7. `master.follower` 的 manager 不落盘（它不参与 raft）。
@@ -1096,6 +1096,8 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 **方案 4 实施（2026-10-25）：** `master_license_peers.go` 的 `resolve` 失败时写回 `resolvedHost{ips: 旧值, at: now}`，TTL 内不再解析；去重放在 `allows` 收集名字处（同一入口，覆盖 `-peers` 与 raft 成员重复），不在 `checkLicensePeer`；`licensePeerResolveTimeout` 降到 1 秒；解析经可替换的 `licensePeerLookupIP`。单测 `TestLicensePeerGuardResolveFailure`：重复名字只解析一次，DNS 失败后 TTL 内零次解析、仍按旧 IP 放行，TTL 过后每个名字只失败一次且再过 TTL 前不重试，从未解析成功的名字被拒。8.4 已补说明。
 
 **方案 5 实施（2026-10-25）：** `state.go` 的 `Merge` 增加 `now` 参数，`in.Watermark` 先取 `min(in.Watermark, now)` 再走三分支；`ApplySync`、`adoptAhead`、对账采纳 `best.clock` 三处都经钳位（后两处仍只在对端 `repair_seq` 更高时采纳）。单测：`TestClockState` 加三条钳位用例（同序号与更高序号的超前水位都只到 now，低于对端 now 的本地水位不被拉低）；新增 `TestManagerLeaderClockAheadDoesNotSuspectFollower`：follower 时钟落后 leader 30 秒，leader 导入后墙钟前进再推送，follower 保持 `VALID`、水位不超过本地 now，随后当选 leader 仍 `VALID`，再由 leader 导入更高序号证书时水位降到 `issued_at`；去掉钳位则该用例在第一步报 `CLOCK_SUSPECT`。`TestManagerClockSuspectAndRepair`（S8）与 `TestManagerAdoptsClockRepair` 不变。4.5 已同步。license 包 `-race` 通过。
+
+**方案 6 实施（2026-10-25）：** A：`SendHeartbeat` 的 `DisconnectNode` 放进更早注册的独立 defer，在 `UnRegisterDataNode` 之后执行。B：`reconcileLocked` 在 `m.mu` 内用 `m.conns` 的键把仍持有流的节点置为在线，与账本替换同锁完成；`ManagerOption.Connected`、`m.connected` 与 `licenseConnected()` 删除。单测：`TestManagerLedgerReplicationAndTakeOver` 改为直接给 c 的 `conns` 放入 v2 模拟存活的流；新增 `TestManagerReconcileDisconnectDuringReconcile`：leader 重新当选、对账收集期间（`onCollect` 钩子）v1 的最后一条流断开，新账本中 v1 离线、`last_seen` 为对账时间并可 `ReleaseNode`，v2 仍在线且 `ReleaseNode` 报 `NODE_ONLINE`，`conns` 只剩 v2。license、server `-race` 通过。8.1 第 4 条已加修订说明。
 
 取舍（2026-10-22 提出，用户 2026-10-25 确认按原方案执行）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
 

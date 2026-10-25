@@ -70,10 +70,14 @@ func (ms *MasterServer) SendHeartbeat(stream master_pb.Seaweed_SendHeartbeatServ
 	// licenseAddr is the address admitted under the node quota.
 	var licenseAddr string
 
+	// Registered first, so it runs after the node left the topology: a
+	// node that is still in the topology is never offline in the ledger.
 	defer func() {
 		if licenseAddr != "" {
 			ms.License.DisconnectNode(license.NodeVolumeServer, licenseAddr)
 		}
+	}()
+	defer func() {
 		if dn != nil {
 			dn.Counter--
 			if dn.Counter > 0 {
