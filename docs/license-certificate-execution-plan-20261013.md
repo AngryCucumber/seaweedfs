@@ -1113,6 +1113,16 @@ MassDB Manager 的 OSS 计划 O1（部署中心用的安装包）与 O2（签发
 
 **全量验证（2026-10-28）：** 在 Linux aarch64 虚拟机（Go 1.26.4，vendor 模式，网络命名空间隔离）上以 `76231e9de` 跑 CI 的精确命令 `go test -tags "elastic gocdk sqlite ydb tikv rclone" ./...`：47 个有测试的包全部通过（`storage/needle_map` 需要仓库根的 `test/data`，首轮因打包漏掉该目录失败，补上后通过），无构建失败。本轮 12 项改动所在的 `license`、`server`、`mount`、`command`、`filer` 包在 macOS 上另以 `-race` 通过。未做真实多 master、多 filer 集群验证。
 
+**真实集群验证（2026-10-28，虚拟机 10.211.55.3，`d0162b7d4` 的 linux/arm64 静态二进制，注入 licensetest 测试信任根）：** 在独立网络命名空间里以 dummy 接口地址（10.9.0.x master、10.9.1.x volume、10.9.2.x filer）和 dnsmasq 域名解析（`lic-m1` 等）搭建 hashicorp raft 的 3 master 集群，再扩到 5 master、2 volume、2 filer（`-saveToFilerLimit=1024`），证书由本仓库 licensetest 密钥签发（`max_master_nodes` 5）。命名空间内本地连接的来源地址是被连接方自己的地址，所以对端校验走的是"本机名字解析"路径，仍经 DNS。结果：
+
+- 方案 8：m4 以 voter 加入时用 iptables 丢弃发往它 gRPC 端口的包，leader 10 秒后记 "stays nonvoter: license state not confirmed"，之后每 5 秒 "promoting master lic-m4:9333 again"；解除后 2 秒内 "promoted master lic-m4:9333 to voter"，`cluster.raft.ps` 变为 Voter。`cluster.raft.add -voter=false` 加入的 m5 运行 1 分钟以上始终 Nonvoter，无提升日志。
+- 方案 4：冻结 dnsmasq（查询超时）12 秒后导入新证书 1.0 秒完成、4 个 voter 全部确认、无误拒；每台 master 只出现一条 "resolve master … i/o timeout; keeping [10.9.0.x] for 10s"，之后 RPC 不再解析。**同时发现守卫之外的限制：** 此时强杀 leader，新 leader 的对账在 DNS 恢复前完不成——不是对端校验拒绝，而是新 leader 向对端发起 gRPC 时拨号本身要解析名字（`dial tcp: lookup lic-m2 … i/o timeout`），follower 从不主动连接对端，没有可复用的连接；raft 自身的选举不受影响。DNS 恢复后 10 秒内对账完成、全部 voter 确认。用主机名互连的部署在 DNS 故障期间不要切主，或改用 IP；记为后续项。
+- 方案 6：同时强杀 leader 与 v2，新 leader 12 秒内 VALID；接管后仍在线的节点在重新注册前短暂处于宽限（volume 心跳周期 5 秒），`DELETE /license/nodes/lic-v2:8080` 返回 200，稳定后对在线的 v2 返回 409 `NODE_ONLINE`；v1 优雅停止后账本进入宽限、拓扑注销，重启后宽限项被消费。对账与断流的竞争窗口本身无法在真实集群上定时触发，只有单测覆盖。
+- 方案 9：f1 建 30 万个内联文件；f2 全新启动，复制开始 0.3 秒后冻结 f1 并强杀 f2（存储已有 8.4 MB、未写 `filer.store.id`）；之后在 f1 删除 `/bs/e001`、`/bs/e002` 两个目录并新建 `/bs/new2/*`；重启 f2 的日志为 "fresh store" 与 "resumes an earlier bootstrap cut at <第一次的切点>"，复制完成后从切点订阅，15 秒后两 filer 递归列表完全一致（297080 个文件，无缺失无多余，被删目录在 f2 不存在，新建文件存在）。把 filer 额度降到 1 后全新启动的 f2 被 master 拒绝：它卡在等待 master 连接（`GetMaster`，运维手册第 12 节已有的既有行为），根本到不了引导，所以 `OnLicenseReject` 中止引导的路径在真实集群上触发不到，只有单测覆盖；对端日志覆盖检查同样只有单测。
+- 方案 5：未做真实验证。二进制是 `CGO_ENABLED=0` 的静态文件，`faketime` 的 `LD_PRELOAD` 对它无效，Linux 时间命名空间只偏移单调时钟，虚拟机时钟不可改动，所以 master 间时钟偏差只有单测覆盖。
+
+测试集群已停止，目录与日志保留在虚拟机 `/root/claude-p5/lic/`（`lic.sh` 为启停脚本）。
+
 取舍（2026-10-22 提出，用户 2026-10-25 确认按原方案执行）：方案 2 的 B 改变上游行为（`getOffset` 出错由"从 0 开始"改为报错重试）；方案 5 调整 4.5 的三分支规则（相同 `repair_seq` 的水位钳位到本地 now）。
 
 **方案复核（2026-10-24）：** 外部对本节方案做了对照源码的隔离复现，确认原方案 3 处缺陷，已改入上文：方案 1 的部分截断分支漏了 `noteChunks`，新写入会被时间戳领先的旧分块覆盖（P1，复现 `Write/Flush` 成功但重读得旧内容，补 `noteChunks` 后通过）；方案 9 只延后写标记不能保证重启后一致，第二次引导不删除源端已删的残留条目且订阅起点漏事件（P1，复现已删除文件保留），改为持久化引导切点；方案 8 会把用户以 `-voter=false` 配置的 nonvoter 一并提升（P2，复现 3 voter 变 4 voter），改为只重试待提升集合。复核同时确认正常读热路径无性能问题（守卫微基准约 0.66 ns/op、零分配），未做集群长期压测。
